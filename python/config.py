@@ -19,3 +19,5 @@ RANDOM_SEED: int = 42
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 RESULTS_DIR: Path = PROJECT_ROOT / "results"
+MAPS_DIR: Path = PROJECT_ROOT / "python" / "maps"
+DEFAULT_MAP: str = "warehouse"

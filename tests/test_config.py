@@ -31,7 +31,13 @@ class TestConfig(unittest.TestCase):
     def test_rutas(self) -> None:
         self.assertIsInstance(config.PROJECT_ROOT, Path)
         self.assertEqual(config.RESULTS_DIR, config.PROJECT_ROOT / "results")
+        self.assertEqual(config.MAPS_DIR, config.PROJECT_ROOT / "python" / "maps")
         self.assertTrue((config.PROJECT_ROOT / "python").is_dir())
+        self.assertTrue(config.MAPS_DIR.is_dir())
+
+    def test_mapa_por_defecto(self) -> None:
+        self.assertIsInstance(config.DEFAULT_MAP, str)
+        self.assertTrue((config.MAPS_DIR / f"{config.DEFAULT_MAP}.json").is_file())
 
 
 if __name__ == "__main__":

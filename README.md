@@ -8,10 +8,12 @@ Unity es solo el cliente visual y lo desarrolla otra persona en otro repo.
 
 > En este repo **no** se escribe nada de C# ni de Unity.
 
-Estado actual: **fase 1 terminada**. La comunicación PULL funciona de extremo a extremo, pero
+Estado actual: **fase 2 terminada**. La comunicación PULL funciona de extremo a extremo, pero
 con datos falsos: `serve` levanta el servidor real y responde con un AGV que avanza en línea
-recta. Todavía no hay simulación, ni A\*, ni Q-Learning; `simulate`, `train`, `evaluate` y
-`benchmark` siguen avisando que no están implementados.
+recta. La fase 2 añade el **mapa lógico** (`python/graph.py` y `python/maps/`), que es el
+espacio que comparten Python y Unity, con el subcomando `map` para verlo y validarlo. Todavía
+no hay simulación, ni A\*, ni Q-Learning; `simulate`, `train`, `evaluate` y `benchmark` siguen
+avisando que no están implementados.
 
 ## Contrato PULL
 
@@ -80,8 +82,96 @@ unity_y = 0.0                # la altura la aplica Unity con el prefab
 unity_z = py * UNITY_SCALE
 ```
 
+| Eje de Python | Eje de Unity | Cómo sale |
+|---|---|---|
+| `px`, el ancho del almacén | `x` | `px * UNITY_SCALE` |
+| — | `y`, el vertical | siempre `0.0`: la altura la aplica Unity con el prefab |
+| `py`, el fondo del almacén | **`z`** | `py * UNITY_SCALE` |
+
+Lo importante es la última fila: **la Y de Python se convierte en la Z de Unity**, porque en
+Unity el eje vertical es la Y y en la simulación no hay altura, solo el plano del suelo.
+
+**La escala.** Una unidad lógica es **un metro** y `UNITY_SCALE` vale **`1.0`**, así que hoy los
+números de las coordenadas lógicas y los de Unity coinciden. Cambiar `UNITY_SCALE` en
+`config.py` cambia **todas** las coordenadas exportadas, las del snapshot y las del mapa: todo
+pasa por `protocol.to_unity()` y en ningún sitio se guarda una copia ya convertida.
+
 Los valores del contrato viven en `python/config.py` (`HOST`, `PORT`, `ENCODING`,
-`CMD_GET_STATE`, `CMD_RESET`, `CMD_PING`, `UNITY_SCALE`), no sueltos por el código.
+`CMD_GET_STATE`, `CMD_RESET`, `CMD_PING`, `UNITY_SCALE`, `MAPS_DIR`, `DEFAULT_MAP`), no sueltos
+por el código.
+
+## Mapa lógico
+
+Python y Unity tienen que hablar del **mismo** sitio, así que el almacén es un grafo: los nodos
+son puntos donde un AGV puede estar y las aristas son tramos por los que puede pasar, con su
+costo. `python/graph.py` es el dueño del mapa, y `to_unity_dict()` lo exporta con las
+coordenadas ya convertidas para que quien monte la escena pueda generarla desde aquí.
+
+```bash
+python3 python/main.py map --name warehouse   # el almacén (es el de por defecto)
+python3 python/main.py map --name simple      # el grafo de 6 nodos de la guía
+```
+
+Imprime la cabecera, los nodos con sus coordenadas lógicas **y** las de Unity, las aristas con
+su costo, y el resultado de `validate()`. Sale con código 1 si el mapa no es válido.
+
+### Los dos mapas
+
+`simple` es el grafo de 6 nodos de la guía, para pruebas rápidas.
+
+`warehouse` tiene 13 nodos con forma de pasillos: dos corredores horizontales (`S1`–`S6` al sur,
+`N1`–`N6` al norte), cuatro conexiones verticales y un **cuello de botella** en `G`.
+
+```
+N1──N2──N3            N4──N5──N6      y = 8
+ │       │  ╲        ╱  │       │
+ │       │    ▶ G ◀     │       │     y = 4
+ │       │  ╱        ╲  │       │
+S1──S2──S3            S4──S5──S6      y = 0
+ x=0     4   8   12   16   20   24
+```
+
+`G` es un **nodo de articulación**: es la única unión entre la zona izquierda y la derecha, así
+que toda ruta que cruce el almacén pasa por él a la fuerza y quitarlo parte el grafo en dos. De
+ahí salen los escenarios de congestión de las fases siguientes.
+
+> El costo de una arista **no** tiene por qué ser la distancia entre sus nodos. En `simple`,
+> `A(0,0) → D(0,3)` mide 3 pero cuesta 4: un pasillo puede ser lento sin ser largo. Por eso
+> `validate()` nunca compara el costo con la geometría.
+
+### Editar mapas sin tocar código
+
+Los mapas viven en `python/maps/*.json` y se cargan con `graph.load_graph(ruta)`. El fichero
+guarda **solo las coordenadas lógicas**: las de Unity son derivadas y dependen de `UNITY_SCALE`,
+así que congelarlas ahí sería guardar una copia condenada a quedarse vieja.
+
+```json
+{
+  "name": "simple",
+  "directed": false,
+  "positions": {"A": [0.0, 0.0], "B": [2.0, 0.0]},
+  "adjacency": {"A": {"B": 2.0, "D": 4.0}, "B": {"A": 2.0}}
+}
+```
+
+Si el fichero no existe, `map` tira del mapa que `graph.py` lleva dentro y lo avisa por el log.
+
+### `validate()`
+
+Revienta con un `GraphError` que junta **todos** los problemas en un solo mensaje, en vez de
+parar en el primero, para poder arreglar un mapa mal editado de una pasada.
+
+| Comprueba | Qué caza |
+|---|---|
+| Posiciones | Un nodo sin posición, o una posición de un nodo que no existe |
+| Aristas | Que apunten a nodos reales, y que ningún nodo tenga una arista a sí mismo |
+| Costos | Nada negativo, ni infinito, ni `NaN` |
+| Simetría | En un grafo no dirigido, que cada tramo exista en los dos sentidos y valga lo mismo |
+| Conectividad | Que desde cualquier nodo se llegue a todos los demás |
+
+Un grafo se puede declarar `directed=True` para pasillos de un solo sentido: entonces la
+asimetría es legítima y lo que se exige es poder **ir y volver** (conectividad fuerte). Los dos
+mapas del repo son no dirigidos.
 
 ## Estructura
 
@@ -92,7 +182,9 @@ agentesAGV/
 │   ├── logs.py         configuración del logging
 │   ├── protocol.py     el contrato: comandos, serialización y coordenadas
 │   ├── server.py       servidor TCP y la simulación falsa de la fase 1
+│   ├── graph.py        el mapa lógico: grafo, validación y carga desde JSON
 │   ├── main.py         CLI con argparse
+│   ├── maps/           los mapas en JSON (simple.json, warehouse.json)
 │   └── models/         AGVs, almacén y Q-Learning (siguientes fases)
 ├── results/            salidas de las corridas (no se versionan)
 ├── tests/              tests con unittest, y el cliente falso de Unity
@@ -125,6 +217,7 @@ python3 python/main.py --help
 | Subcomando | Qué hace |
 |---|---|
 | `serve` | Levanta el servidor TCP y atiende las peticiones de Unity |
+| `map` | Muestra el mapa lógico del almacén y lo valida |
 | `simulate` | Corre la simulación sin servidor, útil para probar la lógica sola |
 | `train` | Entrena los agentes con Q-Learning |
 | `evaluate` | Evalúa una política ya entrenada |

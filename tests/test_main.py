@@ -2,13 +2,18 @@
 
 import contextlib
 import io
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
+import config
+import graph
 import main
 
-# serve ya esta implementado; el resto sigue siendo andamiaje.
-PENDIENTES = [nombre for nombre in main.COMMANDS if nombre != "serve"]
+# serve y map ya estan implementados; el resto sigue siendo andamiaje.
+IMPLEMENTADOS = {"serve", "map"}
+PENDIENTES = [nombre for nombre in main.COMMANDS if nombre not in IMPLEMENTADOS]
 
 
 class TestParser(unittest.TestCase):
@@ -40,6 +45,14 @@ class TestParser(unittest.TestCase):
         self.assertEqual(args.host, main.config.HOST)
         self.assertEqual(args.port, main.config.PORT)
 
+    def test_map_usa_el_mapa_por_defecto_de_config(self) -> None:
+        args = main.build_parser().parse_args(["map"])
+        self.assertEqual(args.name, config.DEFAULT_MAP)
+
+    def test_map_acepta_otro_nombre(self) -> None:
+        args = main.build_parser().parse_args(["map", "--name", "simple"])
+        self.assertEqual(args.name, "simple")
+
     def test_subcomando_desconocido(self) -> None:
         with self.assertRaises(SystemExit):
             with contextlib.redirect_stderr(io.StringIO()):
@@ -62,6 +75,47 @@ class TestMain(unittest.TestCase):
         self.assertIsInstance(posicionales[0], main.server.FakeSimulation)
         self.assertEqual(nombrados["port"], 0)
         self.assertEqual(nombrados["host"], main.config.HOST)
+
+    def test_map_muestra_los_dos_mapas_y_devuelve_cero(self) -> None:
+        for nombre in graph.BUILTIN_MAPS:
+            with self.subTest(mapa=nombre):
+                with self.assertLogs(level="INFO") as capturado:
+                    self.assertEqual(main.main(["map", "--name", nombre]), 0)
+                salida = "\n".join(capturado.output)
+                self.assertIn(f"mapa {nombre}", salida)
+                self.assertIn("validate(): OK", salida)
+
+    def test_map_muestra_las_dos_coordenadas_de_cada_nodo(self) -> None:
+        with self.assertLogs(level="INFO") as capturado:
+            main.main(["map", "--name", "simple"])
+        salida = "\n".join(capturado.output)
+        # D esta en (0, 3) logicas, o sea (0, 0, 3) en Unity: la Y va a la Z.
+        self.assertIn("(0, 3)", salida)
+        self.assertIn("(0, 0, 3)", salida)
+
+    def test_map_de_un_mapa_que_no_existe_devuelve_dos(self) -> None:
+        with self.assertLogs(level="ERROR") as capturado:
+            self.assertEqual(main.main(["map", "--name", "atlantida"]), 2)
+        self.assertIn("no conozco el mapa", capturado.output[0])
+
+    def test_map_tira_del_mapa_interno_si_falta_el_fichero(self) -> None:
+        with tempfile.TemporaryDirectory() as vacia:
+            with mock.patch.object(config, "MAPS_DIR", Path(vacia)):
+                with self.assertLogs(level="WARNING") as capturado:
+                    self.assertEqual(main.main(["map", "--name", "warehouse"]), 0)
+        self.assertIn("mapa interno", capturado.output[0])
+
+    def test_map_devuelve_uno_si_el_mapa_no_es_valido(self) -> None:
+        with tempfile.TemporaryDirectory() as carpeta:
+            roto = Path(carpeta) / "roto.json"
+            roto.write_text(
+                '{"adjacency": {"A": {"B": 1}}, "positions": {"A": [0, 0]}}',
+                encoding=config.ENCODING,
+            )
+            with mock.patch.object(config, "MAPS_DIR", Path(carpeta)):
+                with self.assertLogs(level="ERROR") as capturado:
+                    self.assertEqual(main.main(["map", "--name", "roto"]), 1)
+        self.assertIn("validate()", capturado.output[0])
 
     def test_sin_argumentos_devuelve_uno(self) -> None:
         with contextlib.redirect_stdout(io.StringIO()) as salida:
