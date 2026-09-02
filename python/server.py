@@ -2,13 +2,12 @@
 
 Solo transporte: acepta conexiones, arma las lineas que llegan partidas y
 delega en `protocol.handle_line`. La simulacion entra por inyeccion de
-dependencia, asi que cambiar la falsa por la de verdad no toca este modulo.
+dependencia: aqui no vive ni una linea de logica del almacen.
 """
 
 import signal
 import socket
 import socketserver
-import threading
 from typing import Any
 
 import config
@@ -19,57 +18,6 @@ log = get_logger("server")
 
 RECV_SIZE: int = 4096
 MAX_LINE_BYTES: int = 64 * 1024
-
-FAKE_AGENT_ID: int = 1
-FAKE_STEP_SIZE: float = 0.25
-FAKE_PATH_LENGTH: float = 10.0
-FAKE_ROTATION: float = 0.0
-FAKE_STATE: str = "moving"
-
-
-class FakeSimulation:
-    """Simulacion falsa de la fase 1: un AGV que avanza en linea recta sobre +X.
-
-    Sirve para probar la comunicacion sin simulacion real. La posicion es una
-    funcion del paso, no un acumulado, asi no hay deriva de coma flotante y
-    `reset()` solo tiene que poner el contador a cero.
-
-    Es segura entre hilos: el servidor la comparte entre todos los clientes.
-    """
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._step = 0
-
-    @property
-    def step(self) -> int:
-        """Numero del ultimo paso entregado."""
-        with self._lock:
-            return self._step
-
-    def get_snapshot(self) -> protocol.Snapshot:
-        """Avanza un paso y devuelve el estado completo en coordenadas de Unity."""
-        with self._lock:
-            self._step += 1
-            paso = self._step
-
-        px = (paso * FAKE_STEP_SIZE) % FAKE_PATH_LENGTH
-        x, y, z = protocol.to_unity(px, 0.0)
-        agente: dict[str, Any] = {
-            "id": FAKE_AGENT_ID,
-            "x": x,
-            "y": y,
-            "z": z,
-            "rotation": FAKE_ROTATION,
-            "state": FAKE_STATE,
-        }
-        return {"step": paso, "agents": [agente]}
-
-    def reset(self) -> None:
-        """Vuelve al paso cero y al origen."""
-        with self._lock:
-            self._step = 0
-        log.info("simulacion reiniciada")
 
 
 class AGVRequestHandler(socketserver.BaseRequestHandler):

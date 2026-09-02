@@ -3,24 +3,41 @@
 import argparse
 from collections.abc import Sequence
 
+import astar
 import config
 import graph
 import server
+import simulation
 from logs import get_logger, setup_logging
 
 log = get_logger("main")
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """Levanta el servidor TCP para Unity."""
-    simulacion = server.FakeSimulation()
+    """Levanta el servidor TCP para Unity con la simulacion de verdad."""
+    grafo, _origen, codigo = _abre_mapa(args.map)
+    if grafo is None:
+        return codigo
+
+    simulacion = simulation.Simulation(grafo, 1)
+    log.info(
+        "sirviendo el mapa %s con %d agente(s)",
+        grafo.name or "(sin nombre)",
+        len(simulacion.agents),
+    )
     return server.serve_forever(simulacion, host=args.host, port=args.port)
 
 
-def cmd_map(args: argparse.Namespace) -> int:
-    """Muestra el mapa logico y lo valida."""
-    ruta = graph.map_path(args.name)
-    constructor = graph.BUILTIN_MAPS.get(args.name)
+def _abre_mapa(nombre: str) -> tuple[graph.WarehouseGraph | None, str, int]:
+    """Carga un mapa del disco (o el interno) y lo valida.
+
+    Devuelve (grafo, de donde salio, codigo de salida). El grafo es None si algo
+    fallo, y entonces el codigo es el que debe devolver el proceso: 1 si el mapa
+    esta roto, 2 si ni siquiera existe. Lo comparten `map`, `simulate` y `serve`,
+    que necesitan exactamente lo mismo.
+    """
+    ruta = graph.map_path(nombre)
+    constructor = graph.BUILTIN_MAPS.get(nombre)
 
     try:
         if ruta.exists():
@@ -34,23 +51,32 @@ def cmd_map(args: argparse.Namespace) -> int:
             log.error(
                 "no conozco el mapa %r: no existe %s y tampoco hay uno interno "
                 "con ese nombre (internos: %s)",
-                args.name,
+                nombre,
                 ruta,
                 ", ".join(sorted(graph.BUILTIN_MAPS)),
             )
-            return 2
+            return None, "", 2
     except graph.GraphError as exc:
         log.error("%s", exc)
-        return 1
+        return None, "", 1
 
-    # Se valida antes de informar: sin un grafo valido la tabla de coordenadas
-    # no se puede ni construir (un nodo puede no tener posicion), y el error de
+    # Se valida antes de devolverlo: sin un grafo valido no se puede ni construir
+    # la tabla de coordenadas (un nodo puede no tener posicion), y el error de
     # validate() ya dice todo lo que le pasa al mapa.
     try:
         grafo.validate()
     except graph.GraphError as exc:
         log.error("validate(): %s", exc)
-        return 1
+        return None, "", 1
+
+    return grafo, origen, 0
+
+
+def cmd_map(args: argparse.Namespace) -> int:
+    """Muestra el mapa logico y lo valida."""
+    grafo, origen, codigo = _abre_mapa(args.name)
+    if grafo is None:
+        return codigo
 
     _informa_mapa(grafo, origen)
     log.info("validate(): OK")
@@ -87,8 +113,105 @@ def _informa_mapa(grafo: graph.WarehouseGraph, origen: str) -> None:
 
 
 def cmd_simulate(args: argparse.Namespace) -> int:
-    """Corre la simulacion sin servidor."""
-    log.warning("simulate: no implementado")
+    """Corre la simulacion sin servidor y cuenta paso a paso lo que hace."""
+    if not args.headless:
+        log.warning("simulate solo tiene modo headless por ahora, corro igual")
+
+    grafo, _origen, codigo = _abre_mapa(args.map)
+    if grafo is None:
+        return codigo
+
+    por_defecto = simulation.default_route(grafo)
+    origen = args.origen if args.origen is not None else por_defecto[0]
+    destino = args.destino if args.destino is not None else por_defecto[1]
+
+    for bandera, nodo in (("--from", origen), ("--to", destino)):
+        if nodo not in grafo.adjacency:
+            log.error(
+                "%s %r no es un nodo de %s (nodos: %s)",
+                bandera,
+                nodo,
+                grafo.name or "(sin nombre)",
+                ", ".join(grafo.nodes()),
+            )
+            return 2
+
+    if args.agents > 1:
+        log.warning(
+            "%d agentes: todavia no hay gestion de colisiones, se cruzaran sin verse",
+            args.agents,
+        )
+
+    simulacion = simulation.Simulation(
+        grafo, args.agents, origin=origen, target=destino
+    )
+    return _corre_simulacion(simulacion, args.steps)
+
+
+def _corre_simulacion(simulacion: simulation.Simulation, pasos: int) -> int:
+    """Tickea hasta `pasos`, o hasta que lleguen todos, contandolo por el log."""
+    grafo = simulacion.graph
+    log.info(
+        "--- simulacion: mapa %s, %d agente(s), %d pasos como mucho ---",
+        grafo.name or "(sin nombre)",
+        len(simulacion.agents),
+        pasos,
+    )
+
+    sin_ruta = False
+    for agente in simulacion.agents:
+        if not agente.path:
+            sin_ruta = True
+            log.error(
+                "AGV %s: no hay ruta hasta %s, se queda %s en %s",
+                agente.id,
+                agente.target_node,
+                agente.state,
+                agente.current_node,
+            )
+            continue
+        log.info(
+            "AGV %s: %s -> %s | costo %g | %s",
+            agente.id,
+            agente.path[0],
+            agente.path[-1],
+            astar.path_cost(grafo, agente.path),
+            " -> ".join(agente.path),
+        )
+
+    log.info("--- pasos ---")
+    while simulacion.step < pasos and not simulacion.done:
+        simulacion.tick()
+        for agente in simulacion.agents:
+            log.info(
+                "paso %3d | AGV %s | %-7s | %-4s -> %-4s | %3.0f%% | tramo %d/%d | tarea %s",
+                simulacion.step,
+                agente.id,
+                agente.state,
+                agente.current_node,
+                agente.next_node() or "-",
+                agente.progress * 100.0,
+                agente.path_index,
+                max(len(agente.path) - 1, 0),
+                "-" if agente.task is None else agente.task,
+            )
+
+    log.info("--- resumen ---")
+    log.info("pasos dados : %d de %d", simulacion.step, pasos)
+    for agente in simulacion.agents:
+        log.info(
+            "AGV %s      : %s en %s, tramo %d/%d",
+            agente.id,
+            agente.state,
+            agente.current_node,
+            agente.path_index,
+            max(len(agente.path) - 1, 0),
+        )
+
+    if sin_ruta:
+        return 1
+    if not simulacion.done:
+        log.warning("se acabaron los pasos antes de que llegaran todos")
     return 0
 
 
@@ -151,6 +274,11 @@ def build_parser() -> argparse.ArgumentParser:
         sub = subparsers.add_parser(name, help=help_text, parents=[common])
         if name == "serve":
             sub.add_argument(
+                "--map",
+                default=config.DEFAULT_MAP,
+                help=f"Mapa a servir (por defecto {config.DEFAULT_MAP})",
+            )
+            sub.add_argument(
                 "--host",
                 default=config.HOST,
                 help=f"Direccion donde escuchar (por defecto {config.HOST})",
@@ -169,6 +297,42 @@ def build_parser() -> argparse.ArgumentParser:
                     f"Mapa a mostrar, de python/maps/ "
                     f"(por defecto {config.DEFAULT_MAP})"
                 ),
+            )
+        elif name == "simulate":
+            sub.add_argument(
+                "--map",
+                default=config.DEFAULT_MAP,
+                help=f"Mapa por el que moverse (por defecto {config.DEFAULT_MAP})",
+            )
+            sub.add_argument(
+                "--agents",
+                type=int,
+                default=1,
+                help="Cuantos AGVs correr (por defecto 1)",
+            )
+            sub.add_argument(
+                "--steps",
+                type=int,
+                default=100,
+                help="Tope de pasos, corta antes si llegan todos (por defecto 100)",
+            )
+            sub.add_argument(
+                "--headless",
+                action="store_true",
+                help="Corre sin servidor, que es el unico modo por ahora",
+            )
+            # "from" es palabra reservada, de ahi el dest explicito.
+            sub.add_argument(
+                "--from",
+                dest="origen",
+                default=None,
+                help="Nodo de salida (por defecto el de la ruta del mapa)",
+            )
+            sub.add_argument(
+                "--to",
+                dest="destino",
+                default=None,
+                help="Nodo de destino (por defecto el de la ruta del mapa)",
             )
 
     return parser

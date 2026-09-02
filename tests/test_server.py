@@ -12,18 +12,24 @@ import time
 import unittest
 
 import config
+import graph
 import protocol
 import server
+import simulation
 from tests.fake_unity_client import LineReader, validar_snapshot
 
 TIMEOUT: float = 5.0
 
 
 class ServidorEnPrueba(unittest.TestCase):
-    """Levanta un AGVServer en el puerto 0 y lo cierra al terminar."""
+    """Levanta un AGVServer en el puerto 0 y lo cierra al terminar.
+
+    Usa la simulacion de verdad sobre el mapa `simple`, que es corto: desde la
+    fase 3 ya no hay una simulacion falsa que inyectar.
+    """
 
     def setUp(self) -> None:
-        self.simulacion = server.FakeSimulation()
+        self.simulacion = simulation.Simulation(graph.simple_graph(), 1)
         self.servidor = server.AGVServer((config.HOST, 0), self.simulacion)
         self.hilo = threading.Thread(target=self.servidor.serve_forever, daemon=True)
         self.hilo.start()
@@ -210,43 +216,6 @@ class TestCierrePorSenal(unittest.TestCase):
 
     def test_sigterm_cierra_limpio(self) -> None:
         self.comprobar_cierre(signal.SIGTERM)
-
-
-class TestFakeSimulation(unittest.TestCase):
-    def test_avanza_en_linea_recta(self) -> None:
-        sim = server.FakeSimulation()
-        primero = sim.get_snapshot()["agents"][0]
-        segundo = sim.get_snapshot()["agents"][0]
-        self.assertGreater(segundo["x"], primero["x"])
-        self.assertEqual(segundo["z"], primero["z"])
-        self.assertEqual(segundo["y"], 0.0)
-
-    def test_reset_deja_el_contador_en_cero(self) -> None:
-        sim = server.FakeSimulation()
-        sim.get_snapshot()
-        sim.reset()
-        self.assertEqual(sim.step, 0)
-        self.assertEqual(sim.get_snapshot()["step"], 1)
-
-    def test_es_segura_entre_hilos(self) -> None:
-        sim = server.FakeSimulation()
-        pasos: list[int] = []
-        cerrojo = threading.Lock()
-
-        def tirar() -> None:
-            for _ in range(200):
-                paso = sim.get_snapshot()["step"]
-                with cerrojo:
-                    pasos.append(paso)
-
-        hilos = [threading.Thread(target=tirar) for _ in range(4)]
-        for hilo in hilos:
-            hilo.start()
-        for hilo in hilos:
-            hilo.join()
-
-        self.assertEqual(len(pasos), 800)
-        self.assertEqual(len(set(pasos)), 800)  # ningun paso repetido ni perdido
 
 
 if __name__ == "__main__":

@@ -27,9 +27,9 @@ Snapshot = dict[str, Any]
 class Simulation(Protocol):
     """Lo que el servidor necesita de una simulacion para poder atenderla.
 
-    Es el contrato de la inyeccion de dependencia: en la fase 1 se le pasa un
-    `server.FakeSimulation` y mas adelante la simulacion de verdad, sin tocar
-    ni el servidor ni este modulo.
+    Es el contrato de la inyeccion de dependencia: el servidor atiende a
+    cualquiera que lo cumpla. Desde la fase 3 se le pasa una
+    `simulation.Simulation`, sin tocar ni el servidor ni este modulo.
     """
 
     def get_snapshot(self) -> Snapshot:

@@ -10,9 +10,10 @@ from unittest import mock
 import config
 import graph
 import main
+import simulation
 
-# serve y map ya estan implementados; el resto sigue siendo andamiaje.
-IMPLEMENTADOS = {"serve", "map"}
+# serve, map y simulate ya estan implementados; el resto sigue siendo andamiaje.
+IMPLEMENTADOS = {"serve", "map", "simulate"}
 PENDIENTES = [nombre for nombre in main.COMMANDS if nombre not in IMPLEMENTADOS]
 
 
@@ -66,15 +67,28 @@ class TestMain(unittest.TestCase):
                 self.assertEqual(main.main([name]), 0)
             self.assertIn("no implementado", captured.output[0])
 
-    def test_serve_levanta_el_servidor_con_la_simulacion_falsa(self) -> None:
+    def test_serve_levanta_el_servidor_con_la_simulacion_de_verdad(self) -> None:
         with mock.patch.object(main.server, "serve_forever", return_value=0) as falso:
             self.assertEqual(main.main(["serve", "--port", "0"]), 0)
 
         falso.assert_called_once()
         posicionales, nombrados = falso.call_args
-        self.assertIsInstance(posicionales[0], main.server.FakeSimulation)
+        self.assertIsInstance(posicionales[0], simulation.Simulation)
         self.assertEqual(nombrados["port"], 0)
         self.assertEqual(nombrados["host"], main.config.HOST)
+
+    def test_serve_sirve_el_mapa_que_le_pidan(self) -> None:
+        with mock.patch.object(main.server, "serve_forever", return_value=0) as falso:
+            self.assertEqual(main.main(["serve", "--map", "simple", "--port", "0"]), 0)
+
+        simulacion = falso.call_args[0][0]
+        self.assertEqual(simulacion.graph.name, "simple")
+
+    def test_serve_con_un_mapa_que_no_existe_devuelve_dos(self) -> None:
+        with mock.patch.object(main.server, "serve_forever") as falso:
+            with self.assertLogs(level="ERROR"):
+                self.assertEqual(main.main(["serve", "--map", "atlantida"]), 2)
+        falso.assert_not_called()
 
     def test_map_muestra_los_dos_mapas_y_devuelve_cero(self) -> None:
         for nombre in graph.BUILTIN_MAPS:
