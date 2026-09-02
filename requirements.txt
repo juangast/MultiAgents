@@ -1,0 +1,1 @@
+# Sin dependencias: todo el proyecto usa solo la libreria estandar de Python 3.10+.
