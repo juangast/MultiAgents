@@ -1,8 +1,38 @@
-"""Fase 6: el entorno de Q-Learning. Estado, acciones y recompensa.
+"""Fases 6 y 7: el entorno de Q-Learning y el bucle que aprende encima de el.
 
-Aqui **no se entrena nada**. Se define el problema: que ve un AGV cuando le toca
-decidir, que puede hacer, y cuanto vale cada cosa que pasa. La fase 7 pone el
-bucle de aprendizaje encima de lo que hay en este modulo.
+El modulo va en dos mitades, y se leen en ese orden:
+
+**Fase 6, el entorno.** Que ve un AGV cuando le toca decidir (`get_local_state`),
+que puede hacer (`Action`), cuanto vale cada cosa que pasa (`reward`) y donde se
+guarda lo aprendido (`QTable`). Aqui no se entrena nada: se define el problema.
+
+**Fase 7, el entrenamiento.** `TrainingEnv` corre un episodio y reparte la
+recompensa, `Trainer` pone encima la actualizacion de Bellman
+
+    Q(s,a) <- Q(s,a) + alpha * [r + gamma * max_a' Q(s',a') - Q(s,a)]
+
+y `train()` / `evaluate()` son los dos modos, bien separados: TRAIN explora con
+epsilon-greedy y escribe en la tabla, EVALUATE es greedy puro, carga la tabla del
+disco y no toca nada. **Ni el uno ni el otro levantan el servidor ni hablan con
+Unity**: entrenar contra un socket solo lo haria mas lento y no le da al
+algoritmo ni un dato mas.
+
+--- Una sola Q-table para todos los AGVs (politica homogenea) ---
+
+Los N agentes comparten la **misma** tabla: todos leen de ella y todos escriben
+en ella. No es un atajo, es la decision de diseño de la fase:
+
+- Un AGV es intercambiable con otro. El estado es local y no lleva el id dentro
+  (`has_priority` dice si soy el menor, no quien soy), asi que lo que aprende el
+  AGV 3 sobre "hay alguien delante y no tengo prioridad" vale igual para el 1.
+- Cada episodio produce N veces mas experiencia. Con 4 agentes la tabla ve
+  ~4x transiciones por episodio que con politicas separadas, y son 72 estados:
+  se llenan en decenas de episodios en vez de en miles.
+- Cambiar el numero de AGVs no invalida el modelo. Se entrena con 4 y se evalua
+  con 6 sin reentrenar, porque la tabla no esta indexada por agente.
+
+Lo que se pierde es la especializacion (no puede haber un AGV "agresivo" y otro
+"cauto"), y en un almacen de AGVs identicos eso no es una perdida.
 
 --- Q-Learning NO sustituye a A* ---
 
@@ -28,22 +58,32 @@ constructor sin tocar una linea del motor:
 
 Para verlo por el log:
 
-    python3 python/qlearning.py
+    python3 python/qlearning.py                                  # el entorno
+    python3 python/main.py train --map warehouse --agents 4       # entrenar
+    python3 python/main.py evaluate --map warehouse --agents 4     # evaluar
 """
 
+import contextlib
+import csv
 import json
+import logging
 import math
 import random
-from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+import statistics
+from collections import Counter, defaultdict
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from enum import Enum
+from itertools import islice
 from pathlib import Path
 from typing import Any, Protocol
 
 import astar
 import config
 import conflicts
-from agent import STATE_MOVING, STATE_WAITING, Agent
+import simulation
+from agent import STATE_DONE, STATE_MOVING, STATE_WAITING, Agent
 from graph import WarehouseGraph
 from logs import get_logger, setup_logging
 
@@ -627,6 +667,38 @@ class QTable:
         """max_a Q(s, a). Es el termino que la fase 7 mete en la actualizacion."""
         return self.value(state, self.best_action(state, among=among))
 
+    def update(
+        self,
+        state: State,
+        action: Action,
+        reward_value: float,
+        next_state: State,
+        *,
+        alpha: float,
+        gamma: float,
+        terminal: bool = False,
+        among: Sequence[Action] | None = None,
+    ) -> float:
+        """La actualizacion de Bellman. Devuelve el Q(s, a) nuevo.
+
+            Q(s,a) <- Q(s,a) + alpha * [r + gamma * max_a' Q(s',a') - Q(s,a)]
+
+        `terminal=True` pone a cero el termino del futuro, que es lo correcto
+        cuando `s'` es el final del episodio: el AGV ya llego y detras no hay
+        nada que valorar. Sin eso la tabla arrastraria el valor de un estado que
+        no se va a vivir, y el +100 de la llegada se contaria dos veces.
+
+        `among` limita el max a las acciones que la politica puede elegir de
+        verdad (`enabled_actions()`): si REROUTE esta apagado, su celda no debe
+        entrar en el maximo o se aprenderia sobre una accion que nadie va a
+        tomar.
+        """
+        actual = self.value(state, action)
+        futuro = 0.0 if terminal else self.best_value(next_state, among=among)
+        nuevo = actual + alpha * (reward_value + gamma * futuro - actual)
+        self.set_value(state, action, nuevo)
+        return nuevo
+
     def as_dict(self) -> dict[str, dict[str, float]]:
         """La tabla en claves de texto, tal y como se guarda. Ordenada."""
         return {
@@ -636,14 +708,25 @@ class QTable:
             for estado in sorted(self._q)
         }
 
-    def save(self, path: str | Path) -> Path:
-        """Escribe la tabla en JSON, creando el directorio si hace falta."""
+    def save(
+        self, path: str | Path, *, metadata: Mapping[str, Any] | None = None
+    ) -> Path:
+        """Escribe la tabla en JSON, creando el directorio si hace falta.
+
+        `metadata` va en el mismo fichero, bajo la clave `metadata`: con que
+        mapa, cuantos agentes, que hiperparametros y que semilla se entreno esto,
+        y cuando. **Una Q-table sin saber con que se entreno no sirve**: 216
+        numeros sueltos no dicen si salieron de `warehouse` con 4 AGVs o de
+        `simple` con 2, y evaluarla en el mapa equivocado no da error, da
+        resultados malos. Lo escribe `Trainer.save()`.
+        """
         destino = Path(path)
         destino.parent.mkdir(parents=True, exist_ok=True)
         contenido: dict[str, Any] = {
             "format": FORMAT,
             "state_fields": list(STATE_FIELDS),
             "actions": [accion.value for accion in ACTIONS],
+            "metadata": dict(metadata) if metadata is not None else {},
             "q": self.as_dict(),
         }
         destino.write_text(
@@ -693,7 +776,42 @@ class QTable:
         return tabla
 
 
+def load_metadata(path: str | Path) -> dict[str, Any]:
+    """La `metadata` con la que se guardo una Q-table, o `{}` si no lleva.
+
+    Se lee aparte de `QTable.load()` a proposito: la tabla se carga para
+    *usarla* y la metadata para *contarla*, y una tabla vieja sin metadata tiene
+    que poder seguir cargando.
+    """
+    crudo = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(crudo, dict):
+        return {}
+    datos = crudo.get("metadata")
+    return dict(datos) if isinstance(datos, dict) else {}
+
+
 # --- La politica -------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class Decision:
+    """Lo que un AGV decidio en un tick concreto, con todo lo que hace falta
+    para poder pagarselo despues.
+
+    Lleva el `step` porque `QLearningPolicy` guarda **la ultima** decision de
+    cada AGV y no todas: un agente a media travesia no decide nada, asi que su
+    entrada se queda de un tick anterior. Sin la marca de paso, el entrenamiento
+    le atribuiria a la decision de ahora lo que paso hace cuatro ticks.
+
+    `reroute` es la (ruta vieja, ruta nueva) si esta decision fue un REROUTE que
+    llego a cambiar algo, y None en cualquier otro caso. Es lo que necesita
+    `is_useless_reroute()` para decidir si cobrar el castigo.
+    """
+
+    state: State
+    action: Action
+    step: int
+    reroute: tuple[tuple[str, ...], tuple[str, ...]] | None = None
 
 
 class QLearningPolicy:
@@ -739,7 +857,7 @@ class QLearningPolicy:
         self.actions: tuple[Action, ...] = enabled_actions(enable_reroute)
         self._rng = random.Random(seed)
         self._simulation: SimulationView | None = simulation
-        self._last: dict[int, tuple[State, Action]] = {}
+        self._last: dict[int, Decision] = {}
         self._last_reroute: dict[int, tuple[list[str], list[str]]] = {}
         self._avisado: bool = False
 
@@ -769,11 +887,8 @@ class QLearningPolicy:
         """
         estado = self.observe(agent, local_state)
         accion = self.choose(estado)
-        self._last[agent.id] = (estado, accion)
-
-        if accion is Action.REROUTE:
-            self._recalcula(agent)
-
+        cambio = self._recalcula(agent) if accion is Action.REROUTE else None
+        self._last[agent.id] = Decision(estado, accion, local_state.step, cambio)
         return to_engine_action(accion)
 
     def observe(
@@ -809,6 +924,17 @@ class QLearningPolicy:
 
     def last_decision(self, agent_id: int) -> tuple[State, Action] | None:
         """El (estado, accion) con el que decidio este AGV la ultima vez."""
+        decision = self._last.get(agent_id)
+        return None if decision is None else (decision.state, decision.action)
+
+    def decision(self, agent_id: int) -> Decision | None:
+        """La ultima decision entera de este AGV: estado, accion, paso y reroute.
+
+        Es lo que usa `TrainingEnv` para saber **en que tick** decidio cada uno:
+        `last_decision()` da la pareja de siempre, y esto da ademas la marca de
+        paso, que es lo que distingue una decision de este tick de la que quedo
+        de hace cuatro.
+        """
         return self._last.get(agent_id)
 
     def last_reroute(self, agent_id: int) -> tuple[list[str], list[str]] | None:
@@ -819,13 +945,21 @@ class QLearningPolicy:
         """
         return self._last_reroute.get(agent_id)
 
-    def _recalcula(self, agent: Agent) -> None:
-        """Aplica el REROUTE y se guarda las dos rutas para poder puntuarlo."""
-        anterior = list(agent.path)
+    def _recalcula(
+        self, agent: Agent
+    ) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
+        """Aplica el REROUTE y devuelve (ruta vieja, ruta nueva), o None.
+
+        None es "el recalculo no llego a cambiar nada": el AGV iba a media
+        travesia o no habia por donde. Un REROUTE que no cambia la ruta cuesta el
+        tick igual, pero no se le cobra el `USELESS_REROUTE`, porque no hubo
+        ruta nueva que juzgar.
+        """
+        anterior = tuple(agent.path)
         nueva = reroute(agent, agent.graph)
         if nueva is None:
-            return
-        self._last_reroute[agent.id] = (anterior, list(nueva))
+            return None
+        self._last_reroute[agent.id] = (list(anterior), list(nueva))
         log.debug(
             "AGV %s: reroute desde %s, %d nodos -> %d nodos",
             agent.id,
@@ -833,33 +967,1059 @@ class QLearningPolicy:
             len(anterior),
             len(nueva),
         )
+        return anterior, tuple(nueva)
+
+
+# --- Fase 7: el entrenamiento -------------------------------------------------
+#
+# Todo lo que sigue corre SIN servidor y SIN Unity. Un episodio son unos cientos
+# de ticks y se entrenan mil episodios: meter un socket en medio multiplicaria el
+# tiempo por el ping y no le daria al algoritmo ni un dato mas de los que ya
+# tiene. Unity se conecta a `main.py serve` cuando hay algo que enseñar.
+
+
+@dataclass(frozen=True, slots=True)
+class TrainingConfig:
+    """Los numeros de una corrida de entrenamiento. Por defecto, los de `config.py`.
+
+    Es inmutable y se guarda tal cual en la metadata de la Q-table: un modelo y
+    los hiperparametros con los que salio viajan juntos o no sirven.
+    """
+
+    map_name: str = config.DEFAULT_MAP
+    agents: int = config.TRAIN_AGENTS
+    episodes: int = config.EPISODES
+    seed: int = config.RANDOM_SEED
+    alpha: float = config.ALPHA
+    gamma: float = config.GAMMA
+    epsilon_start: float = config.EPSILON_START
+    epsilon_end: float = config.EPSILON_END
+    epsilon_decay: float = config.EPSILON_DECAY
+    max_steps: int = config.MAX_STEPS_PER_EPISODE
+    enable_reroute: bool | None = None
+    report_every: int = config.REPORT_EVERY
+
+    def as_dict(self) -> dict[str, Any]:
+        """Los hiperparametros en JSON, para la metadata del modelo."""
+        return {
+            "map": self.map_name,
+            "agents": self.agents,
+            "episodes": self.episodes,
+            "seed": self.seed,
+            "alpha": self.alpha,
+            "gamma": self.gamma,
+            "epsilon_start": self.epsilon_start,
+            "epsilon_end": self.epsilon_end,
+            "epsilon_decay": self.epsilon_decay,
+            "max_steps_per_episode": self.max_steps,
+            "actions": [
+                accion.value for accion in enabled_actions(self.enable_reroute)
+            ],
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class Transition:
+    """Una (s, a, r, s') lista para meter en Bellman.
+
+    `terminal` dice si `next_state` es el final: cuando un AGV llega a su
+    destino no hay futuro que descontar, y `QTable.update()` pone el termino de
+    `gamma` a cero. Un episodio cortado por el tope de pasos **no** es terminal:
+    el mundo seguia, el que se acabo fue el reloj del experimento.
+    """
+
+    agent_id: int
+    state: State
+    action: Action
+    reward: float
+    next_state: State
+    terminal: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EpisodeStats:
+    """Una fila de `results/training_log.csv`: como fue un episodio.
+
+    | Columna           | Que es                                               |
+    |-------------------|------------------------------------------------------|
+    | `episode`         | Numero de episodio, desde 1                          |
+    | `epsilon`         | El epsilon con el que se jugo (0 en EVALUATE)        |
+    | `total_reward`    | Suma de la recompensa de **todos** los AGVs          |
+    | `avg_reward`      | `total_reward` por decision tomada                   |
+    | `conflicts`       | Conflictos detectados en el episodio                 |
+    | `deadlocks`       | 1 si la corrida murio atascada, 0 si no              |
+    | `completed_tasks` | Cuantos AGVs llegaron a su destino                   |
+    | `makespan`        | Tick en que llego el ultimo; si no llegaron todos,   |
+    |                   | los ticks que duro el episodio                       |
+    | `total_wait`      | Ticks perdidos cediendo el paso, entre todos         |
+    | `states_visited`  | Estados distintos en la Q-table (acumulado, tope 72) |
+
+    `avg_reward` va **por decision** y no por agente: el episodio del principio
+    dura 200 ticks y el del final 60, asi que dividir por el numero de AGVs solo
+    reescalaria `total_reward` y no diria nada nuevo. Por decision si dice algo
+    distinto: cuanto saca el AGV cada vez que le toca elegir.
+    """
+
+    episode: int
+    epsilon: float
+    total_reward: float
+    avg_reward: float
+    conflicts: int
+    deadlocks: int
+    completed_tasks: int
+    makespan: int
+    total_wait: int
+    states_visited: int
+
+    def as_row(self) -> dict[str, Any]:
+        """La fila del CSV, con los flotantes ya redondeados."""
+        return {
+            "episode": self.episode,
+            "epsilon": round(self.epsilon, 6),
+            "total_reward": round(self.total_reward, 3),
+            "avg_reward": round(self.avg_reward, 4),
+            "conflicts": self.conflicts,
+            "deadlocks": self.deadlocks,
+            "completed_tasks": self.completed_tasks,
+            "makespan": self.makespan,
+            "total_wait": self.total_wait,
+            "states_visited": self.states_visited,
+        }
+
+
+# Las columnas del CSV, en este orden. Es el contrato del fichero.
+LOG_COLUMNS: tuple[str, ...] = (
+    "episode",
+    "epsilon",
+    "total_reward",
+    "avg_reward",
+    "conflicts",
+    "deadlocks",
+    "completed_tasks",
+    "makespan",
+    "total_wait",
+    "states_visited",
+)
+
+
+class TrainablePolicy(Protocol):
+    """Lo que `TrainingEnv` necesita de una politica para poder puntuarla.
+
+    Es `conflicts.Policy` mas tres cosas: `bind()` para que vea el estado
+    completo, `reset()` entre episodios, y `decision()` para saber **que** eligio
+    cada AGV y **en que tick**, que es lo unico con lo que se puede repartir la
+    recompensa. Lo cumplen `QLearningPolicy` y `BaselineAdapter`.
+    """
+
+    name: str
+
+    def decide(self, agent: Agent, local_state: conflicts.LocalState) -> str: ...
+
+    def bind(self, simulation: SimulationView) -> None: ...
+
+    def reset(self) -> None: ...
+
+    def decision(self, agent_id: int) -> Decision | None: ...
+
+
+class BaselineAdapter:
+    """La politica de la fase 5 con el cuaderno de la fase 7.
+
+    Decide **exactamente** lo mismo que `conflicts.BaselinePolicy` (cede el paso
+    si te ganaron el conflicto), pero ademas apunta el estado y la accion en el
+    formato de `Decision`. Sirve para medir a la baseline con la MISMA vara y en
+    los MISMOS escenarios que al Q-Learning: sin esto la comparacion del
+    `evaluate` seria entre dos numeros calculados de forma distinta.
+
+    No aprende ni guarda nada: es la referencia contra la que se compara.
+    """
+
+    name: str = "baseline"
+
+    def __init__(self, *, simulation: SimulationView | None = None) -> None:
+        self._inner = conflicts.BaselinePolicy()
+        self._simulation: SimulationView | None = simulation
+        self._last: dict[int, Decision] = {}
+
+    def __repr__(self) -> str:
+        return f"BaselineAdapter(bound={self._simulation is not None})"
+
+    def bind(self, simulation: SimulationView) -> None:
+        self._simulation = simulation
+
+    def reset(self) -> None:
+        self._last.clear()
+
+    def decide(self, agent: Agent, local_state: conflicts.LocalState) -> str:
+        estado = (
+            get_local_state(agent, self._simulation)
+            if self._simulation is not None
+            else state_from_local(agent, local_state)
+        )
+        motor = self._inner.decide(agent, local_state)
+        accion = Action.ADVANCE if motor == conflicts.ACTION_GO else Action.WAIT
+        self._last[agent.id] = Decision(estado, accion, local_state.step)
+        return motor
+
+    def decision(self, agent_id: int) -> Decision | None:
+        return self._last.get(agent_id)
+
+
+def random_routes(
+    graph: WarehouseGraph, n_agents: int, rng: random.Random
+) -> list[tuple[str, str]]:
+    """Un escenario nuevo: origenes distintos, destinos distintos, y nadie ya en casa.
+
+    Cada episodio se juega en un reparto de tareas **distinto**, sacado de un
+    generador sembrado. Con el reparto fijo de `Simulation._planea_rutas()` los
+    mil episodios serian el mismo, y la tabla aprenderia ese escenario de
+    memoria en vez de aprender a ceder el paso; ademas la curva de aprendizaje no
+    diria nada, porque el unico ruido seria el de la exploracion.
+
+    Origenes y destinos van sin repetir por lo mismo que en la fase 5: dos AGVs
+    en el mismo nodo rompen la invariante antes de mover nada, y un AGV aparcado
+    encima del destino de otro lo bloquea para siempre.
+    """
+    nodos = graph.nodes()
+    if n_agents > len(nodos):
+        raise ValueError(
+            f"no caben {n_agents} agentes en un mapa de {len(nodos)} nodo(s)"
+        )
+
+    origenes = rng.sample(nodos, n_agents)
+    destinos = rng.sample(nodos, n_agents)
+    # Rechazo simple: un AGV que sale de su propio destino tiene una ruta de un
+    # nodo, llega en el tick cero y no aporta ni una transicion al episodio.
+    for _ in range(20):
+        if all(origen != destino for origen, destino in zip(origenes, destinos)):
+            break
+        destinos = rng.sample(nodos, n_agents)
+    return list(zip(origenes, destinos))
+
+
+@dataclass(slots=True)
+class _Abierta:
+    """Una decision a la que todavia se le esta sumando la recompensa.
+
+    Un AGV decide **solo cuando esta parado en un nodo**: si elige ADVANCE, cruza
+    un tramo que cuesta entre 4 y 8 ticks y durante esos ticks no vuelve a
+    decidir nada. Todo lo que pase mientras cruza (el `+2` de llegar al nodo, el
+    `+100` de terminar) es consecuencia de aquella decision, asi que se le suma a
+    ella y la transicion se cierra cuando el AGV vuelve a decidir o cuando
+    termina. Cerrar la transicion en el mismo tick daria recompensa 0 a todos los
+    ADVANCE, y con eso no se aprende nada.
+    """
+
+    decision: Decision
+    reward: float = 0.0
+
+    def close(self, agent_id: int, next_state: State, *, terminal: bool) -> Transition:
+        return Transition(
+            agent_id=agent_id,
+            state=self.decision.state,
+            action=self.decision.action,
+            reward=self.reward,
+            next_state=next_state,
+            terminal=terminal,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _Foto:
+    """Como estaba un AGV al empezar el tick. Con esto se ve que le paso."""
+
+    path_index: int
+    state: str
+    wait_time: int
+
+
+class TrainingEnv:
+    """Un episodio: monta la simulacion, la tickea y reparte la recompensa.
+
+    No aprende: eso es `Trainer`. Lo que hace es traducir lo que pasa en la
+    `Simulation` a transiciones `(s, a, r, s')`, que es lo unico que Bellman
+    necesita. La separacion importa porque asi el mismo entorno puntua al
+    Q-Learning y a la baseline exactamente igual.
+
+        entorno = TrainingEnv(grafo, 4, politica, seed=42, max_steps=200)
+        entorno.reset()
+        while not entorno.done:
+            for transicion in entorno.step():
+                ...
+        for transicion in entorno.close_pending():
+            ...
+
+    **Cada `reset()` es un escenario nuevo** (ver `random_routes`), sacado del
+    generador sembrado en el constructor: la secuencia de episodios de una
+    semilla es siempre la misma.
+    """
+
+    def __init__(
+        self,
+        graph: WarehouseGraph,
+        n_agents: int,
+        policy: TrainablePolicy,
+        *,
+        seed: int = config.RANDOM_SEED,
+        max_steps: int = config.MAX_STEPS_PER_EPISODE,
+    ) -> None:
+        self.graph = graph
+        self.n_agents = int(n_agents)
+        self.policy = policy
+        self.max_steps = int(max_steps)
+        self._rng = random.Random(seed)
+
+        self.simulation: simulation.Simulation | None = None
+        self._abiertas: dict[int, _Abierta] = {}
+        self._llegadas: dict[int, int] = {}
+        self._deadlock: bool = False
+
+    def __repr__(self) -> str:
+        return (
+            f"TrainingEnv(map={self.graph.name!r}, agents={self.n_agents}, "
+            f"policy={self.policy.name!r}, max_steps={self.max_steps})"
+        )
+
+    @property
+    def sim(self) -> simulation.Simulation:
+        """La simulacion del episodio en curso. Revienta si no hubo `reset()`."""
+        if self.simulation is None:
+            raise RuntimeError("hace falta un reset() antes de empezar el episodio")
+        return self.simulation
+
+    @property
+    def done(self) -> bool:
+        """True si llegaron todos, si hubo deadlock o si se acabaron los ticks."""
+        return self.sim.done or self.sim.step >= self.max_steps
+
+    def reset(self) -> None:
+        """Arranca un episodio nuevo, con un reparto de tareas nuevo."""
+        rutas = random_routes(self.graph, self.n_agents, self._rng)
+        self.simulation = simulation.Simulation(
+            self.graph, self.n_agents, routes=rutas, policy=self.policy
+        )
+        self.policy.reset()
+        self.policy.bind(self.simulation)
+        self._abiertas.clear()
+        self._llegadas.clear()
+        self._deadlock = False
+
+    def step(self) -> list[Transition]:
+        """Un tick de la simulacion. Devuelve las transiciones que se cerraron.
+
+        El reparto de la recompensa va en dos pasadas, y el orden no es un
+        detalle:
+
+        1. El AGV que **ha vuelto a decidir** en este tick cierra su transicion
+           anterior: el estado que acaba de observar es el `s'` de aquella.
+        2. Los eventos del tick se le suman a la transicion abierta de cada AGV,
+           que para el que decidio ahora es la nueva, y para el que sigue
+           cruzando un tramo es la de hace varios ticks.
+        """
+        paso = self.sim.step + 1
+        antes = {
+            agente.id: _Foto(agente.path_index, agente.state, agente.wait_time)
+            for agente in self.sim.agents
+        }
+        # El registro de conflictos de la corrida solo crece, asi que lo que se
+        # anada de aqui en adelante es exactamente lo de este tick. Se marca la
+        # posicion en vez de recorrer el log entero filtrando por paso: sobre un
+        # episodio de 200 ticks eso seria cuadratico, y no hace falta.
+        ya_habia = len(self.sim.conflicts)
+
+        self.sim.tick()
+
+        murio_ahora = (
+            self.sim.finished_reason == simulation.FINISHED_DEADLOCK
+            and not self._deadlock
+        )
+        self._deadlock = self._deadlock or murio_ahora
+        en_conflicto = {
+            agent_id
+            for choque in islice(self.sim.conflicts, ya_habia, None)
+            for agent_id in choque.agents
+        }
+
+        cerradas: list[Transition] = []
+
+        for agente in self.sim.agents:
+            decision = self.policy.decision(agente.id)
+            if decision is None or decision.step != paso:
+                continue
+            abierta = self._abiertas.get(agente.id)
+            if abierta is not None:
+                cerradas.append(
+                    abierta.close(agente.id, decision.state, terminal=False)
+                )
+            self._abiertas[agente.id] = _Abierta(decision)
+
+        for agente in self.sim.agents:
+            if agente.state == STATE_DONE and antes[agente.id].state != STATE_DONE:
+                self._llegadas[agente.id] = paso
+
+            abierta = self._abiertas.get(agente.id)
+            if abierta is None:
+                continue
+
+            eventos = self._eventos(
+                agente,
+                antes[agente.id],
+                abierta.decision,
+                paso=paso,
+                en_conflicto=agente.id in en_conflicto,
+                deadlock=murio_ahora,
+            )
+            abierta.reward += sum(reward(evento) for evento in eventos)
+
+            if agente.state == STATE_DONE:
+                del self._abiertas[agente.id]
+                cerradas.append(
+                    abierta.close(
+                        agente.id, get_local_state(agente, self.sim), terminal=True
+                    )
+                )
+
+        return cerradas
+
+    def close_pending(self) -> list[Transition]:
+        """Cierra las transiciones que quedaron abiertas al acabar el episodio.
+
+        Un episodio cortado por el tope de pasos **no** es terminal: el AGV
+        seguia teniendo camino por delante y su `s'` vale lo que valga, asi que
+        se descuenta con gamma como cualquier otro. Uno que murio en deadlock si
+        lo es: detras de un atasco no hay futuro que valorar.
+        """
+        cerradas: list[Transition] = []
+        for agente in self.sim.agents:
+            abierta = self._abiertas.pop(agente.id, None)
+            if abierta is None:
+                continue
+            cerradas.append(
+                abierta.close(
+                    agente.id,
+                    get_local_state(agente, self.sim),
+                    terminal=self._deadlock or agente.state == STATE_DONE,
+                )
+            )
+        return cerradas
+
+    def stats(self, episode: int, epsilon: float, *, states_visited: int) -> EpisodeStats:
+        """Los numeros del episodio que acaba de terminar."""
+        completadas = sum(
+            1 for agente in self.sim.agents if agente.state == STATE_DONE
+        )
+        llegaron_todos = len(self._llegadas) == len(self.sim.agents)
+        return EpisodeStats(
+            episode=episode,
+            epsilon=epsilon,
+            total_reward=0.0,  # lo rellena el Trainer, que es quien las suma
+            avg_reward=0.0,
+            conflicts=self.sim.conflicts.total,
+            deadlocks=int(self._deadlock),
+            completed_tasks=completadas,
+            makespan=max(self._llegadas.values()) if llegaron_todos else self.sim.step,
+            total_wait=sum(agente.wait_time for agente in self.sim.agents),
+            states_visited=states_visited,
+        )
+
+    def _eventos(
+        self,
+        agent: Agent,
+        antes: _Foto,
+        decision: Decision,
+        *,
+        paso: int,
+        en_conflicto: bool,
+        deadlock: bool,
+    ) -> list[Event]:
+        """Que le paso a este AGV en este tick, en eventos con precio.
+
+        Cada evento salta **como mucho una vez**, y el precio de todos sale de
+        `config.py` por `reward()`. Las reglas:
+
+        - `PROGRESS`: `path_index` subio, o sea que cruzo un tramo entero. Que se
+          haya movido en pantalla no cuenta: pagar por ir a media travesia seria
+          pagar por ir despacio.
+        - `TASK_COMPLETE`: entro en `done` en este tick.
+        - `CONFLICT` frente a `WAIT`: los dos son "no se movio", y lo que los
+          separa es **haberlo intentado**. El que eligio ADVANCE teniendo un
+          conflicto encima y se quedo donde estaba, intento entrar donde no
+          cabia: -20. El que cedio el paso, -1. Si el castigo cayera sobre todos
+          los del conflicto, la accion no cambiaria la recompensa y no habria
+          nada que aprender; y si cayera sobre el que **si** paso, el AGV con
+          prioridad aprenderia a no usarla y el almacen se pararia entero.
+        - `USELESS_REROUTE`: solo el tick en que se recalculo, y solo si la ruta
+          nueva ni salia mas barata ni esquivaba un conflicto de verdad.
+        - `DEADLOCK`: a todo el que seguia en marcha cuando la corrida murio.
+        """
+        eventos: list[Event] = []
+
+        if agent.path_index > antes.path_index:
+            eventos.append(Event.PROGRESS)
+        if agent.state == STATE_DONE and antes.state != STATE_DONE:
+            eventos.append(Event.TASK_COMPLETE)
+
+        if agent.wait_time > antes.wait_time:
+            intento_entrar = decision.action is Action.ADVANCE and decision.step == paso
+            eventos.append(
+                Event.CONFLICT if intento_entrar and en_conflicto else Event.WAIT
+            )
+
+        if decision.step == paso and decision.reroute is not None:
+            vieja, nueva = decision.reroute
+            if is_useless_reroute(
+                self.graph, vieja, nueva, avoided_conflict=en_conflicto
+            ):
+                eventos.append(Event.USELESS_REROUTE)
+
+        if deadlock and agent.state != STATE_DONE:
+            eventos.append(Event.DEADLOCK)
+
+        return eventos
+
+
+class Trainer:
+    """El bucle de Q-Learning: episodios, epsilon-greedy y Bellman.
+
+    Los dos modos van bien separados y el que manda es `learn`:
+
+    | Modo       | `learn` | epsilon                 | Q-table              |
+    |------------|---------|-------------------------|----------------------|
+    | TRAIN      | `True`  | de EPSILON_START a END  | se actualiza         |
+    | EVALUATE   | `False` | **0**, greedy puro      | **no se toca**       |
+
+    En EVALUATE no hay ni azar ni escritura: `epsilon = 0` hace que
+    `QLearningPolicy.choose()` sea siempre `best_action()`, y `_aprende()` no se
+    llama. Es lo que hace que evaluar dos veces el mismo modelo devuelva
+    exactamente los mismos numeros.
+
+    Los N agentes comparten **una sola** Q-table (politica homogenea): es la
+    decision de diseño explicada arriba en el docstring del modulo.
+    """
+
+    def __init__(
+        self,
+        graph: WarehouseGraph,
+        cfg: TrainingConfig,
+        *,
+        q_table: QTable | None = None,
+        learn: bool = True,
+    ) -> None:
+        self.graph = graph
+        self.cfg = cfg
+        self.learn = learn
+        self.q: QTable = q_table if q_table is not None else QTable()
+        self.actions = enabled_actions(cfg.enable_reroute)
+        self.epsilon: float = cfg.epsilon_start if learn else 0.0
+        self.history: list[EpisodeStats] = []
+        # Cuantas veces se actualizo cada estado. Sin esto, una celda que se
+        # visito 4.000 veces y otra que se visito 3 se leen igual en el JSON, y
+        # la segunda no es una politica aprendida: es ruido con forma de numero.
+        self.visits: Counter[State] = Counter()
+
+        # Dos generadores distintos, los dos hijos de la misma semilla: si el
+        # escenario y la exploracion salieran del mismo, cambiar el numero de
+        # acciones exploradas moveria tambien el reparto de tareas de cada
+        # episodio, y dos corridas dejarian de ser comparables.
+        maestro = random.Random(cfg.seed)
+        semilla_escenarios = maestro.randrange(2**31)
+        semilla_politica = maestro.randrange(2**31)
+
+        self.policy = QLearningPolicy(
+            self.q,
+            epsilon=self.epsilon,
+            seed=semilla_politica,
+            enable_reroute=cfg.enable_reroute,
+        )
+        self.env = TrainingEnv(
+            graph,
+            cfg.agents,
+            self.policy,
+            seed=semilla_escenarios,
+            max_steps=cfg.max_steps,
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"Trainer(mode={'train' if self.learn else 'evaluate'}, "
+            f"map={self.graph.name!r}, agents={self.cfg.agents}, "
+            f"epsilon={self.epsilon:g}, states={len(self.q)})"
+        )
+
+    def decay_epsilon(self) -> float:
+        """Decaimiento exponencial con suelo: `eps <- max(END, eps * DECAY)`.
+
+        Exponencial y no lineal porque lo que hace falta es explorar mucho al
+        principio, cuando la tabla esta a ceros y cualquier cosa es informacion,
+        y cada vez menos despues. El suelo `EPSILON_END` no se quita nunca: una
+        politica que deja de explorar del todo no vuelve a corregir un estado
+        que aprendio mal.
+        """
+        self.epsilon = max(self.cfg.epsilon_end, self.epsilon * self.cfg.epsilon_decay)
+        return self.epsilon
+
+    def run_episode(self, episode: int) -> EpisodeStats:
+        """Un episodio entero: reset, ticks hasta el final y las Q que toquen."""
+        self.policy.epsilon = self.epsilon
+        self.env.reset()
+
+        total = 0.0
+        decisiones = 0
+        while not self.env.done:
+            for transicion in self.env.step():
+                total += transicion.reward
+                decisiones += 1
+                self._aprende(transicion)
+
+        for transicion in self.env.close_pending():
+            total += transicion.reward
+            decisiones += 1
+            self._aprende(transicion)
+
+        numeros = self.env.stats(episode, self.epsilon, states_visited=len(self.q))
+        return replace(
+            numeros,
+            total_reward=total,
+            avg_reward=total / decisiones if decisiones else 0.0,
+        )
+
+    def run(self, episodes: int | None = None) -> list[EpisodeStats]:
+        """El bucle: `EPISODES` episodios y un `decay_epsilon()` detras de cada uno.
+
+            for episode in range(EPISODES):
+                env.reset()
+                while not env.done:
+                    ... s, a, r, s' de cada agente, y Q(s,a) actualizada ...
+                decay_epsilon()
+
+        El log de la simulacion se calla durante la corrida: mil episodios con
+        una linea por conflicto son cientos de miles de lineas por consola, y lo
+        que se quiere leer es el resumen de cada 100.
+        """
+        cuantos = self.cfg.episodes if episodes is None else int(episodes)
+        modo = "TRAIN" if self.learn else "EVALUATE"
+        log.info(
+            "--- %s: mapa %s, %d AGVs, %d episodios, semilla %d ---",
+            modo,
+            self.graph.name or "(sin nombre)",
+            self.cfg.agents,
+            cuantos,
+            self.cfg.seed,
+        )
+        if self.learn:
+            log.info(
+                "alpha %g | gamma %g | epsilon %g -> %g (x%g por episodio) | "
+                "tope %d ticks | acciones %s",
+                self.cfg.alpha,
+                self.cfg.gamma,
+                self.cfg.epsilon_start,
+                self.cfg.epsilon_end,
+                self.cfg.epsilon_decay,
+                self.cfg.max_steps,
+                ", ".join(accion.value for accion in self.actions),
+            )
+
+        with _quiet("simulation", "agent"):
+            for episode in range(1, cuantos + 1):
+                self.history.append(self.run_episode(episode))
+                if self.learn:
+                    self.decay_epsilon()
+        return self.history
+
+    def save(self, path: str | Path = config.Q_TABLE_FILE) -> Path:
+        """Guarda la Q-table con la metadata de esta corrida."""
+        return self.q.save(path, metadata=self.metadata())
+
+    def metadata(self) -> dict[str, Any]:
+        """Con que se entreno esto: mapa, agentes, hiperparametros, semilla y fecha."""
+        ultimo = self.history[-1] if self.history else None
+        return {
+            "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "map": self.graph.name or "(sin nombre)",
+            "map_nodes": len(self.graph.nodes()),
+            "agents": self.cfg.agents,
+            "seed": self.cfg.seed,
+            "episodes_run": len(self.history),
+            "hyperparameters": self.cfg.as_dict(),
+            "final_epsilon": round(self.epsilon, 6),
+            "states_visited": len(self.q),
+            "state_space_size": state_space_size(),
+            "shared_q_table": True,
+            "visits": {
+                encode_state(estado): cuantas
+                for estado, cuantas in sorted(self.visits.items())
+            },
+            "last_episode": ultimo.as_row() if ultimo is not None else None,
+        }
+
+    def _aprende(self, transicion: Transition) -> None:
+        """Bellman, pero solo en TRAIN. En EVALUATE esto no hace nada."""
+        if not self.learn:
+            return
+        self.visits[transicion.state] += 1
+        self.q.update(
+            transicion.state,
+            transicion.action,
+            transicion.reward,
+            transicion.next_state,
+            alpha=self.cfg.alpha,
+            gamma=self.cfg.gamma,
+            terminal=transicion.terminal,
+            among=self.actions,
+        )
+
+
+# --- Los dos modos -----------------------------------------------------------
+
+
+def train(
+    graph: WarehouseGraph,
+    cfg: TrainingConfig | None = None,
+    *,
+    model_path: str | Path = config.Q_TABLE_FILE,
+    log_path: str | Path | None = config.TRAINING_LOG_FILE,
+    curve_path: str | Path | None = config.LEARNING_CURVE_FILE,
+) -> Trainer:
+    """Modo TRAIN: entrena, guarda el modelo, el CSV y la curva. Sin servidor.
+
+    Devuelve el `Trainer` con `history` lleno, por si quien llama quiere seguir
+    mirando los numeros.
+    """
+    entrenador = Trainer(graph, cfg if cfg is not None else TrainingConfig())
+    entrenador.run()
+
+    entrenador.save(model_path)
+    if log_path is not None:
+        write_training_log(entrenador.history, log_path)
+    for linea in summary_lines(entrenador.history, entrenador.cfg.report_every):
+        log.info("%s", linea)
+    if curve_path is not None:
+        save_learning_curve(entrenador.history, curve_path)
+    return entrenador
+
+
+def evaluate(
+    graph: WarehouseGraph,
+    cfg: TrainingConfig | None = None,
+    *,
+    model_path: str | Path = config.Q_TABLE_FILE,
+    episodes: int = 100,
+) -> tuple[Trainer, list[EpisodeStats]]:
+    """Modo EVALUATE: carga la Q-table del disco y juega greedy puro.
+
+    `epsilon = 0`, `learn = False`: no explora, no escribe en la tabla y no
+    guarda nada. Devuelve `(trainer, baseline)`, con la baseline corrida sobre
+    **los mismos escenarios** para que la comparacion signifique algo: los dos
+    `TrainingEnv` salen de la misma semilla, asi que el episodio 7 de uno es el
+    episodio 7 del otro, con las mismas tareas y los mismos AGVs.
+    """
+    ajustes = cfg if cfg is not None else TrainingConfig()
+    tabla = QTable.load(model_path)
+
+    aprendida = Trainer(graph, ajustes, q_table=tabla, learn=False)
+    aprendida.run(episodes)
+
+    referencia = _run_baseline(graph, ajustes, episodes)
+    return aprendida, referencia
+
+
+def _run_baseline(
+    graph: WarehouseGraph, cfg: TrainingConfig, episodes: int
+) -> list[EpisodeStats]:
+    """La baseline de la fase 5 sobre los mismos escenarios, con la misma vara."""
+    maestro = random.Random(cfg.seed)
+    semilla_escenarios = maestro.randrange(2**31)
+
+    politica = BaselineAdapter()
+    entorno = TrainingEnv(
+        graph,
+        cfg.agents,
+        politica,
+        seed=semilla_escenarios,
+        max_steps=cfg.max_steps,
+    )
+
+    historia: list[EpisodeStats] = []
+    with _quiet("simulation", "agent"):
+        for episode in range(1, episodes + 1):
+            entorno.reset()
+            total = 0.0
+            decisiones = 0
+            while not entorno.done:
+                for transicion in entorno.step():
+                    total += transicion.reward
+                    decisiones += 1
+            for transicion in entorno.close_pending():
+                total += transicion.reward
+                decisiones += 1
+            numeros = entorno.stats(episode, 0.0, states_visited=0)
+            historia.append(
+                replace(
+                    numeros,
+                    total_reward=total,
+                    avg_reward=total / decisiones if decisiones else 0.0,
+                )
+            )
+    return historia
+
+
+# --- El registro de la corrida -----------------------------------------------
+
+
+def write_training_log(
+    stats: Sequence[EpisodeStats], path: str | Path = config.TRAINING_LOG_FILE
+) -> Path:
+    """Escribe `results/training_log.csv`: una fila por episodio, cabecera incluida."""
+    destino = Path(path)
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    with destino.open("w", encoding=config.ENCODING, newline="") as fichero:
+        escritor = csv.DictWriter(fichero, fieldnames=list(LOG_COLUMNS))
+        escritor.writeheader()
+        for fila in stats:
+            escritor.writerow(fila.as_row())
+    log.info("log de entrenamiento en %s (%d episodios)", destino, len(stats))
+    return destino
+
+
+def read_training_log(path: str | Path = config.TRAINING_LOG_FILE) -> list[dict[str, str]]:
+    """Lee el CSV tal cual, en texto. Para los tests y para mirarlo a mano."""
+    with Path(path).open("r", encoding=config.ENCODING, newline="") as fichero:
+        return list(csv.DictReader(fichero))
+
+
+def summary_lines(
+    stats: Sequence[EpisodeStats], every: int = config.REPORT_EVERY
+) -> list[str]:
+    """La tabla resumen por bloques de `every` episodios, lista para el log.
+
+    Se promedia por bloques y no episodio a episodio porque cada episodio tiene
+    un reparto de tareas distinto: dos AGVs que salen pegados chocan y dos que
+    salen en esquinas opuestas no, y esa varianza tapa la tendencia. La media de
+    100 episodios sortea el mismo tipo de escenarios en todos los bloques, asi
+    que lo que cambie de un bloque a otro es la politica.
+    """
+    if not stats:
+        return ["(sin episodios)"]
+
+    cabecera = (
+        f"{'episodios':>12} {'epsilon':>8} {'recompensa':>11} {'r/decision':>11} "
+        f"{'conflictos':>11} {'deadlocks':>10} {'completadas':>12} "
+        f"{'makespan':>9} {'espera':>8} {'estados':>8}"
+    )
+    lineas = [f"--- resumen cada {every} episodios ---", cabecera, "-" * len(cabecera)]
+
+    agentes = max((fila.completed_tasks for fila in stats), default=0)
+    for arranque in range(0, len(stats), every):
+        bloque = stats[arranque : arranque + every]
+        lineas.append(
+            f"{bloque[0].episode:>5}-{bloque[-1].episode:<6} "
+            f"{statistics.fmean(f.epsilon for f in bloque):>8.3f} "
+            f"{statistics.fmean(f.total_reward for f in bloque):>11.1f} "
+            f"{statistics.fmean(f.avg_reward for f in bloque):>11.2f} "
+            f"{statistics.fmean(f.conflicts for f in bloque):>11.1f} "
+            f"{statistics.fmean(f.deadlocks for f in bloque):>10.2f} "
+            f"{statistics.fmean(f.completed_tasks for f in bloque):>12.2f} "
+            f"{statistics.fmean(f.makespan for f in bloque):>9.1f} "
+            f"{statistics.fmean(f.total_wait for f in bloque):>8.1f} "
+            f"{bloque[-1].states_visited:>8}"
+        )
+    if agentes:
+        lineas.append(f"(completadas es sobre {agentes} AGVs por episodio)")
+    return lineas
+
+
+def moving_average(values: Sequence[float], window: int) -> list[float]:
+    """Media movil centrada-a-la-izquierda, del mismo largo que la entrada."""
+    if window <= 1:
+        return [float(valor) for valor in values]
+    salida: list[float] = []
+    acumulado = 0.0
+    for indice, valor in enumerate(values):
+        acumulado += float(valor)
+        if indice >= window:
+            acumulado -= float(values[indice - window])
+        salida.append(acumulado / min(indice + 1, window))
+    return salida
+
+
+def save_learning_curve(
+    stats: Sequence[EpisodeStats],
+    path: str | Path = config.LEARNING_CURVE_FILE,
+    *,
+    window: int | None = None,
+) -> Path | None:
+    """Guarda la curva de aprendizaje en PNG. Devuelve None si no hay matplotlib.
+
+    matplotlib es opcional a proposito: el proyecto no tiene dependencias, y el
+    CSV con los mil episodios ya esta escrito antes de llegar aqui. Sin la
+    libreria se avisa por el log y se sigue; el entrenamiento no se pierde por
+    no poder dibujarlo.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")  # sin ventana: esto corre en una terminal
+        from matplotlib import pyplot as plt
+    except ImportError:
+        log.warning(
+            "matplotlib no esta instalado, me salto %s "
+            "(los mil episodios estan en el CSV igualmente)",
+            path,
+        )
+        return None
+
+    if not stats:
+        log.warning("no hay episodios que dibujar")
+        return None
+
+    ventana = window if window is not None else max(1, len(stats) // 50)
+    episodios = [fila.episode for fila in stats]
+    paneles = (
+        ("recompensa total", [fila.total_reward for fila in stats], "tab:blue"),
+        ("conflictos", [float(fila.conflicts) for fila in stats], "tab:red"),
+        ("tareas completadas", [float(fila.completed_tasks) for fila in stats], "tab:green"),
+        ("makespan (ticks)", [float(fila.makespan) for fila in stats], "tab:orange"),
+    )
+
+    figura, ejes = plt.subplots(2, 2, figsize=(12, 7), sharex=True)
+    for eje, (titulo, valores, color) in zip(ejes.flat, paneles):
+        eje.plot(episodios, valores, color=color, alpha=0.22, linewidth=0.8)
+        eje.plot(
+            episodios,
+            moving_average(valores, ventana),
+            color=color,
+            linewidth=1.8,
+            label=f"media movil ({ventana})",
+        )
+        eje.set_title(titulo)
+        eje.grid(alpha=0.25)
+        eje.legend(loc="best", fontsize="small")
+
+    for eje in ejes[-1]:
+        eje.set_xlabel("episodio")
+
+    gemelo = ejes.flat[0].twinx()
+    gemelo.plot(episodios, [fila.epsilon for fila in stats], color="grey", linestyle="--", linewidth=1.0)
+    gemelo.set_ylabel("epsilon", color="grey")
+
+    figura.suptitle("Q-Learning de AGVs: curva de aprendizaje")
+    figura.tight_layout()
+
+    destino = Path(path)
+    destino.parent.mkdir(parents=True, exist_ok=True)
+    figura.savefig(destino, dpi=120)
+    plt.close(figura)
+    log.info("curva de aprendizaje en %s", destino)
+    return destino
+
+
+def compare_lines(
+    aprendida: Sequence[EpisodeStats], baseline: Sequence[EpisodeStats]
+) -> list[str]:
+    """Q-Learning contra baseline, promedio a promedio, listo para el log.
+
+    Ojo con leer los totales crudos: **un episodio que muere antes acumula menos
+    de todo**. Una politica que se atasca en el tick 30 sale con menos
+    conflictos y menos espera que una que corre 90 ticks y entrega el triple de
+    tareas, y eso no la hace mejor. Por eso van tambien las dos tasas por tick,
+    que es lo que se puede comparar entre corridas de distinta duracion, y por
+    eso las que mandan son `completadas` y `deadlocks`.
+    """
+    if not aprendida or not baseline:
+        return ["(no hay con que comparar)"]
+
+    def medias(filas: Sequence[EpisodeStats]) -> dict[str, float]:
+        ticks = max(statistics.fmean(f.makespan for f in filas), 1.0)
+        return {
+            "recompensa": statistics.fmean(f.total_reward for f in filas),
+            "completadas": statistics.fmean(f.completed_tasks for f in filas),
+            "deadlocks": statistics.fmean(f.deadlocks for f in filas),
+            "makespan": ticks,
+            "conflictos": statistics.fmean(f.conflicts for f in filas),
+            "conflictos/tick": statistics.fmean(f.conflicts for f in filas) / ticks,
+            "espera": statistics.fmean(f.total_wait for f in filas),
+            "espera/tick": statistics.fmean(f.total_wait for f in filas) / ticks,
+        }
+
+    izquierda, derecha = medias(aprendida), medias(baseline)
+    lineas = [
+        f"--- {len(aprendida)} episodios, los mismos escenarios, medias ---",
+        f"{'metrica':<17}{'q-learning':>12}{'baseline':>12}{'diferencia':>13}",
+        "-" * 54,
+    ]
+    for nombre in izquierda:
+        uno, otro = izquierda[nombre], derecha[nombre]
+        lineas.append(f"{nombre:<17}{uno:>12.2f}{otro:>12.2f}{uno - otro:>+13.2f}")
+    lineas.append(
+        "los totales crudos (conflictos, espera) premian al que muere antes: "
+        "miralos por tick"
+    )
+    return lineas
+
+
+@contextlib.contextmanager
+def _quiet(*names: str, level: int = logging.ERROR) -> Iterator[None]:
+    """Baja el nivel de unos loggers mientras dura el bloque, y lo devuelve luego.
+
+    Mil episodios de `Simulation` son una linea de INFO por conflicto y otra por
+    reset: cientos de miles de lineas que tapan lo unico que hay que leer, que es
+    el resumen. Los errores siguen saliendo.
+    """
+    anteriores = [(logging.getLogger(nombre), logging.getLogger(nombre).level) for nombre in names]
+    for logger, _ in anteriores:
+        logger.setLevel(level)
+    try:
+        yield
+    finally:
+        for logger, nivel in anteriores:
+            logger.setLevel(nivel)
+
 
 
 __all__ = [
     "ACTIONS",
     "FORMAT",
+    "LOG_COLUMNS",
     "QUEUE_CAP",
     "STATE_FIELDS",
     "STATE_SIZES",
     "Action",
+    "BaselineAdapter",
+    "Decision",
+    "EpisodeStats",
     "Event",
     "QLearningPolicy",
     "QTable",
     "SimulationView",
     "State",
+    "TrainablePolicy",
+    "Trainer",
+    "TrainingConfig",
+    "TrainingEnv",
+    "Transition",
+    "compare_lines",
     "decode_state",
     "distance_bucket",
     "enabled_actions",
     "encode_state",
+    "evaluate",
     "get_local_state",
     "is_useless_reroute",
+    "load_metadata",
+    "moving_average",
+    "random_routes",
+    "read_training_log",
     "report_state_space",
     "reroute",
     "reroute_penalties",
     "reward",
+    "save_learning_curve",
     "state_from_local",
     "state_space_size",
+    "summary_lines",
     "to_engine_action",
+    "train",
+    "write_training_log",
 ]
 
 

@@ -12,8 +12,8 @@ import graph
 import main
 import simulation
 
-# serve, map y simulate ya estan implementados; el resto sigue siendo andamiaje.
-IMPLEMENTADOS = {"serve", "map", "simulate"}
+# Lo unico que sigue siendo andamiaje es `benchmark`.
+IMPLEMENTADOS = {"serve", "map", "simulate", "train", "evaluate"}
 PENDIENTES = [nombre for nombre in main.COMMANDS if nombre not in IMPLEMENTADOS]
 
 
@@ -138,7 +138,7 @@ class TestMain(unittest.TestCase):
 
     def test_verbose_no_truena(self) -> None:
         with self.assertLogs(level="WARNING"):
-            self.assertEqual(main.main(["--verbose", "train"]), 0)
+            self.assertEqual(main.main(["--verbose", "benchmark"]), 0)
 
 
 if __name__ == "__main__":

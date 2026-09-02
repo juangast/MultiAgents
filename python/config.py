@@ -46,7 +46,29 @@ REWARD_CONFLICT: float = -20.0        # intentar entrar en conflicto
 REWARD_DEADLOCK: float = -50.0        # provocar un deadlock
 REWARD_USELESS_REROUTE: float = -3.0  # recalcular sin ganar nada
 
+# Entrenamiento del Q-Learning (fase 7). La fase 6 define el entorno; estos son
+# los numeros del bucle que aprende encima de el, y los lee `qlearning.Trainer`.
+ALPHA: float = 0.2          # cuanto pesa lo nuevo frente a lo que ya sabia
+GAMMA: float = 0.95         # cuanto vale el futuro; casi 1 porque el +100 esta al final
+EPSILON_START: float = 1.0  # se empieza explorando del todo
+EPSILON_END: float = 0.05   # y nunca se deja de explorar un poco
+EPSILON_DECAY: float = 0.995  # exponencial: epsilon <- max(END, epsilon * DECAY)
+EPISODES: int = 1000
+# Tope de ticks por episodio. Un tramo del `warehouse` cuesta entre 4 y 8 ticks,
+# asi que una ruta entera son ~30 y 200 deja sitio de sobra para atascarse y aun
+# asi llegar. Sin tope, un episodio del principio (epsilon 1.0) no termina nunca.
+MAX_STEPS_PER_EPISODE: int = 200
+TRAIN_AGENTS: int = 4
+# Cada cuantos episodios se imprime una fila del resumen por consola.
+REPORT_EVERY: int = 100
+
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 RESULTS_DIR: Path = PROJECT_ROOT / "results"
 MAPS_DIR: Path = PROJECT_ROOT / "python" / "maps"
+MODELS_DIR: Path = PROJECT_ROOT / "python" / "models"
 DEFAULT_MAP: str = "warehouse"
+
+# Lo que produce y consume la fase 7.
+Q_TABLE_FILE: Path = MODELS_DIR / "q_table.json"
+TRAINING_LOG_FILE: Path = RESULTS_DIR / "training_log.csv"
+LEARNING_CURVE_FILE: Path = RESULTS_DIR / "learning_curve.png"

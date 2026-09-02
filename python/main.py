@@ -2,10 +2,12 @@
 
 import argparse
 from collections.abc import Sequence
+from pathlib import Path
 
 import astar
 import config
 import graph
+import qlearning
 import server
 import simulation
 from logs import get_logger, setup_logging
@@ -250,15 +252,104 @@ def _razon_del_final(simulacion: simulation.Simulation) -> str:
 
 
 def cmd_train(args: argparse.Namespace) -> int:
-    """Entrena los agentes con Q-Learning."""
-    log.warning("train: no implementado")
+    """Modo TRAIN: entrena la Q-table y escribe el modelo, el CSV y la curva.
+
+    **No levanta el servidor ni habla con Unity.** Mil episodios son unos cientos
+    de miles de ticks: meter un socket en medio multiplicaria el tiempo por el
+    ping y no le daria al algoritmo ni un dato mas. Unity entra despues, con
+    `serve`, a ver correr lo aprendido.
+    """
+    grafo, _origen, codigo = _abre_mapa(args.map)
+    if grafo is None:
+        return codigo
+
+    ajustes = _ajustes(args, grafo)
+    try:
+        entrenador = qlearning.train(
+            grafo,
+            ajustes,
+            model_path=args.model,
+            log_path=args.log,
+            curve_path=None if args.no_curve else args.curve,
+        )
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
+
+    _informa_modelo(args.model, entrenador.metadata())
     return 0
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
-    """Evalua una politica ya entrenada."""
-    log.warning("evaluate: no implementado")
+    """Modo EVALUATE: carga la Q-table del disco y juega greedy puro.
+
+    `epsilon = 0` y la tabla **no se toca**: no explora, no aprende y no guarda
+    nada. Corre ademas la baseline de la fase 5 sobre los mismos escenarios, que
+    es contra lo que hay que comparar para que los numeros signifiquen algo.
+    """
+    grafo, _origen, codigo = _abre_mapa(args.map)
+    if grafo is None:
+        return codigo
+
+    modelo = Path(args.model)
+    if not modelo.is_file():
+        log.error(
+            "no existe el modelo %s; entrenalo antes con: "
+            "python3 python/main.py train --map %s --agents %d",
+            modelo,
+            args.map,
+            args.agents,
+        )
+        return 2
+
+    try:
+        aprendida, referencia = qlearning.evaluate(
+            grafo, _ajustes(args, grafo), model_path=modelo, episodes=args.episodes
+        )
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 1
+
+    _informa_modelo(modelo, qlearning.load_metadata(modelo))
+    for linea in qlearning.compare_lines(aprendida.history, referencia):
+        log.info("%s", linea)
+    if args.log:
+        qlearning.write_training_log(aprendida.history, args.log)
     return 0
+
+
+def _ajustes(args: argparse.Namespace, grafo: graph.WarehouseGraph) -> qlearning.TrainingConfig:
+    """Arma la `TrainingConfig` con lo que venga por CLI, y el resto de config.py."""
+    return qlearning.TrainingConfig(
+        map_name=grafo.name or args.map,
+        agents=args.agents,
+        episodes=getattr(args, "episodes", config.EPISODES),
+        seed=args.seed,
+        alpha=getattr(args, "alpha", config.ALPHA),
+        gamma=getattr(args, "gamma", config.GAMMA),
+        epsilon_start=getattr(args, "epsilon_start", config.EPSILON_START),
+        epsilon_end=getattr(args, "epsilon_end", config.EPSILON_END),
+        epsilon_decay=getattr(args, "epsilon_decay", config.EPSILON_DECAY),
+        max_steps=args.max_steps,
+        enable_reroute=False if getattr(args, "no_reroute", False) else None,
+    )
+
+
+def _informa_modelo(path: str | Path, metadata: dict[str, object]) -> None:
+    """Escupe por el log con que se entreno una Q-table."""
+    log.info("--- modelo %s ---", path)
+    if not metadata:
+        log.warning("sin metadata: no hay forma de saber con que se entreno")
+        return
+    for clave, valor in metadata.items():
+        if isinstance(valor, dict):
+            log.info(
+                "%-16s: %s",
+                clave,
+                ", ".join(f"{sub}={dato}" for sub, dato in valor.items()),
+            )
+        else:
+            log.info("%-16s: %s", clave, valor)
 
 
 def cmd_benchmark(args: argparse.Namespace) -> int:
@@ -374,8 +465,98 @@ def build_parser() -> argparse.ArgumentParser:
                 default=None,
                 help="Nodo de destino (por defecto el de la ruta del mapa)",
             )
+        elif name in ("train", "evaluate"):
+            _argumentos_de_aprendizaje(sub, name)
 
     return parser
+
+
+def _argumentos_de_aprendizaje(sub: argparse.ArgumentParser, name: str) -> None:
+    """Los argumentos de `train` y `evaluate`. Los defaults salen de `config.py`.
+
+    Lo comun va primero (mapa, agentes, semilla, tope de ticks) y despues lo de
+    cada modo: `train` puede tocar los hiperparametros y elige donde escribir;
+    `evaluate` solo dice que modelo cargar y cuantos episodios jugar.
+    """
+    verbo = "entrenar" if name == "train" else "evaluar"
+    sub.add_argument(
+        "--map",
+        default=config.DEFAULT_MAP,
+        help=f"Mapa sobre el que {verbo} (por defecto {config.DEFAULT_MAP})",
+    )
+    sub.add_argument(
+        "--agents",
+        type=int,
+        default=config.TRAIN_AGENTS,
+        help=f"Cuantos AGVs por episodio (por defecto {config.TRAIN_AGENTS})",
+    )
+    sub.add_argument(
+        "--seed",
+        type=int,
+        default=config.RANDOM_SEED,
+        help=f"Semilla; la misma da la misma corrida (por defecto {config.RANDOM_SEED})",
+    )
+    sub.add_argument(
+        "--max-steps",
+        type=int,
+        default=config.MAX_STEPS_PER_EPISODE,
+        help=f"Tope de ticks por episodio (por defecto {config.MAX_STEPS_PER_EPISODE})",
+    )
+    sub.add_argument(
+        "--model",
+        default=str(config.Q_TABLE_FILE),
+        help=(
+            "Donde se escribe la Q-table"
+            if name == "train"
+            else "Q-table a cargar"
+        )
+        + f" (por defecto {config.Q_TABLE_FILE})",
+    )
+
+    if name == "train":
+        sub.add_argument(
+            "--episodes",
+            type=int,
+            default=config.EPISODES,
+            help=f"Cuantos episodios entrenar (por defecto {config.EPISODES})",
+        )
+        sub.add_argument("--alpha", type=float, default=config.ALPHA, help=f"Tasa de aprendizaje (por defecto {config.ALPHA})")
+        sub.add_argument("--gamma", type=float, default=config.GAMMA, help=f"Descuento del futuro (por defecto {config.GAMMA})")
+        sub.add_argument("--epsilon-start", type=float, default=config.EPSILON_START, help=f"Exploracion inicial (por defecto {config.EPSILON_START})")
+        sub.add_argument("--epsilon-end", type=float, default=config.EPSILON_END, help=f"Suelo de la exploracion (por defecto {config.EPSILON_END})")
+        sub.add_argument("--epsilon-decay", type=float, default=config.EPSILON_DECAY, help=f"Factor exponencial por episodio (por defecto {config.EPSILON_DECAY})")
+        sub.add_argument(
+            "--no-reroute",
+            action="store_true",
+            help="Deja fuera la accion REROUTE: solo ADVANCE y WAIT",
+        )
+        sub.add_argument(
+            "--log",
+            default=str(config.TRAINING_LOG_FILE),
+            help=f"CSV con una fila por episodio (por defecto {config.TRAINING_LOG_FILE})",
+        )
+        sub.add_argument(
+            "--curve",
+            default=str(config.LEARNING_CURVE_FILE),
+            help=f"PNG de la curva de aprendizaje (por defecto {config.LEARNING_CURVE_FILE})",
+        )
+        sub.add_argument(
+            "--no-curve",
+            action="store_true",
+            help="No dibuja la curva aunque haya matplotlib",
+        )
+    else:
+        sub.add_argument(
+            "--episodes",
+            type=int,
+            default=100,
+            help="Cuantos episodios evaluar (por defecto 100)",
+        )
+        sub.add_argument(
+            "--log",
+            default=None,
+            help="CSV opcional con los episodios de la evaluacion",
+        )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
