@@ -11,6 +11,8 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.HOST, "127.0.0.1")
         self.assertEqual(config.PORT, 5000)
         self.assertEqual(config.CMD_GET_STATE, "GET_STATE")
+        self.assertEqual(config.CMD_RESET, "RESET")
+        self.assertEqual(config.CMD_PING, "PING")
         self.assertIsInstance(config.ENCODING, str)
 
     def test_tick(self) -> None:

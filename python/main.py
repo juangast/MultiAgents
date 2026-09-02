@@ -3,6 +3,8 @@
 import argparse
 from collections.abc import Sequence
 
+import config
+import server
 from logs import get_logger, setup_logging
 
 log = get_logger("main")
@@ -10,8 +12,8 @@ log = get_logger("main")
 
 def cmd_serve(args: argparse.Namespace) -> int:
     """Levanta el servidor TCP para Unity."""
-    log.warning("serve: no implementado")
-    return 0
+    simulacion = server.FakeSimulation()
+    return server.serve_forever(simulacion, host=args.host, port=args.port)
 
 
 def cmd_simulate(args: argparse.Namespace) -> int:
@@ -74,7 +76,19 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", metavar="subcomando")
 
     for name, help_text in COMMANDS.items():
-        subparsers.add_parser(name, help=help_text, parents=[common])
+        sub = subparsers.add_parser(name, help=help_text, parents=[common])
+        if name == "serve":
+            sub.add_argument(
+                "--host",
+                default=config.HOST,
+                help=f"Direccion donde escuchar (por defecto {config.HOST})",
+            )
+            sub.add_argument(
+                "--port",
+                type=int,
+                default=config.PORT,
+                help=f"Puerto donde escuchar (por defecto {config.PORT})",
+            )
 
     return parser
 

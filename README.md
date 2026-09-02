@@ -8,8 +8,10 @@ Unity es solo el cliente visual y lo desarrolla otra persona en otro repo.
 
 > En este repo **no** se escribe nada de C# ni de Unity.
 
-Estado actual: **fase 1, andamiaje**. Todavía no hay lógica de simulación; los subcomandos
-existen pero solo avisan que no están implementados.
+Estado actual: **fase 1 terminada**. La comunicación PULL funciona de extremo a extremo, pero
+con datos falsos: `serve` levanta el servidor real y responde con un AGV que avanza en línea
+recta. Todavía no hay simulación, ni A\*, ni Q-Learning; `simulate`, `train`, `evaluate` y
+`benchmark` siguen avisando que no están implementados.
 
 ## Contrato PULL
 
@@ -29,12 +31,57 @@ Unity  ◀────  "{...json...}\n"  ────  Python
 Reglas del contrato:
 
 - Encoding `utf-8`, mensajes delimitados por salto de línea (`\n`).
+- **Una línea entra, una línea sale.** Siempre, incluso si el comando es desconocido o la línea
+  venía vacía: así el cliente nunca pierde el emparejamiento entre lo que pide y lo que recibe.
 - La respuesta es **una** línea: el JSON no lleva saltos de línea internos.
 - El estado es completo en cada respuesta, no incremental. Unity no guarda historia.
-- La forma exacta del JSON se define en la fase del servidor.
+- El comando no distingue mayúsculas de minúsculas y se admite `\r\n`.
+
+### Comandos
+
+| Comando | Qué hace | Respuesta |
+|---|---|---|
+| `GET_STATE` | Pide el estado actual | El snapshot completo |
+| `RESET` | Reinicia la simulación | `{"ok":true}` |
+| `PING` | Comprueba que el servidor vive | `{"ok":true}` |
+
+Un comando desconocido **no** cierra la conexión, responde y sigue:
+
+```
+-> BASURA\n
+<- {"error":"unknown_command","command":"BASURA"}\n
+```
+
+### Formato del snapshot
+
+Este formato está **congelado**. En fases futuras solo se le *agregan* campos; los que ya
+existen no cambian de nombre ni de tipo.
+
+```json
+{"step":1,"agents":[{"id":1,"x":0.25,"y":0.0,"z":0.0,"rotation":0.0,"state":"moving"}]}
+```
+
+| Campo | Tipo | Qué es |
+|---|---|---|
+| `step` | int | Número de paso de la simulación, empieza en 1 |
+| `agents[].id` | int | Identificador del AGV |
+| `agents[].x/y/z` | float | Posición ya en coordenadas de Unity |
+| `agents[].rotation` | float | Giro en grados sobre el eje vertical |
+| `agents[].state` | str | Qué está haciendo el AGV |
+
+### Coordenadas
+
+La simulación piensa en un plano `(px, py)`; Unity usa Y como eje vertical. La conversión es
+**una sola función**, `protocol.to_unity()`, y no se repite en ningún otro sitio:
+
+```
+unity_x = px * UNITY_SCALE
+unity_y = 0.0                # la altura la aplica Unity con el prefab
+unity_z = py * UNITY_SCALE
+```
 
 Los valores del contrato viven en `python/config.py` (`HOST`, `PORT`, `ENCODING`,
-`CMD_GET_STATE`), no sueltos por el código.
+`CMD_GET_STATE`, `CMD_RESET`, `CMD_PING`, `UNITY_SCALE`), no sueltos por el código.
 
 ## Estructura
 
@@ -43,13 +90,20 @@ agentesAGV/
 ├── python/
 │   ├── config.py       constantes (red, ticks, escala de Unity, semilla)
 │   ├── logs.py         configuración del logging
+│   ├── protocol.py     el contrato: comandos, serialización y coordenadas
+│   ├── server.py       servidor TCP y la simulación falsa de la fase 1
 │   ├── main.py         CLI con argparse
 │   └── models/         AGVs, almacén y Q-Learning (siguientes fases)
 ├── results/            salidas de las corridas (no se versionan)
-├── tests/              tests con unittest
+├── tests/              tests con unittest, y el cliente falso de Unity
 ├── requirements.txt
 └── README.md
 ```
+
+El servidor recibe la simulación por **inyección de dependencia**: `serve_forever()` acepta
+cualquier objeto con `get_snapshot()` y `reset()` (el `Protocol` está declarado en
+`protocol.Simulation`). En la fase 1 se le pasa `server.FakeSimulation`; cambiarla por la
+simulación de verdad es una línea de `main.py`.
 
 ## Requisitos
 
@@ -70,24 +124,31 @@ python3 python/main.py --help
 
 | Subcomando | Qué hace |
 |---|---|
-| `serve` | Levanta el servidor TCP y atiende las peticiones `GET_STATE` de Unity |
+| `serve` | Levanta el servidor TCP y atiende las peticiones de Unity |
 | `simulate` | Corre la simulación sin servidor, útil para probar la lógica sola |
 | `train` | Entrena los agentes con Q-Learning |
 | `evaluate` | Evalúa una política ya entrenada |
 | `benchmark` | Mide el rendimiento de la simulación |
 
 ```bash
-python3 python/main.py serve
-python3 python/main.py simulate
-python3 python/main.py train
-python3 python/main.py evaluate
-python3 python/main.py benchmark
+python3 python/main.py serve                          # 127.0.0.1:5000
+python3 python/main.py serve --port 5055              # otro puerto
+python3 python/main.py serve --host 0.0.0.0 --port 5055
 ```
+
+`Ctrl+C` cierra limpio, y también un `kill` (SIGTERM). Con un cliente conectado tarda unos
+milisegundos: los hilos de los clientes son *daemon*, no bloquean la salida.
+
+> **macOS y el puerto 5000.** El receptor de AirPlay se queda con `*:5000`. El servidor
+> igual consigue abrir `127.0.0.1:5000` porque es una dirección más específica, pero si algo
+> se comporta raro, apágalo en Ajustes → General → AirDrop y Handoff → Receptor de AirPlay, o
+> usa `--port`.
 
 ### Logs
 
 Todo sale por `stderr` con el módulo `logging`, nunca con `print`. Con `--verbose` (o `-v`)
-se activa el nivel `DEBUG`. La bandera funciona antes o después del subcomando:
+se activa el nivel `DEBUG`, que en el servidor imprime cada petición con su respuesta. La
+bandera funciona antes o después del subcomando:
 
 ```bash
 python3 python/main.py --verbose serve
@@ -100,7 +161,28 @@ python3 python/main.py serve --verbose
 python3 -m unittest discover -s tests -t . -v
 ```
 
-Cada módulo se puede importar y probar **sin levantar el servidor**.
+### Cliente falso de Unity
+
+`tests/fake_unity_client.py` hace de Unity mientras Unity no existe: se conecta, pide
+`GET_STATE` a un ritmo fijo, muestra lo que recibe, valida que cada respuesta sea JSON con la
+forma del contrato y comprueba que `step` va creciendo. Sale con código 1 si algo falla.
+
+```bash
+python3 python/main.py serve --port 5055 &
+python3 tests/fake_unity_client.py --port 5055 --seconds 60 --rate 10
+python3 tests/fake_unity_client.py --port 5055 --seconds 3 -v   # muestra cada respuesta
+```
+
+| Opción | Por defecto | Para qué |
+|---|---|---|
+| `--host` / `--port` | los de `config.py` | Contra qué servidor |
+| `--seconds` | `10` | Cuánto dura la corrida |
+| `--rate` | `config.TICK_RATE` (10) | Peticiones por segundo |
+| `--label` | vacío | Distingue varios clientes a la vez en el log |
+| `-v` | apagado | Muestra todas las respuestas, no una por segundo |
+
+Al terminar imprime un resumen con las peticiones enviadas, los errores de JSON, de forma y de
+red, y las latencias mín/media/p95/máx.
 
 ## Reglas del proyecto
 
@@ -108,5 +190,7 @@ Cada módulo se puede importar y probar **sin levantar el servidor**.
 - Sin dependencias pesadas: nada de gym, stable-baselines ni torch.
   El Q-Learning se implementa a mano con diccionarios.
 - Nada de lógica de negocio dentro de `server.py`: el servidor solo traduce sockets a llamadas.
+  `FakeSimulation` es la excepción temporal de la fase 1 y desaparece cuando llegue la
+  simulación de verdad en `python/models/`.
 - Cada módulo debe poder importarse y probarse por separado, sin levantar el servidor.
 - Logging con el módulo `logging`, nunca con `print`.
