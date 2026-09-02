@@ -344,6 +344,122 @@ Que hayan llegado todos no es un atasco: sin AGVs activos no hay deadlock.
 
 Una simulación colgada para siempre no es un resultado experimental, es un bug de la corrida.
 
+## El entorno de Q-Learning
+
+Fase 6: aquí se **define** el problema de aprendizaje; entrenarlo es la fase 7. Todo vive en
+`python/qlearning.py`, y los números que se ajustan, en `config.py`.
+
+### Q-Learning no sustituye a A\*
+
+El pathfinding lo sigue resolviendo A\*: quién dice por dónde se va de `S1` a `N6` es
+`astar.astar()`, igual que en la fase 3. Lo que se aprende es mucho más chico: **qué hacer AHORA**
+cuando la ruta que ya tengo me mete en un conflicto.
+
+Si el estado fuera la ruta entera, el espacio explotaría. En `warehouse` hay 13 nodos, y solo las
+posiciones de 6 AGVs ya son 13⁶ = 4.826.809 estados, sin contar rutas ni destinos. Con el estado
+local son **72**.
+
+### El estado: cinco enteros, discreto y local
+
+`get_local_state(agent, simulation) -> tuple` devuelve **siempre** una tupla de cinco enteros,
+hasheable y con cada campo en su rango: es la clave de la Q-table.
+
+| Campo | Valores | Qué pregunta |
+|---|---|---|
+| `next_node_occupied` | 0/1 | ¿hay alguien en el nodo al que voy a entrar? |
+| `edge_conflict` | 0/1 | ¿alguien viene de frente por mi siguiente arista? |
+| `queue_ahead` | 0/1/2 | ¿cuántos AGVs esperan en mis 2 nodos siguientes? (saturado en 2) |
+| `distance_bucket` | 0/1/2 | ¿cuánto me falta? cerca / medio / lejos |
+| `has_priority` | 0/1 | ¿soy el id menor de los que estamos en conflicto? |
+
+```
+2 × 2 × 3 × 3 × 2 = 72 estados × 3 acciones = 216 celdas de Q(s, a)
+```
+
+```bash
+python3 python/qlearning.py      # imprime el desglose por el log
+```
+
+`distance_bucket` cuenta **nodos que faltan de la ruta**, nunca distancia euclidiana: en un almacén
+dos nodos pueden estar pegados y tener medio pasillo de por medio, así que la geometría mentiría
+sobre lo que falta de verdad. Los cortes son `DISTANCE_NEAR_NODES` y `DISTANCE_MID_NODES`.
+
+Ni coordenadas continuas, ni el mapa completo, ni las rutas de los demás: cinco preguntas sobre lo
+que este AGV tiene delante.
+
+### Las acciones
+
+| Acción | Qué hace |
+|---|---|
+| `ADVANCE` | Avanzar al siguiente nodo del path que trazó A\* |
+| `WAIT` | Quedarse un tick |
+| `REROUTE` | Recalcular A\* penalizando el nodo/tramo congestionado (`astar.Penalties`) |
+
+Ninguna acción elige un nodo: la ruta la traza A\*. `REROUTE` **no mueve** al AGV en el mismo tick
+—cuando la política decide, el motor ya fijó la intención en la fase A—, así que la ruta nueva
+entra en vigor en el siguiente y hacia el motor un `REROUTE` se traduce a `wait`. Tampoco pasa por
+`Agent.assign_task()`, que reiniciaría `wait_time`: solo toca `path`, `path_index` y `progress`.
+
+`config.ENABLE_REROUTE` decide si la política puede **elegir** `REROUTE`; con el flag apagado
+quedan `ADVANCE` y `WAIT`, por si la fase 7 converge antes con dos acciones. El flag no cambia la
+Q-table, que guarda siempre las tres: encenderlo después no obliga a migrar ningún fichero.
+
+### La recompensa
+
+Una sola función, `reward(event)`, y los seis números en `config.py` para poder ajustarlos sin
+buscar por el código:
+
+| Evento | Valor | Cuándo |
+|---|---|---|
+| `TASK_COMPLETE` | +100 | el AGV llegó a su destino |
+| `PROGRESS` | +2 | **`path_index` subió**, no que se moviera por el mapa |
+| `WAIT` | -1 | se quedó un tick parado |
+| `CONFLICT` | -20 | intentó entrar donde había choque |
+| `DEADLOCK` | -50 | la corrida murió atascada |
+| `USELESS_REROUTE` | -3 | recalculó **sin salir más barato y sin esquivar un conflicto real** |
+
+Un evento mal escrito lanza `ValueError` en vez de devolver 0.0: un premio invisible se busca
+durante días. Lo de `USELESS_REROUTE` lo decide `is_useless_reroute()`, que compara por costo
+(`astar.path_cost`), no por número de nodos.
+
+### La Q-table
+
+`dict[tuple, dict[Action, float]]` con `defaultdict`: un estado nuevo nace con sus acciones a cero,
+así que la fase 7 puede preguntar por cualquier estado sin comprobar antes si existe. `save(path)` y
+`load(path)` en JSON:
+
+```json
+{
+  "format": "agv-qtable/1",
+  "state_fields": ["next_node_occupied", "edge_conflict", "queue_ahead",
+                   "distance_bucket", "has_priority"],
+  "actions": ["advance", "wait", "reroute"],
+  "q": { "0|1|2|1|0": {"advance": 1.5, "wait": -0.25, "reroute": 0.0} }
+}
+```
+
+La clave es la tupla de estado con los campos en el orden de `state_fields`, separados por `|`
+(JSON no admite tuplas como clave, y así se lee de un vistazo). `state_fields` va escrito en el
+fichero a propósito: sin él, una tabla guardada hoy y leída después de reordenar los campos
+seguiría cargando, y aprendería sobre estados equivocados sin avisar.
+
+### La política
+
+`QLearningPolicy` cumple el mismo contrato que la baseline (`name` + `decide(agent, local_state)`),
+así que entra por el constructor **sin tocar `simulation.py`**:
+
+```python
+politica = qlearning.QLearningPolicy()
+simulacion = Simulation(grafo, 6, policy=politica)
+politica.bind(simulacion)      # para que vea el estado completo
+```
+
+En la fase 6 no aprende: elige la mejor acción de una tabla que está a ceros, o sea que siempre
+avanza (con `epsilon > 0` explora, con un generador sembrado para que la corrida siga siendo
+reproducible). Lo que se demuestra ahora no es lo que decide, es que se enchufa. Sin `bind()`
+sigue funcionando, pero saca el estado del `LocalState` del motor y ahí `queue_ahead` es una
+aproximación; avisa una vez por el log.
+
 ## Estructura
 
 ```
@@ -358,6 +474,7 @@ agentesAGV/
 │   ├── agent.py        el AGV: ruta, estado y tarea
 │   ├── conflicts.py    conflictos, ocupación y la política base
 │   ├── simulation.py   el almacén en marcha: agentes, ticks y snapshot
+│   ├── qlearning.py    el entorno de Q-Learning: estado, acciones y recompensa
 │   ├── main.py         CLI con argparse
 │   ├── maps/           los mapas en JSON (simple.json, warehouse.json)
 │   └── models/         Q-Learning (siguientes fases)
@@ -481,6 +598,7 @@ python3 python/main.py serve --verbose
 python3 -m unittest discover -s tests -t . -v
 python3 -m unittest tests.test_astar -v          # solo la fase 3
 python3 -m unittest tests.test_conflicts -v      # solo la fase 5
+python3 -m unittest tests.test_qlearning -v      # solo la fase 6
 ```
 
 | Fichero | Qué cubre |
@@ -493,10 +611,15 @@ python3 -m unittest tests.test_conflicts -v      # solo la fase 5
 | `test_main.py` | El CLI |
 | `test_astar.py` | La fase 3: A\*, penalizaciones, `Agent`, `Simulation` y el snapshot |
 | `test_conflicts.py` | La fase 5: conflictos, política base, invariante y deadlock |
+| `test_qlearning.py` | La fase 6: estado, acciones, recompensa, Q-table y la política |
 
 `test_astar.py` compara A\* contra una **búsqueda exhaustiva** en los dos mapas (los 186 pares
 ordenados de nodos), comprueba que cada par consecutivo de una ruta es una arista de verdad, y
 valida el snapshot con el mismo `validar_snapshot()` que usa el cliente falso de Unity.
+
+`test_qlearning.py` comprueba que el espacio de estados son 72 (y falla si pasa de 500), que
+`get_local_state()` devuelve la misma tupla de cinco enteros en 200 ticks con 6 AGVs, y que la
+política se intercambia con la baseline sin tocar el motor.
 
 `test_conflicts.py` monta a propósito un cruce de frente y demuestra que se detecta como
 `edge conflict`, y corre **500 ticks con 6 AGVs** comprobando en cada tick que no hay dos en el
