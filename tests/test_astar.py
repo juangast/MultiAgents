@@ -20,6 +20,15 @@ import simulation
 from tests.fake_unity_client import CAMPOS_AGENTE, validar_snapshot
 
 
+def sin_el_numero_de_corrida(instantanea: dict) -> dict:
+    """El snapshot sin `stats.run`, para comparar dos corridas entre si."""
+    copia = dict(instantanea)
+    copia["stats"] = {
+        clave: valor for clave, valor in copia["stats"].items() if clave != "run"
+    }
+    return copia
+
+
 def mapas_del_repo() -> list[graph.WarehouseGraph]:
     """Los dos mapas de verdad del proyecto."""
     return [graph.simple_graph(), graph.warehouse_graph()]
@@ -408,11 +417,19 @@ class TestDeterminismo(unittest.TestCase):
             self.assertEqual(una.get_snapshot(), otra.get_snapshot())
 
     def test_reset_repite_la_corrida_clavada(self) -> None:
+        # `stats.run` es lo unico que cambia entre corridas, y a proposito: es el
+        # contador que deja a Unity distinguir un reinicio de un `step` estancado.
         simulacion = simulation.Simulation(graph.warehouse_graph(), 1)
-        primera = [simulacion.get_snapshot() for _ in range(30)]
+        primera = [sin_el_numero_de_corrida(simulacion.get_snapshot()) for _ in range(30)]
         simulacion.reset()
-        segunda = [simulacion.get_snapshot() for _ in range(30)]
+        segunda = [sin_el_numero_de_corrida(simulacion.get_snapshot()) for _ in range(30)]
         self.assertEqual(primera, segunda)
+
+    def test_el_numero_de_corrida_sube_en_cada_reset(self) -> None:
+        simulacion = simulation.Simulation(graph.warehouse_graph(), 1)
+        self.assertEqual(simulacion.get_snapshot()["stats"]["run"], 1)
+        simulacion.reset()
+        self.assertEqual(simulacion.get_snapshot()["stats"]["run"], 2)
 
     def test_la_semilla_sale_de_config(self) -> None:
         self.assertEqual(
@@ -799,8 +816,10 @@ class TestSimulateCLI(unittest.TestCase):
             self.assertEqual(main.main(["simulate", "--map", "simple"]), 0)
         self.assertIn("headless", "\n".join(capturado.output))
 
-    def test_con_varios_agentes_avisa_de_que_no_hay_colisiones(self) -> None:
-        with self.assertLogs(level="WARNING") as capturado:
+    def test_con_varios_agentes_gestiona_los_conflictos(self) -> None:
+        # Hasta la fase 4 esto avisaba de que los AGVs se cruzarian sin verse.
+        # Ahora se ven: el resumen trae el conteo de conflictos y por que acabo.
+        with self.assertLogs(level="INFO") as capturado:
             self.assertEqual(
                 main.main(
                     ["simulate", "--map", "warehouse", "--agents", "3",
@@ -808,7 +827,23 @@ class TestSimulateCLI(unittest.TestCase):
                 ),
                 0,
             )
-        self.assertIn("colisiones", "\n".join(capturado.output))
+        salida = "\n".join(capturado.output)
+        self.assertIn("conflictos  :", salida)
+        self.assertIn("final       :", salida)
+        self.assertIn("espera total:", salida)
+        self.assertNotIn("colisiones", salida)
+
+    def test_mas_agentes_que_nodos_no_arranca(self) -> None:
+        # Cada AGV necesita un nodo de salida para el solo, o la invariante de
+        # ocupacion nace rota antes de mover nada.
+        with self.assertLogs(level="ERROR") as capturado:
+            self.assertEqual(
+                main.main(
+                    ["simulate", "--map", "simple", "--agents", "7", "--headless"]
+                ),
+                2,
+            )
+        self.assertIn("no caben", "\n".join(capturado.output))
 
     def test_los_valores_por_defecto_del_parser(self) -> None:
         args = main.build_parser().parse_args(["simulate"])

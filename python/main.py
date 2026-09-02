@@ -19,11 +19,17 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if grafo is None:
         return codigo
 
-    simulacion = simulation.Simulation(grafo, 1)
+    try:
+        simulacion = simulation.Simulation(grafo, args.agents)
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
+
     log.info(
-        "sirviendo el mapa %s con %d agente(s)",
+        "sirviendo el mapa %s con %d agente(s) y politica %s",
         grafo.name or "(sin nombre)",
         len(simulacion.agents),
+        simulacion.policy.name,
     )
     return server.serve_forever(simulacion, host=args.host, port=args.port)
 
@@ -136,25 +142,29 @@ def cmd_simulate(args: argparse.Namespace) -> int:
             )
             return 2
 
-    if args.agents > 1:
-        log.warning(
-            "%d agentes: todavia no hay gestion de colisiones, se cruzaran sin verse",
-            args.agents,
+    try:
+        simulacion = simulation.Simulation(
+            grafo, args.agents, origin=origen, target=destino
         )
-
-    simulacion = simulation.Simulation(
-        grafo, args.agents, origin=origen, target=destino
-    )
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
     return _corre_simulacion(simulacion, args.steps)
 
 
 def _corre_simulacion(simulacion: simulation.Simulation, pasos: int) -> int:
-    """Tickea hasta `pasos`, o hasta que lleguen todos, contandolo por el log."""
+    """Tickea hasta `pasos`, o hasta que lleguen todos, contandolo por el log.
+
+    Devuelve 0 aunque la corrida muera en deadlock: un baseline que se atasca es
+    un resultado experimental valido, no un fallo del programa. Lo unico que se
+    considera error es que un AGV no tenga ni ruta que seguir.
+    """
     grafo = simulacion.graph
     log.info(
-        "--- simulacion: mapa %s, %d agente(s), %d pasos como mucho ---",
+        "--- simulacion: mapa %s, %d agente(s), politica %s, %d pasos como mucho ---",
         grafo.name or "(sin nombre)",
         len(simulacion.agents),
+        simulacion.policy.name,
         pasos,
     )
 
@@ -184,7 +194,8 @@ def _corre_simulacion(simulacion: simulation.Simulation, pasos: int) -> int:
         simulacion.tick()
         for agente in simulacion.agents:
             log.info(
-                "paso %3d | AGV %s | %-7s | %-4s -> %-4s | %3.0f%% | tramo %d/%d | tarea %s",
+                "paso %3d | AGV %s | %-7s | %-4s -> %-4s | %3.0f%% | tramo %d/%d "
+                "| espera %3d | tarea %s",
                 simulacion.step,
                 agente.id,
                 agente.state,
@@ -193,26 +204,49 @@ def _corre_simulacion(simulacion: simulation.Simulation, pasos: int) -> int:
                 agente.progress * 100.0,
                 agente.path_index,
                 max(len(agente.path) - 1, 0),
+                agente.wait_time,
                 "-" if agente.task is None else agente.task,
             )
 
+    numeros = simulacion.stats()
     log.info("--- resumen ---")
     log.info("pasos dados : %d de %d", simulacion.step, pasos)
+    log.info("final       : %s", _razon_del_final(simulacion))
+    log.info(
+        "conflictos  : %d (%s)",
+        numeros["conflicts"],
+        ", ".join(
+            f"{tipo} {cuantos}"
+            for tipo, cuantos in numeros["conflicts_by_type"].items()
+        ),
+    )
+    log.info("espera total: %d ticks entre todos", numeros["total_wait_time"])
     for agente in simulacion.agents:
         log.info(
-            "AGV %s      : %s en %s, tramo %d/%d",
+            "AGV %s      : %s en %s, tramo %d/%d, %d ticks esperando",
             agente.id,
             agente.state,
             agente.current_node,
             agente.path_index,
             max(len(agente.path) - 1, 0),
+            agente.wait_time,
         )
 
     if sin_ruta:
         return 1
-    if not simulacion.done:
-        log.warning("se acabaron los pasos antes de que llegaran todos")
     return 0
+
+
+def _razon_del_final(simulacion: simulation.Simulation) -> str:
+    """Por que se paro la corrida, en una linea para el resumen."""
+    if simulacion.finished_reason == simulation.FINISHED_DEADLOCK:
+        return (
+            f"deadlock, nadie avanzo en {config.DEADLOCK_TICKS} ticks seguidos "
+            f"(el baseline no sabe deshacerlo: para eso esta el Q-Learning)"
+        )
+    if simulacion.done:
+        return "llegaron todos"
+    return "se acabaron los pasos antes de que llegaran todos"
 
 
 def cmd_train(args: argparse.Namespace) -> int:
@@ -288,6 +322,12 @@ def build_parser() -> argparse.ArgumentParser:
                 type=int,
                 default=config.PORT,
                 help=f"Puerto donde escuchar (por defecto {config.PORT})",
+            )
+            sub.add_argument(
+                "--agents",
+                type=int,
+                default=1,
+                help="Cuantos AGVs servir (por defecto 1)",
             )
         elif name == "map":
             sub.add_argument(

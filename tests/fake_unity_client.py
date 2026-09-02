@@ -30,6 +30,8 @@ from logs import get_logger, setup_logging  # noqa: E402
 
 RECV_SIZE: int = 4096
 CAMPOS_AGENTE: tuple[str, ...] = ("id", "x", "y", "z", "rotation", "state")
+# Los que agrega la fase 5 al primer nivel del snapshot.
+CAMPOS_STATS: tuple[str, ...] = ("run", "conflicts", "deadlocks", "finished_reason")
 
 
 class LineReader:
@@ -75,6 +77,15 @@ def validar_snapshot(payload: Any) -> str:
         faltan = [campo for campo in CAMPOS_AGENTE if campo not in agente]
         if faltan:
             return f"al agente {indice} le faltan campos: {', '.join(faltan)}"
+
+    numeros = payload.get("stats")
+    if not isinstance(numeros, dict):
+        return "falta el campo 'stats' como objeto"
+    faltan = [campo for campo in CAMPOS_STATS if campo not in numeros]
+    if faltan:
+        return f"a 'stats' le faltan campos: {', '.join(faltan)}"
+    if not isinstance(numeros["conflicts"], int):
+        return "'stats.conflicts' tendria que ser un entero"
     return ""
 
 
@@ -90,7 +101,9 @@ class Resumen:
         self.latencias: list[float] = []
         self.primer_step: int | None = None
         self.ultimo_step: int | None = None
+        self.ultima_corrida: int | None = None
         self.pasos_no_crecientes = 0
+        self.reinicios = 0
 
     @property
     def hubo_fallos(self) -> bool:
@@ -110,13 +123,30 @@ class Resumen:
         indice = min(len(ordenadas) - 1, int(fraccion * len(ordenadas)))
         return ordenadas[indice]
 
-    def registrar_step(self, step: int) -> None:
-        """Anota el paso recibido y vigila que sea estrictamente creciente."""
-        if self.primer_step is None:
-            self.primer_step = step
+    def registrar_step(self, step: int, corrida: int | None = None) -> None:
+        """Anota el paso recibido y vigila que sea estrictamente creciente.
+
+        Desde la fase 5 el servidor puede arrancar una corrida nueva solo, cuando
+        la anterior muere en deadlock, y entonces `step` vuelve a 1. Eso no es un
+        paso estancado: es otra corrida, y se reconoce porque `stats.run` sube.
+        Un `step` que baja **sin** que cambie la corrida sigue siendo un fallo.
+        """
+        empezo_otra_corrida = (
+            corrida is not None
+            and self.ultima_corrida is not None
+            and corrida > self.ultima_corrida
+        )
+        if empezo_otra_corrida:
+            self.reinicios += 1
+        elif self.primer_step is None:
+            pass
         elif self.ultimo_step is not None and step <= self.ultimo_step:
             self.pasos_no_crecientes += 1
+
+        if self.primer_step is None:
+            self.primer_step = step
         self.ultimo_step = step
+        self.ultima_corrida = corrida
 
 
 def correr(host: str, port: int, segundos: float, rate: float, log: Any) -> Resumen:
@@ -172,7 +202,7 @@ def correr(host: str, port: int, segundos: float, rate: float, log: Any) -> Resu
                 continue
 
             resumen.ok += 1
-            resumen.registrar_step(payload["step"])
+            resumen.registrar_step(payload["step"], payload["stats"]["run"])
 
             if numero % max(1, round(rate)) == 0:
                 log.info(
@@ -196,6 +226,7 @@ def informar(resumen: Resumen, log: Any) -> None:
     log.info("errores de forma  : %d", resumen.errores_forma)
     log.info("errores de red    : %d", resumen.errores_red)
     log.info("steps no crecientes: %d", resumen.pasos_no_crecientes)
+    log.info("corridas nuevas   : %d", resumen.reinicios)
     log.info("step primero/ultimo: %s / %s", resumen.primer_step, resumen.ultimo_step)
 
     if resumen.latencias:

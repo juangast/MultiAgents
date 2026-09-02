@@ -8,12 +8,19 @@ Unity es solo el cliente visual y lo desarrolla otra persona en otro repo.
 
 > En este repo **no** se escribe nada de C# ni de Unity.
 
-Estado actual: **fase 3 terminada**. Ya no hay datos falsos: `serve` levanta el servidor con la
-simulación de verdad y el AGV recorre el grafo del almacén con rutas calculadas por **A\***. La
-fase 3 añade el pathfinding (`python/astar.py`), el agente (`python/agent.py`) y la simulación
-(`python/simulation.py`), y estrena el subcomando `simulate`. La `FakeSimulation` de la fase 1
-ha desaparecido. Todavía no hay Q-Learning: `train`, `evaluate` y `benchmark` siguen avisando
-que no están implementados.
+Estado actual: **fase 5 terminada**. Los AGVs ya no se atraviesan: la fase 5 añade la detección
+de conflictos y la política base (`python/conflicts.py`), parte el tick en dos fases y saca los
+números de cada corrida en `snapshot["stats"]`. La política es **intercambiable**, así que el
+Q-Learning de la fase 8 entra sin tocar el motor.
+
+Antes: la fase 3 trajo el pathfinding (`python/astar.py`), el agente (`python/agent.py`) y la
+simulación (`python/simulation.py`), y estrenó el subcomando `simulate`. La `FakeSimulation` de
+la fase 1 ha desaparecido. Todavía no hay aprendizaje: `train`, `evaluate` y `benchmark` siguen
+avisando que no están implementados.
+
+> El baseline **no** está para funcionar bien. Está para funcionar siempre igual y dejar números
+> que medir: gana el AGV de id menor y punto, así que se atasca en el cuello de botella. Sin esa
+> referencia no habría con qué comparar el Q-Learning después.
 
 ## Contrato PULL
 
@@ -77,13 +84,32 @@ existen no cambian de nombre ni de tipo.
 | `agents[].next_node` | str \| null | fase 3 | Hacia dónde va ahora, `null` si ya llegó |
 | `agents[].path` | list[str] | fase 3 | La ruta entera, para poder pintarla |
 | `agents[].task` | int \| null | fase 3 | Id de la tarea que lleva |
+| `agents[].wait_time` | int | fase 5 | Ticks **acumulados** que lleva cediendo el paso |
+| `stats` | object | fase 5 | Los números de la corrida, ver abajo |
 
 La **posición va interpolada** entre `node` y `next_node`: un AGV a mitad de un tramo manda la
 mitad de camino, no el nodo de destino. Así Unity puede mover el prefab sin teletransportes.
 
-> Los cuatro campos de la fase 3 son *añadidos*: los cinco de la fase 1 conservan nombre y tipo,
-> y `JsonUtility` de Unity ignora lo que no conoce, así que un cliente de la fase 1 sigue
+> Los campos de las fases 3 y 5 son *añadidos*: los de la fase 1 conservan nombre y tipo, y
+> `JsonUtility` de Unity ignora lo que no conoce, así que un cliente de la fase 1 sigue
 > funcionando sin tocarle una línea.
+
+#### `stats`
+
+| Campo | Tipo | Qué es |
+|---|---|---|
+| `run` | int | Número de corrida; sube en cada `reset()` |
+| `policy` | str | La política activa (`baseline` por ahora) |
+| `conflicts` | int | Conflictos detectados en esta corrida |
+| `conflicts_by_type` | object | Desglose: `vertex`, `edge`, `following`, `congestion` |
+| `deadlocks` | int | Atascos de la **sesión**; no se borra al reiniciar |
+| `waiting` | int | Cuántos AGVs están cediendo el paso ahora mismo |
+| `total_wait_time` | int | Suma del `wait_time` de todos |
+| `finished_reason` | str \| null | `"deadlock"` si la corrida murió atascada |
+
+Cuando una corrida muere en deadlock, el servidor entrega **una vez** el snapshot del atasco
+(con `finished_reason` puesto) y en la petición siguiente arranca otra corrida: `step` vuelve a 1
+y `run` sube. Es la única situación en la que `step` no crece, y se reconoce por `run`.
 
 ### Coordenadas
 
@@ -234,18 +260,103 @@ forma determinista con `config.RANDOM_SEED`, así que dos corridas dan exactamen
 Sin ruta posible el agente se queda `idle` y la simulación sigue: que dos zonas del almacén estén
 incomunicadas es un estado normal del mapa, no un error del programa.
 
+## Conflictos y política base
+
+### El tick va en dos fases
+
+Las dos dentro del **mismo** paso: declarar la intención no puede costar un tick extra, o un AGV
+solo tardaría el doble en cruzar el almacén y las medidas de la fase 3 dejarían de valer.
+
+```
+FASE A   cada AGV parado en un nodo declara a cuál quiere entrar
+FASE B   se detectan los conflictos -> la política decide quién cede -> se mueve
+```
+
+El conflicto se ve **antes** de mover a nadie: la detección trabaja sobre las intenciones y sobre
+la ocupación tal como estaban al empezar el tick, así que el perdedor de un choque termina el
+paso exactamente donde empezó.
+
+### Reserva doble: un nodo, un AGV
+
+El movimiento es continuo, así que a media travesía el `current_node` de un AGV sigue siendo el
+nodo del que salió. Por eso el que cruza `X → Y` **retiene los dos** y suelta `X` solo al llegar:
+
+```
+tick 3:   AGV 1  ------>------   progreso 0.4
+          X                 Y
+   occupancy:  X -> 1,  Y -> 1
+
+   AGV 2 quiere entrar en X  ->  FOLLOWING CONFLICT  ->  waiting
+```
+
+`occupancy` es `nodo -> un solo agent_id`, y esa es la invariante del almacén. Lo contrario sí
+vale: un AGV puede tener dos nodos, un nodo nunca tiene dos AGVs.
+
+La consecuencia es que el **following está prohibido**: nadie entra en el nodo que otro está
+dejando hasta que lo suelta. Es una decisión, no un descuido. Cuesta throughput y provoca
+deadlocks, pero deja la invariante comprobable directamente sobre `current_node`, sin trucos, y
+un baseline que se atasca es exactamente lo que hace falta para que la fase 8 tenga qué mejorar.
+
+### Los cuatro conflictos
+
+| Tipo | Qué es |
+|---|---|
+| `vertex` | Dos o más AGVs quieren el mismo nodo. El que ya está encima cuenta como uno más |
+| `edge` | Cruce de frente: A va de X a Y mientras B va de Y a X |
+| `following` | A quiere entrar en el nodo que B está dejando. No se permite |
+| `congestion` | Un AGV pasa de `CONFLICT_WAIT_THRESHOLD` esperando, o hay `CONGESTION_ZONE_AGENTS` esperando en una zona (un nodo y sus vecinos) |
+
+La congestión se cuenta **solo en el tick en que se cruza el umbral**. Un atasco de cincuenta
+ticks es un conflicto, no cincuenta, o el número dejaría de significar algo. Los otros tres sí se
+cuentan cada tick: mientras el choque siga ahí, sigue siendo un choque.
+
+### La política
+
+`resolve_baseline()` es toda la inteligencia que hay: **gana el AGV de id menor**, el resto pasa a
+`waiting` y suma un tick a su `wait_time`. Es pura — dice quién gana, no toca a nadie; quien
+aplica el cambio de estado es el motor.
+
+Por debajo de la política hay un **gate físico**: diga lo que diga, en un nodo ocupado no se
+entra. Eso hace la invariante inviolable venga la política que venga, incluida la que aprenda la
+fase 8.
+
+En un cruce de frente el baseline se ve tal como es: nombra ganador al de id menor, pero el
+perdedor sigue sentado en el nodo destino, así que el gate frena **también al ganador** y los dos
+se quedan esperando hasta el deadlock. El baseline no sabe deshacer eso. Para eso está el
+Q-Learning.
+
+`Simulation` recibe la política por el constructor, igual que el servidor recibe la simulación:
+
+```python
+simulacion = Simulation(grafo, 6, policy=MiPolitica())
+```
+
+Cualquier objeto con `name` y `decide(agent, local_state) -> "go" | "wait"` vale
+(`conflicts.Policy`). `local_state` es deliberadamente **local**: el nodo en el que está, a dónde
+quiere ir, lo que lleva esperando y quién le ganó este tick. Ni el mapa entero ni las rutas de los
+demás; si pudiera mirarlo todo aprendería una política centralizada, que es otro problema.
+
+### Deadlock
+
+Si en `config.DEADLOCK_TICKS` ticks seguidos no avanza **ningún** AGV activo, la corrida se marca
+como muerta (`finished_reason = "deadlock"`), se cuenta en `stats.deadlocks` y `simulate` para.
+Que hayan llegado todos no es un atasco: sin AGVs activos no hay deadlock.
+
+Una simulación colgada para siempre no es un resultado experimental, es un bug de la corrida.
+
 ## Estructura
 
 ```
 agentesAGV/
 ├── python/
-│   ├── config.py       constantes (red, ticks, escala de Unity, semilla)
+│   ├── config.py       constantes (red, ticks, Unity, semilla, umbrales)
 │   ├── logs.py         configuración del logging
 │   ├── protocol.py     el contrato: comandos, serialización y coordenadas
 │   ├── server.py       servidor TCP, solo transporte
 │   ├── graph.py        el mapa lógico: grafo, validación y carga desde JSON
 │   ├── astar.py        pathfinding con A\* y penalizaciones
 │   ├── agent.py        el AGV: ruta, estado y tarea
+│   ├── conflicts.py    conflictos, ocupación y la política base
 │   ├── simulation.py   el almacén en marcha: agentes, ticks y snapshot
 │   ├── main.py         CLI con argparse
 │   ├── maps/           los mapas en JSON (simple.json, warehouse.json)
@@ -297,7 +408,11 @@ python3 python/main.py serve                          # 127.0.0.1:5000
 python3 python/main.py serve --port 5055              # otro puerto
 python3 python/main.py serve --host 0.0.0.0 --port 5055
 python3 python/main.py serve --map simple             # sirve el otro mapa
+python3 python/main.py serve --agents 6               # con tráfico, para ver conflictos
 ```
+
+Con `--agents 1` (el defecto) no hay con quién chocar y `stats.conflicts` sale siempre 0. Para
+ver la fase 5 en marcha hacen falta varios AGVs.
 
 ### `simulate`
 
@@ -312,20 +427,34 @@ python3 python/main.py simulate --map simple --from A --to F --headless
 | Opción | Por defecto | Para qué |
 |---|---|---|
 | `--map` | `config.DEFAULT_MAP` | Mapa por el que moverse |
-| `--agents` | `1` | Cuántos AGVs correr |
+| `--agents` | `1` | Cuántos AGVs correr; no puede haber más que nodos en el mapa |
 | `--steps` | `100` | Tope de pasos; corta antes si llegan todos |
 | `--headless` | apagado | Corre sin servidor, que es el único modo por ahora |
 | `--from` / `--to` | la ruta del mapa | Origen y destino (`simple`: `A→F`; `warehouse`: `S1→N6`) |
 
 ```
 AGV 1: S1 -> N6 | costo 27.4 | S1 -> S2 -> S3 -> G -> N4 -> N5 -> N6
-paso   1 | AGV 1 | moving  | S1   -> S2   |  25% | tramo 0/6 | tarea 1
+paso   1 | AGV 1 | moving  | S1   -> S2   |  25% | tramo 0/6 | espera   0 | tarea 1
 ...
-paso  28 | AGV 1 | done    | N6   -> -    |   0% | tramo 6/6 | tarea 1
+paso  28 | AGV 1 | done    | N6   -> -    |   0% | tramo 6/6 | espera   0 | tarea 1
+```
+
+Con varios AGVs salen además los conflictos y el resumen de la corrida:
+
+```
+paso  19 | CONFLICTO edge       | AGV 4, 6 | G <-> N3
+paso  20 | CONFLICTO vertex     | AGV 1, 2, 4, 5, 6 | G
+deadlock en el paso 28: 20 ticks seguidos sin que avance nadie
+--- resumen ---
+final       : deadlock, nadie avanzo en 20 ticks seguidos
+conflictos  : 61 (vertex 28, edge 28, following 0, congestion 5)
+espera total: 128 ticks entre todos
+AGV 4      : waiting en G, tramo 0/3, 28 ticks esperando
 ```
 
 Sale con `0` si la corrida fue bien, `1` si algún AGV se quedó sin ruta y `2` si el mapa o los
-nodos que le pasaste no existen.
+nodos que le pasaste no existen. Un **deadlock sale con `0`**: que el baseline se atasque es un
+resultado experimental válido, no un fallo del programa. La razón del final va en el resumen.
 
 `Ctrl+C` cierra limpio, y también un `kill` (SIGTERM). Con un cliente conectado tarda unos
 milisegundos: los hilos de los clientes son *daemon*, no bloquean la salida.
@@ -351,6 +480,7 @@ python3 python/main.py serve --verbose
 ```bash
 python3 -m unittest discover -s tests -t . -v
 python3 -m unittest tests.test_astar -v          # solo la fase 3
+python3 -m unittest tests.test_conflicts -v      # solo la fase 5
 ```
 
 | Fichero | Qué cubre |
@@ -362,10 +492,16 @@ python3 -m unittest tests.test_astar -v          # solo la fase 3
 | `test_graph.py` | El mapa lógico: grafo, `validate()` y ficheros |
 | `test_main.py` | El CLI |
 | `test_astar.py` | La fase 3: A\*, penalizaciones, `Agent`, `Simulation` y el snapshot |
+| `test_conflicts.py` | La fase 5: conflictos, política base, invariante y deadlock |
 
 `test_astar.py` compara A\* contra una **búsqueda exhaustiva** en los dos mapas (los 186 pares
 ordenados de nodos), comprueba que cada par consecutivo de una ruta es una arista de verdad, y
 valida el snapshot con el mismo `validar_snapshot()` que usa el cliente falso de Unity.
+
+`test_conflicts.py` monta a propósito un cruce de frente y demuestra que se detecta como
+`edge conflict`, y corre **500 ticks con 6 AGVs** comprobando en cada tick que no hay dos en el
+mismo nodo. También prueba que una política temeraria que siempre dice `go` sigue sin poder
+romper la invariante: para eso está el gate físico.
 
 ### Cliente falso de Unity
 

@@ -36,13 +36,19 @@ class Agent:
     | `path`         | La ruta entera, de origen a destino                     |
     | `path_index`   | Que posicion de `path` es `current_node`                |
     | `state`        | Uno de STATES                                           |
-    | `wait_time`    | Ticks que le quedan cediendo el paso                    |
+    | `wait_time`    | Ticks acumulados cediendo el paso                       |
     | `task`         | Id de la tarea que lleva, o None                        |
     | `progress`     | 0..1 entre `current_node` y `next_node()`               |
 
     Ademas guarda `graph` y `start_node`, que no van al snapshot: el primero
     porque `assign_task()` tiene que correr A*, el segundo porque `reset()` tiene
     que saber a que nodo volver para que la simulacion sea reproducible.
+
+    `wait_time` **acumula**, no descuenta: es el tiempo total que este AGV ha
+    perdido cediendo el paso en toda la corrida, y por eso solo vuelve a cero en
+    `reset()`. Quien lo sube es `simulation.Simulation`, un tick por cada vez que
+    le toca esperar, y quien lo saca de `waiting` es tambien la simulacion cuando
+    el nodo que pedia queda libre, no un contador que llega a cero.
     """
 
     def __init__(self, agent_id: int, graph: WarehouseGraph, start: str) -> None:
