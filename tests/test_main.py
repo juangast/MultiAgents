@@ -16,6 +16,15 @@ import qlearning
 import scenarios
 import simulation
 
+def grafo_partido() -> graph.WarehouseGraph:
+    """Dos islas que no se tocan: de la primera no se llega a la segunda."""
+    return graph.WarehouseGraph(
+        adjacency={"A": {"B": 1.0}, "B": {"A": 1.0}, "X": {"Y": 1.0}, "Y": {"X": 1.0}},
+        positions={"A": (0.0, 0.0), "B": (1.0, 0.0), "X": (9.0, 0.0), "Y": (10.0, 0.0)},
+        name="partido",
+    )
+
+
 # Desde la fase 10 estan los siete: `scenario` es el ultimo.
 IMPLEMENTADOS = {
     "serve", "map", "simulate", "train", "evaluate", "benchmark", "scenario",
@@ -332,6 +341,106 @@ class TestTrainPorEscenario(unittest.TestCase):
         with self.assertLogs(level="ERROR") as capturado:
             self.assertEqual(main.main(["train", "--scenario", "Z"]), 2)
         self.assertIn("no conozco el escenario", capturado.output[0])
+
+
+class TestSimulateCLI(unittest.TestCase):
+    """El subcomando `simulate`."""
+
+    def test_llega_al_destino_en_el_mapa_simple(self) -> None:
+        with self.assertLogs(level="INFO") as capturado:
+            self.assertEqual(
+                main.main(["simulate", "--map", "simple", "--steps", "50", "--headless"]),
+                0,
+            )
+        salida = "\n".join(capturado.output)
+        self.assertIn("A -> B -> E -> F", salida)
+        self.assertIn("done en F", salida)
+
+    def test_cruza_el_almacen_por_el_cuello_de_botella(self) -> None:
+        with self.assertLogs(level="INFO") as capturado:
+            self.assertEqual(
+                main.main(
+                    ["simulate", "--map", "warehouse", "--agents", "1",
+                     "--steps", "100", "--headless"]
+                ),
+                0,
+            )
+        salida = "\n".join(capturado.output)
+        self.assertIn("S1 -> S2 -> S3 -> G -> N4 -> N5 -> N6", salida)
+        self.assertIn("pasos dados : 28 de 100", salida)
+
+    def test_acepta_from_y_to(self) -> None:
+        with self.assertLogs(level="INFO") as capturado:
+            self.assertEqual(
+                main.main(
+                    ["simulate", "--map", "simple", "--from", "D", "--to", "C",
+                     "--headless"]
+                ),
+                0,
+            )
+        self.assertIn("D -> ", "\n".join(capturado.output))
+
+    def test_un_nodo_que_no_existe_devuelve_dos(self) -> None:
+        with self.assertLogs(level="ERROR") as capturado:
+            self.assertEqual(
+                main.main(["simulate", "--map", "simple", "--to", "Z", "--headless"]), 2
+            )
+        self.assertIn("no es un nodo", capturado.output[0])
+
+    def test_un_mapa_que_no_existe_devuelve_dos(self) -> None:
+        with self.assertLogs(level="ERROR"):
+            self.assertEqual(
+                main.main(["simulate", "--map", "atlantida", "--headless"]), 2
+            )
+
+    def test_sin_ruta_devuelve_uno_y_no_revienta(self) -> None:
+        with mock.patch.object(main, "_abre_mapa", return_value=(grafo_partido(), "test", 0)):
+            with self.assertLogs(level="WARNING") as capturado:
+                self.assertEqual(main.main(["simulate", "--headless"]), 1)
+        self.assertIn("no hay ruta", "\n".join(capturado.output))
+
+    def test_sin_headless_avisa_pero_corre(self) -> None:
+        with self.assertLogs(level="WARNING") as capturado:
+            self.assertEqual(main.main(["simulate", "--map", "simple"]), 0)
+        self.assertIn("headless", "\n".join(capturado.output))
+
+    def test_con_varios_agentes_gestiona_los_conflictos(self) -> None:
+        # Hasta la fase 4 esto avisaba de que los AGVs se cruzarian sin verse.
+        # Ahora se ven: el resumen trae el conteo de conflictos y por que acabo.
+        with self.assertLogs(level="INFO") as capturado:
+            self.assertEqual(
+                main.main(
+                    ["simulate", "--map", "warehouse", "--agents", "3",
+                     "--steps", "40", "--headless"]
+                ),
+                0,
+            )
+        salida = "\n".join(capturado.output)
+        self.assertIn("conflictos  :", salida)
+        self.assertIn("final       :", salida)
+        self.assertIn("espera total:", salida)
+        self.assertNotIn("colisiones", salida)
+
+    def test_mas_agentes_que_nodos_no_arranca(self) -> None:
+        # Cada AGV necesita un nodo de salida para el solo, o la invariante de
+        # ocupacion nace rota antes de mover nada.
+        with self.assertLogs(level="ERROR") as capturado:
+            self.assertEqual(
+                main.main(
+                    ["simulate", "--map", "simple", "--agents", "7", "--headless"]
+                ),
+                2,
+            )
+        self.assertIn("no caben", "\n".join(capturado.output))
+
+    def test_los_valores_por_defecto_del_parser(self) -> None:
+        args = main.build_parser().parse_args(["simulate"])
+        self.assertEqual(args.map, config.DEFAULT_MAP)
+        self.assertEqual(args.agents, 1)
+        self.assertEqual(args.steps, 100)
+        self.assertFalse(args.headless)
+        self.assertIsNone(args.origen)
+        self.assertIsNone(args.destino)
 
 
 if __name__ == "__main__":

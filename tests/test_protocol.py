@@ -1,11 +1,23 @@
-"""Tests del contrato PULL. Sin sockets: aqui solo se prueba el modulo puro."""
+"""Tests del contrato PULL: los comandos, la serializacion y las coordenadas.
+
+Casi todo se prueba sin sockets, sobre el modulo puro. La excepcion es
+`TestFragmentacionTCP`, que **si** abre un socket de verdad: TCP es un flujo de
+bytes y no respeta los limites de los mensajes, asi que la regla "una linea
+entra, una linea sale" solo significa algo si se comprueba contra un socket que
+parte y pega los envios como le da la gana.
+"""
 
 import json
+import socket
+import threading
 import unittest
 from unittest import mock
 
 import config
+import graph
 import protocol
+import server
+import simulation
 
 
 class SimulacionStub:
@@ -110,6 +122,76 @@ class TestHandleLine(unittest.TestCase):
 
     def test_el_stub_cumple_el_protocolo(self) -> None:
         self.assertIsInstance(self.sim, protocol.Simulation)
+
+
+class TestFragmentacionTCP(unittest.TestCase):
+    """El contrato aguanta como TCP parta los bytes por el camino.
+
+    TCP entrega un **flujo**, no mensajes: un `send()` del cliente puede llegar
+    en tres trozos, y tres `send()` pueden llegar pegados en uno. Un cliente que
+    de por hecho que un `recv()` trae exactamente una respuesta funciona en
+    localhost y se rompe en cuanto hay red de por medio. Estas tres pruebas son
+    las que el cliente de Unity tiene que poder pasar.
+    """
+
+    def setUp(self) -> None:
+        self.simulacion = simulation.Simulation(graph.simple_graph(), 1)
+        self.servidor = server.AGVServer((config.HOST, 0), self.simulacion)
+        self.hilo = threading.Thread(target=self.servidor.serve_forever, daemon=True)
+        self.hilo.start()
+        self.sock = socket.create_connection(self.servidor.server_address, timeout=5.0)
+        self.addCleanup(self.cerrar)
+
+    def cerrar(self) -> None:
+        self.sock.close()
+        self.servidor.shutdown()
+        self.servidor.server_close()
+        self.hilo.join(timeout=5.0)
+
+    def lee_una_linea(self) -> dict:
+        """Lee hasta el primer salto de linea. Asi es como se hace bien."""
+        trozos = bytearray()
+        while b"\n" not in trozos:
+            dato = self.sock.recv(4096)
+            if not dato:
+                self.fail("el servidor cerro sin contestar")
+            trozos.extend(dato)
+        linea, _, resto = bytes(trozos).partition(b"\n")
+        self.assertEqual(resto, b"", "llego mas de una linea de golpe")
+        return json.loads(linea.decode(config.ENCODING))
+
+    def test_un_comando_partido_en_varios_envios(self) -> None:
+        # El caso que rompe a un cliente ingenuo: la respuesta no puede salir
+        # hasta que llegue el salto de linea, por muchos trozos que hagan falta.
+        for trozo in (b"GET_", b"STA", b"TE", b"\n"):
+            self.sock.sendall(trozo)
+        self.assertEqual(self.lee_una_linea()["step"], 1)
+
+        self.sock.sendall(b"PI")
+        self.sock.sendall(b"NG\n")
+        self.assertEqual(self.lee_una_linea(), {"ok": True})
+
+    def test_varios_comandos_pegados_en_un_solo_envio(self) -> None:
+        # Y el contrario: tres comandos en un `send()` son tres respuestas, en
+        # orden y cada una en su linea.
+        self.sock.sendall(b"PING\nBASURA\nPING\n")
+
+        trozos = bytearray()
+        while trozos.count(b"\n") < 3:
+            trozos.extend(self.sock.recv(4096))
+        lineas = bytes(trozos).split(b"\n")[:3]
+        respuestas = [json.loads(una.decode(config.ENCODING)) for una in lineas]
+
+        self.assertEqual(respuestas[0], {"ok": True})
+        self.assertEqual(respuestas[1]["error"], protocol.ERROR_UNKNOWN_COMMAND)
+        self.assertEqual(respuestas[2], {"ok": True})
+
+    def test_el_emparejado_no_se_pierde_en_100_peticiones(self) -> None:
+        # Una peticion, una respuesta, siempre en el mismo orden: si el servidor
+        # se saltara una o contestara de mas, `step` dejaria de cuadrar.
+        for esperado in range(1, 101):
+            self.sock.sendall(b"GET_STATE\n")
+            self.assertEqual(self.lee_una_linea()["step"], esperado)
 
 
 if __name__ == "__main__":
