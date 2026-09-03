@@ -1036,6 +1036,81 @@ el régimen en el que se va a evaluar.
 > Esto es el resultado real, sin maquillar. Un benchmark que solo sabe dar buenas noticias no sirve
 > para decidir nada.
 
+### Dos defectos que el benchmark destapó
+
+Medir sirvió para encontrar dos fallos **silenciosos** en cómo se sirve un modelo. Ninguno da
+error: los dos dan resultados malos, que es peor.
+
+**1. El modelo se servía fuera de su action set.** La fila de la Q-table lleva siempre las tres
+acciones, aunque se entrene solo con dos (`train --no-reroute`). `make_policy()` no miraba con qué
+se había entrenado y habilitaba REROUTE igualmente — y esa columna sigue **a ceros**. Como la
+recompensa del almacén es casi toda negativa (−20 por chocar, −1 por cada tick esperando), **el
+cero le gana a todo lo aprendido**: la política se pasaba la corrida eligiendo precisamente la
+acción de la que no sabía nada.
+
+Ahora `make_policy()` lee `metadata.hyperparameters.actions` y sirve con el action set con el que
+se entrenó. Un modelo antiguo que no lo diga se sirve como antes.
+
+**2. Una celda sin explorar valía 0, y 0 es optimista.** El mismo problema, un nivel más abajo: no
+la columna entera, sino la celda `(estado, acción)` que el entrenamiento apenas tocó. Se guardaban
+las visitas **por estado**, y eso no basta: un estado con 20 000 visitas puede tener una acción
+probada 19 000 veces y otra tres. Ahora se guardan también **por celda** (`metadata.action_visits`)
+y al servir sólo compiten las que llegan a `config.SERVE_MIN_VISITS` (30). Si ninguna llega, se
+cae a todas: mejor una decisión con poco respaldo que ninguna. El filtro **no** toca la
+exploración — al entrenar, la celda sin probar es justo la que hay que probar.
+
+Los dos arreglos, medidos sobre el mismo modelo entrenado con `--no-reroute` y las mismas 20
+semillas:
+
+| | makespan | reroutes | completas |
+|---|---:|---:|---:|
+| baseline (referencia) | 401.1 | 18.1 | 90 % |
+| sin ningún arreglo | 449.9 | 357.4 | 70 % |
+| solo el arreglo 1 | **408.1** | **18.8** | **85 %** |
+| solo el arreglo 3 | **408.1** | **18.8** | **85 %** |
+
+Cada uno atrapa el fallo por su cuenta, y dan exactamente el mismo resultado: son la misma trampa
+vista desde la metadata y desde los contadores.
+
+> **Lo que estos arreglos NO hacen: mejorar el modelo que se sirve hoy.** El `q_table.json` del
+> repo se entrenó con las tres acciones y con exploración de sobra en los estados frecuentes, así
+> que no hay nada que enmascarar: con y sin los arreglos da los mismos 494.4 ticks. Son un cepo
+> para un fallo que estaba puesto, no una mejora del rendimiento. Lo que le falta al modelo actual
+> es otra cosa, y es lo de abajo.
+
+### Lo que le falta al Q-Learning
+
+Lo que de verdad explica los 484 reroutes no es un defecto de código, es la recompensa. Contando
+eventos en 300 episodios de entrenamiento:
+
+| evento | veces | precio | total |
+|---|---:|---:|---:|
+| `WAIT` | 33 375 | −1 | −33 375 |
+| `CONFLICT` | 6 515 | −20 | −130 300 |
+| `PROGRESS` | 6 837 | +2 | +13 674 |
+| `USELESS_REROUTE` | 2 256 | −3 | −6 768 |
+| `TASK_COMPLETE` | 1 285 | +100 | +128 500 |
+
+De 5054 reroutes ejecutados, **el 55 % sale gratis** y el resto cuesta −3: coste esperado ≈ −1.3,
+**una sola vez**. Esperar cuesta −1 **por tick**. Estar bloqueado cinco ticks son −5, así que
+recalcular siempre sale a cuenta — y la recompensa **nunca cobra los 40 puntos de distancia extra
+del rodeo**. `is_useless_reroute()` casi no salta porque `avoided_conflict` es cierto siempre que
+estés bloqueado y el primer paso cambie, o sea casi siempre.
+
+(Probado y descartado: quitar `REWARD_PROGRESS` **empeora** las cosas — 655 reroutes en vez de 484.
+No es que rerutear pague; es que no cuesta.)
+
+Quedan tres cosas para la fase 10, en orden:
+
+1. **Cobrar el reroute por lo que cuesta**, proporcional a `cost(nueva) − cost(vieja)`, en vez de
+   un −3 plano.
+2. **Entrenar en el régimen en que se evalúa.** La tabla salió de 1 tarea por AGV y 200 ticks; el
+   benchmark le pide 4 tareas y 800, con AGVs aparcados ocupando nodos. `metrics.build_scenario()`
+   ya existe y se le puede pasar a `TrainingEnv`.
+3. **Un bit de estado que vea el bucle.** El fallo observado es un ping-pong determinista entre dos
+   rutas cada 21 ticks: mismo estado, misma acción, para siempre. Un `recently_rerouted` pasa el
+   espacio de 72 a 144 estados y rompe la simetría.
+
 ## Estructura
 
 ```

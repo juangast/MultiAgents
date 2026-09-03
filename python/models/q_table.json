@@ -13,7 +13,7 @@
     "reroute"
   ],
   "metadata": {
-    "trained_at": "2026-09-03T04:52:08+00:00",
+    "trained_at": "2026-09-03T17:06:34+00:00",
     "map": "warehouse",
     "map_nodes": 13,
     "agents": 4,
@@ -81,6 +81,208 @@
       "1|1|2|0|1": 228,
       "1|1|2|1|0": 312,
       "1|1|2|1|1": 281
+    },
+    "action_visits": {
+      "0|0|0|0|0": {
+        "advance": 143,
+        "wait": 360,
+        "reroute": 244
+      },
+      "0|0|0|0|1": {
+        "advance": 11212,
+        "wait": 3273,
+        "reroute": 2573
+      },
+      "0|0|0|1|0": {
+        "advance": 36,
+        "wait": 188,
+        "reroute": 145
+      },
+      "0|0|0|1|1": {
+        "advance": 10273,
+        "wait": 2348,
+        "reroute": 2164
+      },
+      "0|0|0|2|1": {
+        "advance": 90,
+        "wait": 25,
+        "reroute": 35
+      },
+      "0|0|1|0|0": {
+        "advance": 26,
+        "wait": 175,
+        "reroute": 195
+      },
+      "0|0|1|0|1": {
+        "advance": 474,
+        "wait": 334,
+        "reroute": 370
+      },
+      "0|0|1|1|0": {
+        "advance": 31,
+        "wait": 98,
+        "reroute": 191
+      },
+      "0|0|1|1|1": {
+        "advance": 734,
+        "wait": 267,
+        "reroute": 458
+      },
+      "1|0|0|0|0": {
+        "advance": 1447,
+        "wait": 8270,
+        "reroute": 11939
+      },
+      "1|0|0|0|1": {
+        "advance": 1233,
+        "wait": 6232,
+        "reroute": 9142
+      },
+      "1|0|0|1|0": {
+        "advance": 929,
+        "wait": 3703,
+        "reroute": 8558
+      },
+      "1|0|0|1|1": {
+        "advance": 711,
+        "wait": 2631,
+        "reroute": 6154
+      },
+      "1|0|0|2|0": {
+        "advance": 3,
+        "wait": 4,
+        "reroute": 6
+      },
+      "1|0|0|2|1": {
+        "advance": 0,
+        "wait": 0,
+        "reroute": 1
+      },
+      "1|0|1|0|0": {
+        "advance": 528,
+        "wait": 2791,
+        "reroute": 4482
+      },
+      "1|0|1|0|1": {
+        "advance": 322,
+        "wait": 1736,
+        "reroute": 2852
+      },
+      "1|0|1|1|0": {
+        "advance": 285,
+        "wait": 1030,
+        "reroute": 3177
+      },
+      "1|0|1|1|1": {
+        "advance": 221,
+        "wait": 619,
+        "reroute": 2037
+      },
+      "1|0|1|2|0": {
+        "advance": 2,
+        "wait": 4,
+        "reroute": 3
+      },
+      "1|0|1|2|1": {
+        "advance": 1,
+        "wait": 2,
+        "reroute": 1
+      },
+      "1|0|2|0|0": {
+        "advance": 78,
+        "wait": 260,
+        "reroute": 612
+      },
+      "1|0|2|0|1": {
+        "advance": 27,
+        "wait": 117,
+        "reroute": 282
+      },
+      "1|0|2|1|0": {
+        "advance": 51,
+        "wait": 209,
+        "reroute": 719
+      },
+      "1|0|2|1|1": {
+        "advance": 51,
+        "wait": 146,
+        "reroute": 389
+      },
+      "1|1|0|0|0": {
+        "advance": 48,
+        "wait": 189,
+        "reroute": 374
+      },
+      "1|1|0|0|1": {
+        "advance": 25,
+        "wait": 137,
+        "reroute": 251
+      },
+      "1|1|0|1|0": {
+        "advance": 20,
+        "wait": 63,
+        "reroute": 204
+      },
+      "1|1|0|1|1": {
+        "advance": 18,
+        "wait": 62,
+        "reroute": 145
+      },
+      "1|1|0|2|0": {
+        "advance": 1,
+        "wait": 0,
+        "reroute": 0
+      },
+      "1|1|1|0|0": {
+        "advance": 516,
+        "wait": 2841,
+        "reroute": 4636
+      },
+      "1|1|1|0|1": {
+        "advance": 469,
+        "wait": 2542,
+        "reroute": 4643
+      },
+      "1|1|1|1|0": {
+        "advance": 230,
+        "wait": 967,
+        "reroute": 2184
+      },
+      "1|1|1|1|1": {
+        "advance": 250,
+        "wait": 754,
+        "reroute": 2183
+      },
+      "1|1|1|2|0": {
+        "advance": 2,
+        "wait": 2,
+        "reroute": 1
+      },
+      "1|1|1|2|1": {
+        "advance": 2,
+        "wait": 1,
+        "reroute": 0
+      },
+      "1|1|2|0|0": {
+        "advance": 28,
+        "wait": 181,
+        "reroute": 204
+      },
+      "1|1|2|0|1": {
+        "advance": 19,
+        "wait": 59,
+        "reroute": 150
+      },
+      "1|1|2|1|0": {
+        "advance": 28,
+        "wait": 79,
+        "reroute": 205
+      },
+      "1|1|2|1|1": {
+        "advance": 28,
+        "wait": 104,
+        "reroute": 149
+      }
     },
     "last_episode": {
       "episode": 1000,

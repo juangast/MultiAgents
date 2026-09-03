@@ -132,3 +132,10 @@ BASELINE_CSV: Path = RESULTS_DIR / "baseline.csv"
 QLEARNING_CSV: Path = RESULTS_DIR / "qlearning.csv"
 COMPARISON_JSON: Path = RESULTS_DIR / "comparison.json"
 COMPARISON_PLOT: Path = RESULTS_DIR / "comparison.png"
+
+# Cuantas veces tiene que haberse probado una celda (estado, accion) para que la
+# politica se fie de ella al servir. Es el arreglo del "cero optimista": casi
+# toda la recompensa del almacen es negativa, asi que una celda que nadie probo
+# vale 0.0 y le gana a TODO lo aprendido. Sin este filtro la politica acaba
+# eligiendo justo la accion de la que no sabe nada. Con 0 se apaga el filtro.
+SERVE_MIN_VISITS: int = 30

@@ -688,5 +688,169 @@ class TestPoliticaIntercambiable(unittest.TestCase):
         self.assertIsNone(politica.last_decision(1))
 
 
+class TestSeSirveConLoQueSeEntreno(unittest.TestCase):
+    """Un modelo no se sirve fuera del action set con el que se entreno.
+
+    Es el fallo silencioso que arregla la fase 9: la fila de la Q-table lleva
+    SIEMPRE las tres acciones, aunque se entrenara solo con dos. Si al servir se
+    habilita REROUTE, su columna sigue a ceros; y como la recompensa del almacen
+    es casi toda negativa, el cero le gana a todo lo aprendido y la politica se
+    pasa la corrida eligiendo la accion de la que no sabe nada.
+    """
+
+    def _entrenado(self, carpeta: str, *, con_reroute: bool) -> Path:
+        destino = Path(carpeta) / "modelo.json"
+        ajustes = qlearning.TrainingConfig(
+            map_name="warehouse",
+            agents=2,
+            episodes=25,
+            seed=7,
+            enable_reroute=None if con_reroute else False,
+        )
+        entrenador = qlearning.Trainer(graph.warehouse_graph(), ajustes)
+        entrenador.run()
+        entrenador.save(destino)
+        return destino
+
+    def test_la_metadata_dice_con_que_acciones_se_entreno(self) -> None:
+        with tempfile.TemporaryDirectory() as carpeta:
+            sin = self._entrenado(carpeta, con_reroute=False)
+            self.assertIs(qlearning.trained_enable_reroute(sin), False)
+        with tempfile.TemporaryDirectory() as carpeta:
+            con = self._entrenado(carpeta, con_reroute=True)
+            self.assertIs(qlearning.trained_enable_reroute(con), True)
+
+    def test_un_modelo_sin_metadata_no_dice_nada(self) -> None:
+        """Y entonces se cae a `config.ENABLE_REROUTE`, como siempre."""
+        with tempfile.TemporaryDirectory() as carpeta:
+            destino = Path(carpeta) / "pelada.json"
+            qlearning.QTable().save(destino)
+            self.assertIsNone(qlearning.trained_enable_reroute(destino))
+
+    def test_make_policy_no_habilita_una_accion_que_no_se_entreno(self) -> None:
+        """El arreglo: aunque `config.ENABLE_REROUTE` este encendido."""
+        with tempfile.TemporaryDirectory() as carpeta:
+            modelo = self._entrenado(carpeta, con_reroute=False)
+            with mock.patch.object(config, "ENABLE_REROUTE", True):
+                politica = simulation.make_policy("qlearning", model=modelo)
+            self.assertNotIn(qlearning.Action.REROUTE, politica.actions)
+            self.assertEqual(
+                politica.actions, (qlearning.Action.ADVANCE, qlearning.Action.WAIT)
+            )
+
+    def test_un_modelo_de_tres_acciones_las_conserva(self) -> None:
+        with tempfile.TemporaryDirectory() as carpeta:
+            modelo = self._entrenado(carpeta, con_reroute=True)
+            politica = simulation.make_policy("qlearning", model=modelo)
+            self.assertIn(qlearning.Action.REROUTE, politica.actions)
+
+
+class TestNoSeFiaDeLoQueNoAprendio(unittest.TestCase):
+    """Una celda que nadie probo vale 0.0, y el cero gana. Ese es el problema.
+
+    Con la recompensa del almacen casi toda negativa, la accion sin explorar es
+    la mas atractiva de la tabla. El filtro por visitas la deja fuera al servir.
+    """
+
+    def _politica(self, valores, visitas, min_visits):
+        tabla = qlearning.QTable({(1, 0, 0, 0, 0): valores})
+        return qlearning.QLearningPolicy(
+            tabla, epsilon=0.0, visits={(1, 0, 0, 0, 0): visitas}, min_visits=min_visits
+        )
+
+    def test_sin_filtro_gana_la_celda_que_nadie_probo(self) -> None:
+        """El comportamiento viejo, que es justo el que hay que evitar."""
+        politica = self._politica(
+            {
+                qlearning.Action.ADVANCE: -18.0,
+                qlearning.Action.WAIT: -4.0,
+                qlearning.Action.REROUTE: 0.0,
+            },
+            {qlearning.Action.ADVANCE: 5000, qlearning.Action.WAIT: 4000,
+             qlearning.Action.REROUTE: 0},
+            0,
+        )
+        self.assertIs(politica.choose((1, 0, 0, 0, 0)), qlearning.Action.REROUTE)
+
+    def test_con_filtro_gana_la_mejor_de_las_que_si_aprendio(self) -> None:
+        politica = self._politica(
+            {
+                qlearning.Action.ADVANCE: -18.0,
+                qlearning.Action.WAIT: -4.0,
+                qlearning.Action.REROUTE: 0.0,
+            },
+            {qlearning.Action.ADVANCE: 5000, qlearning.Action.WAIT: 4000,
+             qlearning.Action.REROUTE: 0},
+            30,
+        )
+        self.assertIs(politica.choose((1, 0, 0, 0, 0)), qlearning.Action.WAIT)
+
+    def test_si_ninguna_tiene_respaldo_no_se_queda_sin_elegir(self) -> None:
+        """Mejor una decision con poco respaldo que ninguna."""
+        politica = self._politica(
+            {
+                qlearning.Action.ADVANCE: -1.0,
+                qlearning.Action.WAIT: -2.0,
+                qlearning.Action.REROUTE: -3.0,
+            },
+            {qlearning.Action.ADVANCE: 2, qlearning.Action.WAIT: 1,
+             qlearning.Action.REROUTE: 1},
+            30,
+        )
+        self.assertIs(politica.choose((1, 0, 0, 0, 0)), qlearning.Action.ADVANCE)
+
+    def test_un_estado_que_no_esta_en_la_tabla_no_revienta(self) -> None:
+        politica = self._politica(
+            {qlearning.Action.ADVANCE: 1.0}, {qlearning.Action.ADVANCE: 100}, 30
+        )
+        self.assertIn(politica.choose((0, 1, 2, 2, 1)), qlearning.ACTIONS)
+
+    def test_el_filtro_no_toca_la_exploracion(self) -> None:
+        """Al entrenar, la celda sin probar es justo la que hay que probar."""
+        politica = self._politica(
+            {
+                qlearning.Action.ADVANCE: -18.0,
+                qlearning.Action.WAIT: -4.0,
+                qlearning.Action.REROUTE: 0.0,
+            },
+            {qlearning.Action.ADVANCE: 5000, qlearning.Action.WAIT: 4000,
+             qlearning.Action.REROUTE: 0},
+            30,
+        )
+        politica.epsilon = 1.0
+        elegidas = {politica.choose((1, 0, 0, 0, 0)) for _ in range(200)}
+        self.assertIn(qlearning.Action.REROUTE, elegidas)
+
+    def test_el_entrenamiento_guarda_las_visitas_por_celda(self) -> None:
+        with tempfile.TemporaryDirectory() as carpeta:
+            destino = Path(carpeta) / "modelo.json"
+            ajustes = qlearning.TrainingConfig(
+                map_name="warehouse", agents=2, episodes=25, seed=7
+            )
+            entrenador = qlearning.Trainer(graph.warehouse_graph(), ajustes)
+            entrenador.run()
+            entrenador.save(destino)
+
+            visitas = qlearning.load_action_visits(destino)
+            self.assertTrue(visitas)
+            # Lo que cuenta por celda tiene que sumar lo que cuenta por estado.
+            por_estado = qlearning.load_metadata(destino)["visits"]
+            for clave, cuantas in por_estado.items():
+                estado = qlearning.decode_state(clave)
+                self.assertEqual(sum(visitas[estado].values()), cuantas)
+
+    def test_un_modelo_viejo_sin_visitas_sigue_cargando(self) -> None:
+        """Sin contadores no hay con que filtrar, y se sirve como siempre."""
+        with tempfile.TemporaryDirectory() as carpeta:
+            destino = Path(carpeta) / "vieja.json"
+            qlearning.QTable({(1, 0, 0, 0, 0): {qlearning.Action.ADVANCE: 1.0}}).save(
+                destino, metadata={"hyperparameters": {"actions": ["advance", "wait", "reroute"]}}
+            )
+            self.assertEqual(qlearning.load_action_visits(destino), {})
+            with self.assertLogs("simulation", level="WARNING"):
+                politica = simulation.make_policy("qlearning", model=destino)
+            self.assertEqual(politica.min_visits, config.SERVE_MIN_VISITS)
+
+
 if __name__ == "__main__":
     unittest.main()

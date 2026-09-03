@@ -153,8 +153,33 @@ def make_policy(
                 f"no existe la Q-table {ruta}; entrenala antes con: "
                 f"python3 python/main.py train --map {config.DEFAULT_MAP}"
             )
+        # La politica se sirve con el action set con el que se ENTRENO, no con
+        # el que diga `config.ENABLE_REROUTE`. Servir un modelo fuera de su
+        # action set no da error: da una politica que elige a ciegas la columna
+        # que nunca aprendio, porque esa sigue a ceros y el cero le gana a todo
+        # lo aprendido (la recompensa del almacen es casi toda negativa).
+        entrenada_con_reroute = qlearning.trained_enable_reroute(ruta)
+        if entrenada_con_reroute is False and config.ENABLE_REROUTE:
+            log.info(
+                "%s se entreno sin REROUTE: lo dejo fuera tambien al servir",
+                ruta,
+            )
+
+        visitas = qlearning.load_action_visits(ruta)
+        if not visitas and config.SERVE_MIN_VISITS > 0:
+            log.warning(
+                "%s no guarda las visitas por celda: sin ellas no se puede "
+                "filtrar lo que la tabla no llego a aprender (reentrenala)",
+                ruta,
+            )
+
         return qlearning.QLearningPolicy(
-            qlearning.QTable.load(ruta), epsilon=config.SERVE_EPSILON, seed=seed
+            qlearning.QTable.load(ruta),
+            epsilon=config.SERVE_EPSILON,
+            seed=seed,
+            enable_reroute=entrenada_con_reroute,
+            visits=visitas,
+            min_visits=config.SERVE_MIN_VISITS,
         )
 
     raise ValueError(

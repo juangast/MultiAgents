@@ -750,6 +750,55 @@ class QTable:
         return tabla
 
 
+def trained_enable_reroute(path: str | Path) -> bool | None:
+    """Si este modelo se entreno con REROUTE. None si el fichero no lo dice.
+
+    Hace falta porque el fichero guarda **dos** listas de acciones y no son la
+    misma: la de arriba (`actions`) es siempre el enum entero, porque la fila de
+    la tabla lleva las tres celdas pase lo que pase; la que dice con que se
+    entreno de verdad es `metadata.hyperparameters.actions`.
+
+    Servir un modelo fuera de su action set es el fallo silencioso que esto
+    viene a tapar: una tabla entrenada solo con ADVANCE/WAIT tiene la columna
+    REROUTE intacta a ceros, y como lo aprendido es casi todo negativo, el cero
+    gana y la politica se pasa la corrida recalculando una accion que nunca
+    probo.
+    """
+    hiper = (load_metadata(path).get("hyperparameters") or {})
+    nombres = hiper.get("actions")
+    if not nombres:
+        return None
+    return Action.REROUTE.value in {str(nombre) for nombre in nombres}
+
+
+def load_action_visits(path: str | Path) -> dict[State, dict[Action, int]]:
+    """Cuantas veces se actualizo cada celda (estado, accion) al entrenar.
+
+    Vacio si el modelo es anterior a que esto se guardara: entonces no hay con
+    que filtrar y la politica se comporta como siempre. Reentrenar lo rellena.
+    """
+    datos = load_metadata(path).get("action_visits")
+    if not isinstance(datos, dict):
+        return {}
+
+    visitas: dict[State, dict[Action, int]] = {}
+    for clave, fila in datos.items():
+        if not isinstance(fila, dict):
+            continue
+        try:
+            estado = decode_state(str(clave))
+        except ValueError:
+            continue
+        cuenta: dict[Action, int] = {}
+        for nombre, cuantas in fila.items():
+            try:
+                cuenta[Action(str(nombre))] = int(cuantas)
+            except (ValueError, TypeError):
+                continue
+        visitas[estado] = cuenta
+    return visitas
+
+
 def load_metadata(path: str | Path) -> dict[str, Any]:
     """La `metadata` con la que se guardo una Q-table, o `{}` si no lleva.
 
@@ -824,6 +873,8 @@ class QLearningPolicy:
         epsilon: float = 0.0,
         seed: int = config.RANDOM_SEED,
         enable_reroute: bool | None = None,
+        visits: Mapping[State, Mapping[Action, int]] | None = None,
+        min_visits: int = 0,
     ) -> None:
         self.q: QTable = q_table if q_table is not None else QTable()
         self.epsilon: float = float(epsilon)
@@ -832,6 +883,10 @@ class QLearningPolicy:
         self._simulation: SimulationView | None = simulation
         self._last: dict[int, Decision] = {}
         self._avisado: bool = False
+        # Con que respaldo se aprendio cada celda, y cuanto exigir para fiarse.
+        # Al entrenar van vacio y a cero: el filtro es de servir, no de aprender.
+        self._visits: Mapping[State, Mapping[Action, int]] = visits or {}
+        self.min_visits: int = int(min_visits)
 
     def __repr__(self) -> str:
         return (
@@ -892,10 +947,35 @@ class QLearningPolicy:
         ADVANCE, que es la politica temeraria de la fase 6. El azar sale de un
         `random.Random` sembrado, asi que dos corridas con la misma semilla
         deciden exactamente lo mismo.
+
+        El filtro de respaldo se aplica **solo al elegir en serio**, nunca al
+        explorar: al entrenar, una celda sin probar es justo la que hay que
+        probar; al servir, es justo la que no hay que jugarse.
         """
         if self.epsilon > 0.0 and self._rng.random() < self.epsilon:
             return self._rng.choice(self.actions)
-        return self.q.best_action(state, among=self.actions)
+        return self.q.best_action(state, among=self._respaldadas(state))
+
+    def _respaldadas(self, state: State) -> tuple[Action, ...]:
+        """Las acciones que esta tabla probo lo bastante en este estado.
+
+        Una celda actualizada tres veces no es una politica aprendida, es ruido
+        con forma de numero. Y hay algo peor: como casi toda la recompensa del
+        almacen es negativa (-20 por chocar, -1 por cada tick esperando), la
+        celda que **nadie** probo se queda en 0.0 y le gana a todo lo que si se
+        aprendio. Sin este filtro la politica elige precisamente la accion de la
+        que no sabe nada.
+
+        Si ninguna llega al minimo se devuelven todas: mejor una decision con
+        poco respaldo que ninguna, y ahi manda el desempate de siempre.
+        """
+        if self.min_visits <= 0 or not self._visits:
+            return self.actions
+        fila = self._visits.get(tuple(state), {})
+        respaldadas = tuple(
+            accion for accion in self.actions if fila.get(accion, 0) >= self.min_visits
+        )
+        return respaldadas or self.actions
 
     def last_decision(self, agent_id: int) -> tuple[State, Action] | None:
         """El (estado, accion) con el que decidio este AGV la ultima vez."""
@@ -1487,6 +1567,10 @@ class Trainer:
         # visito 4.000 veces y otra que se visito 3 se leen igual en el JSON, y
         # la segunda no es una politica aprendida: es ruido con forma de numero.
         self.visits: Counter[State] = Counter()
+        # Y lo mismo celda a celda. El contador por estado no basta: un estado
+        # con 20.000 visitas puede tener una accion probada 19.000 veces y otra
+        # tres, y al servir hay que poder distinguirlas.
+        self.action_visits: Counter[tuple[State, Action]] = Counter()
 
         # Dos generadores distintos, los dos hijos de la misma semilla: si el
         # escenario y la exploracion salieran del mismo, cambiar el numero de
@@ -1620,6 +1704,13 @@ class Trainer:
                 encode_state(estado): cuantas
                 for estado, cuantas in sorted(self.visits.items())
             },
+            "action_visits": {
+                encode_state(estado): {
+                    accion.value: self.action_visits[(estado, accion)]
+                    for accion in ACTIONS
+                }
+                for estado in sorted(self.visits)
+            },
             "last_episode": ultimo.as_row() if ultimo is not None else None,
         }
 
@@ -1628,6 +1719,7 @@ class Trainer:
         if not self.learn:
             return
         self.visits[transicion.state] += 1
+        self.action_visits[(transicion.state, transicion.action)] += 1
         self.q.update(
             transicion.state,
             transicion.action,
