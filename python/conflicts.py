@@ -29,9 +29,13 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Protocol, runtime_checkable
 
+import astar
 import config
 from agent import STATE_WAITING, Agent
 from graph import WarehouseGraph
+from logs import get_logger
+
+log = get_logger("conflicts")
 
 # Los cuatro tipos de conflicto que el almacen sabe reconocer.
 TYPE_VERTEX: str = "vertex"
@@ -46,6 +50,44 @@ TYPES: tuple[str, ...] = (TYPE_VERTEX, TYPE_EDGE, TYPE_FOLLOWING, TYPE_CONGESTIO
 ACTION_GO: str = "go"
 ACTION_WAIT: str = "wait"
 ACTIONS: tuple[str, ...] = (ACTION_GO, ACTION_WAIT)
+
+# --- Las tres intenciones de la fase 8 ---------------------------------------
+#
+# Una INTENCION no es una garantia: dice lo que el AGV quiere hacer, no lo que va
+# a pasar. Quien concede o niega es el motor, con el gate fisico. Por eso son
+# vocabulario aparte del `go`/`wait` de arriba, que es lo que el motor entiende:
+# `go` es "quiero pasar" y ADVANCE es "elijo avanzar", y entre las dos cosas esta
+# la autoridad del motor.
+INTENT_ADVANCE: str = "advance"
+INTENT_WAIT: str = "wait"
+INTENT_REROUTE: str = "reroute"
+INTENTS: tuple[str, ...] = (INTENT_ADVANCE, INTENT_WAIT, INTENT_REROUTE)
+
+# Como se lee una politica de las de antes. `go` es la forma vieja de decir
+# ADVANCE, asi que `BaselinePolicy` y cualquier politica escrita para la fase 5
+# siguen valiendo sin tocarles una linea.
+_INTENT_ALIAS: dict[str, str] = {
+    ACTION_GO: INTENT_ADVANCE,
+    INTENT_ADVANCE: INTENT_ADVANCE,
+    ACTION_WAIT: INTENT_WAIT,
+    INTENT_REROUTE: INTENT_REROUTE,
+}
+
+
+def normalize_intent(value: str) -> str:
+    """Traduce lo que devuelva una politica a una de las tres intenciones.
+
+    Lanza `ValueError` con la lista de las que hay si el valor no es ninguna, por
+    lo mismo que `qlearning.reward()` lanza con un evento mal escrito: una accion
+    que se traga en silencio y acaba valiendo "wait" se busca durante dias.
+    """
+    intencion = _INTENT_ALIAS.get(str(value).strip().lower())
+    if intencion is None:
+        conocidas = ", ".join(sorted({*_INTENT_ALIAS}))
+        raise ValueError(
+            f"la politica devolvio {value!r}; las acciones que hay son {conocidas}"
+        )
+    return intencion
 
 # Que agente quiere entrar en que nodo en este tick.
 Intents = Mapping[int, str]
@@ -367,6 +409,66 @@ def _esperando_en(
     )
 
 
+# --- El reroute --------------------------------------------------------------
+#
+# Recalcular es mecanica del MOTOR, no del aprendizaje: la politica solo dice
+# "reroute" y quien encarece el mapa y llama a A* es la simulacion. Por eso estas
+# dos funciones viven aqui y no en `qlearning.py` (que las re-exporta para no
+# romper a quien ya las importaba de alli).
+
+
+def reroute_penalties(
+    agent: Agent, *, penalty: float | None = None
+) -> dict[str | tuple[str, str], float]:
+    """Encarece lo que este AGV tiene delante, para que A* lo esquive.
+
+    Penaliza el nodo siguiente y el tramo hacia el, que es exactamente la
+    congestion que el agente puede ver desde donde esta. Sale en el formato de
+    `astar.Penalties`, el gancho que la fase 3 dejo preparado: no toca el mapa
+    ni lo recarga, solo hace cara una casilla durante una busqueda.
+    """
+    siguiente = agent.next_node()
+    if siguiente is None:
+        return {}
+    extra = config.REROUTE_PENALTY if penalty is None else float(penalty)
+    return {siguiente: extra, (agent.current_node, siguiente): extra}
+
+
+def reroute(
+    agent: Agent,
+    graph: WarehouseGraph,
+    *,
+    penalties: astar.Penalties | None = None,
+) -> list[str] | None:
+    """Recalcula la ruta desde donde esta el agente, esquivando lo de delante.
+
+    Devuelve la ruta nueva ya puesta en el agente, o None si no hay ninguna (o
+    si el agente esta a media travesia, que ahi no se puede cambiar de idea sin
+    teletransportarlo).
+
+    **No usa `Agent.assign_task()` a proposito**: esa reinicia `wait_time`, que
+    es justo la medida con la que se comparan las politicas, y borrar el reloj
+    de la espera en cada recalculo haria que el numero dejara de significar
+    algo. Aqui solo se tocan `path`, `path_index` y `progress`; el destino, la
+    tarea y el estado se quedan como estaban.
+    """
+    if agent.target_node is None or agent.progress > 0.0:
+        return None
+
+    if penalties is None:
+        penalties = reroute_penalties(agent)
+
+    nueva = astar.astar(graph, agent.current_node, agent.target_node, penalties)
+    if nueva is None:
+        log.debug("AGV %s: reroute sin salida desde %s", agent.id, agent.current_node)
+        return None
+
+    agent.path = list(nueva)
+    agent.path_index = 0
+    agent.progress = 0.0
+    return agent.path
+
+
 # --- Resolucion --------------------------------------------------------------
 
 
@@ -462,6 +564,10 @@ __all__ = [
     "ACTIONS",
     "ACTION_GO",
     "ACTION_WAIT",
+    "INTENTS",
+    "INTENT_ADVANCE",
+    "INTENT_REROUTE",
+    "INTENT_WAIT",
     "BaselinePolicy",
     "Conflict",
     "ConflictLog",
@@ -478,6 +584,9 @@ __all__ = [
     "congested_zones",
     "detect_conflicts",
     "detect_congestion",
+    "normalize_intent",
     "read_only",
+    "reroute",
+    "reroute_penalties",
     "resolve_baseline",
 ]

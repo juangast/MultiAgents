@@ -19,6 +19,10 @@ UNITY_Y: float = 0.0
 
 OK_PAYLOAD: dict[str, Any] = {"ok": True}
 ERROR_UNKNOWN_COMMAND: str = "unknown_command"
+# Los tres finales posibles de un SET_MODE que no sale bien.
+ERROR_BAD_MODE: str = "bad_mode"                    # ese modo no existe
+ERROR_MODE_NOT_SUPPORTED: str = "mode_not_supported"  # esta simulacion no cambia de modo
+ERROR_SET_MODE_FAILED: str = "set_mode_failed"      # existe, pero no se pudo montar
 
 Snapshot = dict[str, Any]
 
@@ -39,6 +43,12 @@ class Simulation(Protocol):
     def reset(self) -> None:
         """Deja la simulacion en su estado inicial."""
         ...
+
+    # `set_mode` NO va en el Protocol a proposito: es **opcional**. Una
+    # simulacion que no sepa cambiar de politica tiene que poder servirse igual,
+    # y `SET_MODE` le contesta `mode_not_supported` en vez de reventar el hilo
+    # del cliente. Es la misma regla que con un comando desconocido: se responde
+    # y se sigue.
 
 
 def to_unity(px: float, py: float) -> tuple[float, float, float]:
@@ -97,4 +107,50 @@ def handle_line(line: str, simulation: Simulation) -> str:
     if command == config.CMD_PING:
         return encode_line(OK_PAYLOAD)
 
+    if command == config.CMD_SET_MODE:
+        return encode_line(set_mode_payload(simulation, _args))
+
     return encode_line(unknown_command_payload(command))
+
+
+def set_mode_payload(simulation: Simulation, args: list[str]) -> dict[str, Any]:
+    """Cambia la politica en caliente y contesta como fue.
+
+    Es el unico comando con argumento: `SET_MODE baseline` o `SET_MODE
+    qlearning`. Sirve para cambiar de politica en mitad de una demo sin
+    reiniciar el servidor, y **arranca una corrida limpia**: media corrida con
+    una politica y media con otra no es una corrida de ninguna de las dos.
+
+    Ninguno de los cuatro finales lanza. Un comando que tumba el hilo del
+    cliente rompe el contrato de "una linea entra, una linea sale", y de eso no
+    se salva ni el que viene mal escrito.
+    """
+    modo = args[0].lower() if args else ""
+    if modo not in config.POLICIES:
+        return {
+            "error": ERROR_BAD_MODE,
+            "command": config.CMD_SET_MODE,
+            "mode": modo,
+            "modes": list(config.POLICIES),
+        }
+
+    cambiar = getattr(simulation, "set_mode", None)
+    if not callable(cambiar):
+        return {"error": ERROR_MODE_NOT_SUPPORTED, "command": config.CMD_SET_MODE}
+
+    try:
+        activo = cambiar(modo)
+    except ValueError as exc:
+        # El caso tipico: `qlearning` sin Q-table entrenada en el disco.
+        return {
+            "error": ERROR_SET_MODE_FAILED,
+            "command": config.CMD_SET_MODE,
+            "mode": modo,
+            "detail": str(exc),
+        }
+
+    respuesta: dict[str, Any] = {"ok": True, "mode": activo or modo}
+    corrida = getattr(simulation, "run", None)
+    if isinstance(corrida, int):
+        respuesta["run"] = corrida
+    return respuesta

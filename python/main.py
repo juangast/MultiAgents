@@ -16,22 +16,29 @@ log = get_logger("main")
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """Levanta el servidor TCP para Unity con la simulacion de verdad."""
+    """Levanta el servidor TCP para Unity con la simulacion de verdad.
+
+    `--policy` es la unica variable experimental: con `baseline` y con
+    `qlearning` corre exactamente el mismo motor. Y se puede cambiar en caliente
+    desde el socket con `SET_MODE`, sin reiniciar nada.
+    """
     grafo, _origen, codigo = _abre_mapa(args.map)
     if grafo is None:
         return codigo
 
     try:
-        simulacion = simulation.Simulation(grafo, args.agents)
+        simulacion = simulation.Simulation(
+            grafo, args.agents, policy=args.policy, model=args.model
+        )
     except ValueError as exc:
         log.error("%s", exc)
         return 2
 
     log.info(
-        "sirviendo el mapa %s con %d agente(s) y politica %s",
+        "sirviendo el mapa %s con %d agente(s) en modo %s",
         grafo.name or "(sin nombre)",
         len(simulacion.agents),
-        simulacion.policy.name,
+        simulacion.mode,
     )
     return server.serve_forever(simulacion, host=args.host, port=args.port)
 
@@ -146,7 +153,12 @@ def cmd_simulate(args: argparse.Namespace) -> int:
 
     try:
         simulacion = simulation.Simulation(
-            grafo, args.agents, origin=origen, target=destino
+            grafo,
+            args.agents,
+            origin=origen,
+            target=destino,
+            policy=args.policy,
+            model=args.model,
         )
     except ValueError as exc:
         log.error("%s", exc)
@@ -163,10 +175,10 @@ def _corre_simulacion(simulacion: simulation.Simulation, pasos: int) -> int:
     """
     grafo = simulacion.graph
     log.info(
-        "--- simulacion: mapa %s, %d agente(s), politica %s, %d pasos como mucho ---",
+        "--- simulacion: mapa %s, %d agente(s), modo %s, %d pasos como mucho ---",
         grafo.name or "(sin nombre)",
         len(simulacion.agents),
-        simulacion.policy.name,
+        simulacion.mode,
         pasos,
     )
 
@@ -195,12 +207,15 @@ def _corre_simulacion(simulacion: simulation.Simulation, pasos: int) -> int:
     while simulacion.step < pasos and not simulacion.done:
         simulacion.tick()
         for agente in simulacion.agents:
+            registro = simulacion.action_record(agente.id)
             log.info(
-                "paso %3d | AGV %s | %-7s | %-4s -> %-4s | %3.0f%% | tramo %d/%d "
-                "| espera %3d | tarea %s",
+                "paso %3d | AGV %s | %-7s | %-7s%-1s | %-4s -> %-4s | %3.0f%% | "
+                "tramo %d/%d | espera %3d | tarea %s",
                 simulacion.step,
                 agente.id,
                 agente.state,
+                "-" if registro is None else registro.action,
+                "!" if registro is not None and registro.blocked else " ",
                 agente.current_node,
                 agente.next_node() or "-",
                 agente.progress * 100.0,
@@ -223,6 +238,11 @@ def _corre_simulacion(simulacion: simulation.Simulation, pasos: int) -> int:
         ),
     )
     log.info("espera total: %d ticks entre todos", numeros["total_wait_time"])
+    log.info(
+        "acciones    : %s (desatascos forzados: %d)",
+        ", ".join(f"{accion} {cuantas}" for accion, cuantas in numeros["actions"].items()),
+        numeros["forced"],
+    )
     for agente in simulacion.agents:
         log.info(
             "AGV %s      : %s en %s, tramo %d/%d, %d ticks esperando",
@@ -420,6 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
                 default=1,
                 help="Cuantos AGVs servir (por defecto 1)",
             )
+            _argumentos_de_politica(sub)
         elif name == "map":
             sub.add_argument(
                 "--name",
@@ -465,10 +486,38 @@ def build_parser() -> argparse.ArgumentParser:
                 default=None,
                 help="Nodo de destino (por defecto el de la ruta del mapa)",
             )
+            _argumentos_de_politica(sub)
         elif name in ("train", "evaluate"):
             _argumentos_de_aprendizaje(sub, name)
 
     return parser
+
+
+def _argumentos_de_politica(sub: argparse.ArgumentParser) -> None:
+    """`--policy` y `--model`, que son los de la fase 8.
+
+    Los comparten `serve` y `simulate` porque son la misma pregunta: con que
+    politica se corre. **`--policy` es la unica variable experimental**: lo demas
+    (mapa, agentes, semilla, conflictos, desatasco) es identico en los dos modos,
+    y si no lo fuera, comparar las dos corridas no mediria la politica.
+    """
+    sub.add_argument(
+        "--policy",
+        choices=list(config.POLICIES),
+        default=config.DEFAULT_POLICY,
+        help=(
+            f"Politica con la que correr (por defecto {config.DEFAULT_POLICY}); "
+            f"con {config.POLICY_QLEARNING} hace falta un modelo entrenado"
+        ),
+    )
+    sub.add_argument(
+        "--model",
+        default=str(config.Q_TABLE_FILE),
+        help=(
+            f"Q-table a cargar con --policy {config.POLICY_QLEARNING} "
+            f"(por defecto {config.Q_TABLE_FILE})"
+        ),
+    )
 
 
 def _argumentos_de_aprendizaje(sub: argparse.ArgumentParser, name: str) -> None:

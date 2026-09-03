@@ -143,7 +143,14 @@ def serve_forever(
 
     escucha = _formatea(servidor.server_address)
     log.info("servidor escuchando en %s", escucha)
-    log.info("comandos: %s, %s, %s", config.CMD_GET_STATE, config.CMD_RESET, config.CMD_PING)
+    log.info(
+        "comandos: %s, %s, %s, %s %s",
+        config.CMD_GET_STATE,
+        config.CMD_RESET,
+        config.CMD_PING,
+        config.CMD_SET_MODE,
+        "|".join(config.POLICIES),
+    )
 
     _instalar_parada_por_senal()
 

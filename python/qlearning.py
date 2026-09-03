@@ -393,56 +393,11 @@ def to_engine_action(action: Action) -> str:
 # --- El reroute --------------------------------------------------------------
 
 
-def reroute_penalties(
-    agent: Agent, *, penalty: float | None = None
-) -> dict[str | tuple[str, str], float]:
-    """Encarece lo que este AGV tiene delante, para que A* lo esquive.
-
-    Penaliza el nodo siguiente y el tramo hacia el, que es exactamente la
-    congestion que el agente puede ver desde donde esta. Sale en el formato de
-    `astar.Penalties`, el gancho que la fase 3 dejo preparado: no toca el mapa
-    ni lo recarga, solo hace cara una casilla durante una busqueda.
-    """
-    siguiente = agent.next_node()
-    if siguiente is None:
-        return {}
-    extra = config.REROUTE_PENALTY if penalty is None else float(penalty)
-    return {siguiente: extra, (agent.current_node, siguiente): extra}
-
-
-def reroute(
-    agent: Agent,
-    graph: WarehouseGraph,
-    *,
-    penalties: astar.Penalties | None = None,
-) -> list[str] | None:
-    """Recalcula la ruta desde donde esta el agente, esquivando lo de delante.
-
-    Devuelve la ruta nueva ya puesta en el agente, o None si no hay ninguna (o
-    si el agente esta a media travesia, que ahi no se puede cambiar de idea sin
-    teletransportarlo).
-
-    **No usa `Agent.assign_task()` a proposito**: esa reinicia `wait_time`, que
-    es justo la medida con la que se comparan las politicas, y borrar el reloj
-    de la espera en cada recalculo haria que el numero dejara de significar
-    algo. Aqui solo se tocan `path`, `path_index` y `progress`; el destino, la
-    tarea y el estado se quedan como estaban.
-    """
-    if agent.target_node is None or agent.progress > 0.0:
-        return None
-
-    if penalties is None:
-        penalties = reroute_penalties(agent)
-
-    nueva = astar.astar(graph, agent.current_node, agent.target_node, penalties)
-    if nueva is None:
-        log.debug("AGV %s: reroute sin salida desde %s", agent.id, agent.current_node)
-        return None
-
-    agent.path = list(nueva)
-    agent.path_index = 0
-    agent.progress = 0.0
-    return agent.path
+# Recalcular es mecanica del MOTOR, no del aprendizaje, asi que estas dos viven
+# en `conflicts` desde la fase 8. Se re-exportan aqui porque la fase 6 las
+# publico en este modulo y lo que se importa de un sitio no se muda sin avisar.
+reroute_penalties = conflicts.reroute_penalties
+reroute = conflicts.reroute
 
 
 def is_useless_reroute(
@@ -459,13 +414,22 @@ def is_useless_reroute(
     larga esta bien pagado si con eso se sale de un cruce de frente, y esta mal
     pagado si solo fue por probar.
 
+    Esquivar un conflicto justifica una ruta **igual** de cara, no una mas cara.
+    Sin ese matiz el castigo no salta nunca (bloqueado siempre hay un conflicto)
+    y la politica aprende a recalcular sin parar: como `PROGRESS` paga por cada
+    nodo cruzado, dar la vuelta al almacen sale rentable, y dos AGVs sentados en
+    el destino del otro se pasan la corrida dando vueltas.
+
     Se compara por costo (`astar.path_cost`), no por numero de nodos: la ruta
     corta en saltos puede ser la cara. Una ruta que ni siquiera se puede recorrer
     cuenta como infinita, o sea que nunca es mejor.
     """
+    nuevo, viejo = _costo(graph, new_path), _costo(graph, old_path)
+    if nuevo > viejo:
+        return True
     if avoided_conflict:
         return False
-    return _costo(graph, new_path) >= _costo(graph, old_path)
+    return nuevo >= viejo
 
 
 def _costo(graph: WarehouseGraph, path: Sequence[str]) -> float:
@@ -636,9 +600,19 @@ class QTable:
         """La fila del estado, creandola a ceros si es la primera vez."""
         return self._q[tuple(state)]
 
+    def _fila(self, state: State) -> dict[Action, float]:
+        """La fila del estado **sin crearla**: si no esta, una de ceros de usar y tirar.
+
+        Leer no puede escribir. Con el `defaultdict` pelado, preguntar por un
+        estado que no se ha visto lo mete en la tabla, y entonces un `evaluate`
+        (que no aprende nada) acabaria con mas estados de los que tenia el modelo
+        que cargo. `states_visited` dejaria de contar lo que dice contar.
+        """
+        return self._q.get(tuple(state)) or _fila_en_cero()
+
     def value(self, state: State, action: Action) -> float:
-        """Q(s, a)."""
-        return self[state][action]
+        """Q(s, a). No crea la fila: leer no escribe."""
+        return self._fila(state)[action]
 
     def set_value(self, state: State, action: Action, value: float) -> None:
         """Escribe Q(s, a). Quien calcula el valor nuevo es la fase 7."""
@@ -656,7 +630,7 @@ class QTable:
         candidatas = tuple(among) if among else ACTIONS
         if not candidatas:
             raise ValueError("no hay ninguna accion entre la que elegir")
-        fila = self[state]
+        fila = self._fila(state)
         mejor = candidatas[0]
         for accion in candidatas[1:]:
             if fila[accion] > fila[mejor]:
@@ -803,15 +777,14 @@ class Decision:
     entrada se queda de un tick anterior. Sin la marca de paso, el entrenamiento
     le atribuiria a la decision de ahora lo que paso hace cuatro ticks.
 
-    `reroute` es la (ruta vieja, ruta nueva) si esta decision fue un REROUTE que
-    llego a cambiar algo, y None en cualquier otro caso. Es lo que necesita
-    `is_useless_reroute()` para decidir si cobrar el castigo.
+    Lo que **no** lleva es que paso despues: si el motor concedio el paso, si lo
+    nego o si el recalculo cambio algo. Eso es cosa del motor y esta en
+    `simulation.ActionRecord`. Aqui solo vive lo que la politica eligio.
     """
 
     state: State
     action: Action
     step: int
-    reroute: tuple[tuple[str, ...], tuple[str, ...]] | None = None
 
 
 class QLearningPolicy:
@@ -858,7 +831,6 @@ class QLearningPolicy:
         self._rng = random.Random(seed)
         self._simulation: SimulationView | None = simulation
         self._last: dict[int, Decision] = {}
-        self._last_reroute: dict[int, tuple[list[str], list[str]]] = {}
         self._avisado: bool = False
 
     def __repr__(self) -> str:
@@ -875,21 +847,24 @@ class QLearningPolicy:
     def reset(self) -> None:
         """Olvida las decisiones del episodio. La Q-table **no** se toca."""
         self._last.clear()
-        self._last_reroute.clear()
 
     def decide(self, agent: Agent, local_state: conflicts.LocalState) -> str:
-        """`go` o `wait`, que es lo unico que el motor entiende.
+        """La accion elegida: `"advance"`, `"wait"` o `"reroute"`.
 
-        Por dentro elige entre las tres acciones y guarda la decision para la
-        fase 7. Un REROUTE recalcula la ruta aqui mismo y devuelve `wait`: la
-        intencion de este tick ya estaba fijada cuando el motor pregunto, asi
-        que la ruta nueva empieza a valer en el siguiente.
+        Y **nada mas**: aqui no se mueve a nadie ni se le reescribe la ruta. La
+        politica propone y el motor dispone, que es lo que la fase 8 vino a
+        dejar claro. Quien ejecuta el REROUTE (encarecer el mapa y volver a
+        llamar a A*) es `simulation.Simulation._recalcula()`, con la tabla de
+        penalizaciones del almacen, no con un dict de usar y tirar.
+
+        Antes esta funcion recalculaba la ruta ella misma, y eso dejaba al motor
+        con una intencion que apuntaba a la ruta vieja: una fuente de errores
+        silenciosos que la fase 8 se lleva por delante.
         """
         estado = self.observe(agent, local_state)
         accion = self.choose(estado)
-        cambio = self._recalcula(agent) if accion is Action.REROUTE else None
-        self._last[agent.id] = Decision(estado, accion, local_state.step, cambio)
-        return to_engine_action(accion)
+        self._last[agent.id] = Decision(estado, accion, local_state.step)
+        return accion.value
 
     def observe(
         self, agent: Agent, local_state: conflicts.LocalState | None = None
@@ -937,37 +912,6 @@ class QLearningPolicy:
         """
         return self._last.get(agent_id)
 
-    def last_reroute(self, agent_id: int) -> tuple[list[str], list[str]] | None:
-        """La (ruta vieja, ruta nueva) del ultimo REROUTE de este AGV.
-
-        La fase 7 la necesita para saber si cobrar el `USELESS_REROUTE`:
-        `is_useless_reroute(grafo, vieja, nueva, avoided_conflict=...)`.
-        """
-        return self._last_reroute.get(agent_id)
-
-    def _recalcula(
-        self, agent: Agent
-    ) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
-        """Aplica el REROUTE y devuelve (ruta vieja, ruta nueva), o None.
-
-        None es "el recalculo no llego a cambiar nada": el AGV iba a media
-        travesia o no habia por donde. Un REROUTE que no cambia la ruta cuesta el
-        tick igual, pero no se le cobra el `USELESS_REROUTE`, porque no hubo
-        ruta nueva que juzgar.
-        """
-        anterior = tuple(agent.path)
-        nueva = reroute(agent, agent.graph)
-        if nueva is None:
-            return None
-        self._last_reroute[agent.id] = (list(anterior), list(nueva))
-        log.debug(
-            "AGV %s: reroute desde %s, %d nodos -> %d nodos",
-            agent.id,
-            agent.current_node,
-            len(anterior),
-            len(nueva),
-        )
-        return anterior, tuple(nueva)
 
 
 # --- Fase 7: el entrenamiento -------------------------------------------------
@@ -1442,17 +1386,30 @@ class TrainingEnv:
           pagar por ir despacio.
         - `TASK_COMPLETE`: entro en `done` en este tick.
         - `CONFLICT` frente a `WAIT`: los dos son "no se movio", y lo que los
-          separa es **haberlo intentado**. El que eligio ADVANCE teniendo un
-          conflicto encima y se quedo donde estaba, intento entrar donde no
-          cabia: -20. El que cedio el paso, -1. Si el castigo cayera sobre todos
-          los del conflicto, la accion no cambiaria la recompensa y no habria
-          nada que aprender; y si cayera sobre el que **si** paso, el AGV con
-          prioridad aprenderia a no usarla y el almacen se pararia entero.
+          separa es **haberlo intentado**. Quien lo dice ya no es la decision,
+          es el motor: `ActionRecord.blocked` es "elegi ADVANCE y no me dejaron
+          pasar", que es exactamente intentar entrar donde no cabia. -20. El que
+          cedio el paso, -1.
+
+          El castigo **no** cae sobre el que gano el desempate y si paso. Y no es
+          un descuido: el estado local no distingue "camino libre sin rivales" de
+          "camino libre y gano la disputa" (en los dos `next_node_occupied = 0` y
+          `has_priority = 1`), asi que cobrarselo al ganador envenenaria la celda
+          del camino libre, que es la que sostiene toda la politica, y el almacen
+          se pararia entero. Al perdedor si se le cobra, y es el que puede
+          aprender algo: su `has_priority` vale 0.
+        - `CONFLICT` tambien al que el desatasco tuvo que forzar
+          (`ActionRecord.forced`). Es la leccion de la fase 8: quedarse todos
+          parados sale caro, y quien paga es la accion que cada uno eligio.
         - `USELESS_REROUTE`: solo el tick en que se recalculo, y solo si la ruta
           nueva ni salia mas barata ni esquivaba un conflicto de verdad.
         - `DEADLOCK`: a todo el que seguia en marcha cuando la corrida murio.
         """
         eventos: list[Event] = []
+        # Lo que el MOTOR hizo con la intencion de este AGV. La decision dice lo
+        # que quiso; esto dice lo que le dejaron.
+        registro = self.sim.action_record(agent.id)
+        fresco = registro is not None and registro.step == paso
 
         if agent.path_index > antes.path_index:
             eventos.append(Event.PROGRESS)
@@ -1460,15 +1417,29 @@ class TrainingEnv:
             eventos.append(Event.TASK_COMPLETE)
 
         if agent.wait_time > antes.wait_time:
-            intento_entrar = decision.action is Action.ADVANCE and decision.step == paso
             eventos.append(
-                Event.CONFLICT if intento_entrar and en_conflicto else Event.WAIT
+                Event.CONFLICT if fresco and registro.blocked else Event.WAIT
             )
 
-        if decision.step == paso and decision.reroute is not None:
-            vieja, nueva = decision.reroute
+        if fresco and registro.forced and Event.CONFLICT not in eventos:
+            eventos.append(Event.CONFLICT)
+
+        if fresco and registro.reroute is not None:
+            vieja, nueva = registro.reroute
+            # "Esquivar un conflicto" es irse a otro sitio, no que hubiera un
+            # conflicto. Con `en_conflicto` a secas, cualquier recalculo hecho
+            # estando bloqueado (o sea, casi todos) contaba como util y el
+            # castigo no saltaba nunca: la politica aprendia a recalcular sin
+            # parar, y dos AGVs sentados en el destino del otro se pasaban la
+            # corrida dando vueltas al almacen.
+            esquiva = (
+                en_conflicto
+                and len(vieja) > 1
+                and len(nueva) > 1
+                and nueva[1] != vieja[1]
+            )
             if is_useless_reroute(
-                self.graph, vieja, nueva, avoided_conflict=en_conflicto
+                self.graph, vieja, nueva, avoided_conflict=esquiva
             ):
                 eventos.append(Event.USELESS_REROUTE)
 

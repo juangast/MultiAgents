@@ -8,15 +8,17 @@ Unity es solo el cliente visual y lo desarrolla otra persona en otro repo.
 
 > En este repo **no** se escribe nada de C# ni de Unity.
 
-Estado actual: **fase 7 terminada**. Los AGVs ya aprenden. La fase 6 definió el entorno de
-Q-Learning (estado local de 72 valores, tres acciones y la recompensa) y la fase 7 pone encima el
-bucle que lo entrena: `python/main.py train` corre mil episodios sin servidor y sin Unity, deja la
-Q-table en `python/models/q_table.json` y los números en `results/`. La recompensa media por
-episodio pasa de **-328.8 a +181.3** y los conflictos bajan de **106.2 a 77.0**; contra el
-baseline, en los mismos escenarios, entrega **2.78 tareas de 4 en vez de 1.55** y se atasca la
-mitad de veces. Los detalles, en [El entrenamiento](#el-entrenamiento).
+Estado actual: **fase 8 terminada**. Las dos piezas ya corren juntas en el mismo tick: **A\* dice
+por dónde y el Q-Learning dice qué conviene hacer ahora**. `main.py serve --policy qlearning`
+levanta el almacén con la Q-table entrenada, la acción de cada AGV (`advance` / `wait` /
+`reroute`) sale en el snapshot para que Unity la pinte, y `SET_MODE` cambia de política en caliente
+sin reiniciar nada. El motor sigue siendo la autoridad —una acción es una intención, no una
+garantía— y ahora además desatasca: **cero deadlocks** en las dos políticas, donde antes moría el
+91 % de los episodios del baseline. Los detalles, en [La fase 8](#la-fase-8-a-dice-por-dónde-q-learning-dice-qué-hacer-ahora).
 
-Antes: la fase 5 añadió la detección de conflictos y la política base (`python/conflicts.py`),
+Antes: la fase 7 puso el bucle que entrena la Q-table (`python/main.py train`, mil episodios sin
+servidor y sin Unity) sobre el entorno que definió la fase 6 (estado local de 72 valores, tres
+acciones y la recompensa). Los números están en [El entrenamiento](#el-entrenamiento). La fase 5 añadió la detección de conflictos y la política base (`python/conflicts.py`),
 partió el tick en dos fases y sacó los números de cada corrida en `snapshot["stats"]`; la política
 es **intercambiable**, así que el Q-Learning entró sin tocar el motor. La fase 3 trajo el
 pathfinding (`python/astar.py`), el agente (`python/agent.py`) y la simulación
@@ -58,6 +60,25 @@ Reglas del contrato:
 | `GET_STATE` | Pide el estado actual | El snapshot completo |
 | `RESET` | Reinicia la simulación | `{"ok":true}` |
 | `PING` | Comprueba que el servidor vive | `{"ok":true}` |
+| `SET_MODE baseline\|qlearning` | Cambia de política **en caliente** y arranca una corrida limpia | `{"ok":true,"mode":"qlearning","run":3}` |
+
+`SET_MODE` es el único comando con argumento, y ninguno de sus finales cierra la conexión:
+
+```
+-> SET_MODE turbo\n
+<- {"error":"bad_mode","command":"SET_MODE","mode":"turbo","modes":["baseline","qlearning"]}\n
+```
+
+| Error | Cuándo |
+|---|---|
+| `bad_mode` | El modo no existe, o no venía ninguno |
+| `set_mode_failed` | El modo existe pero no se pudo montar (falta la Q-table, típicamente) |
+| `mode_not_supported` | Esta simulación no sabe cambiar de política |
+
+Cambiar de modo **siempre reinicia**, aunque el modo pedido sea el que ya estaba: media corrida con
+una política y media con otra no es una corrida de ninguna de las dos, y sus números no dirían
+nada. Sube `run`, `step` vuelve a 1 y lo único que sobrevive es `stats.deadlocks`, que cuenta los
+de la sesión.
 
 Un comando desconocido **no** cierra la conexión, responde y sigue:
 
@@ -91,6 +112,14 @@ existen no cambian de nombre ni de tipo.
 | `agents[].task` | int \| null | fase 3 | Id de la tarea que lleva |
 | `agents[].wait_time` | int | fase 5 | Ticks **acumulados** que lleva cediendo el paso |
 | `stats` | object | fase 5 | Los números de la corrida, ver abajo |
+| `agents[].action` | str | fase 8 | Lo que **eligió** hacer: `advance`, `wait` o `reroute` |
+| `agents[].blocked` | bool | fase 8 | Eligió `advance` y el motor **no le dejó** pasar |
+| `mode` | str | fase 8 | La política activa: `baseline` o `qlearning` |
+
+`action` y `blocked` van juntos a propósito: uno es lo que el AGV **quiso** y el otro lo que el
+motor **le concedió**. Que puedan no coincidir es la fase 8 entera. Un AGV a media travesía está
+ejecutando un avance, así que su acción es `advance`; el que ya llegó o no tiene ruta sale como
+`wait`.
 
 La **posición va interpolada** entre `node` y `next_node`: un AGV a mitad de un tramo manda la
 mitad de camino, no el nodo de destino. Así Unity puede mover el prefab sin teletransportes.
@@ -111,6 +140,9 @@ mitad de camino, no el nodo de destino. Así Unity puede mover el prefab sin tel
 | `waiting` | int | Cuántos AGVs están cediendo el paso ahora mismo |
 | `total_wait_time` | int | Suma del `wait_time` de todos |
 | `finished_reason` | str \| null | `"deadlock"` si la corrida murió atascada |
+| `actions` | object | Decisiones de la corrida por tipo: `{"advance":n,"wait":n,"reroute":n}` |
+| `forced` | int | Veces que el motor tuvo que desatascar a la fuerza |
+| `penalties` | int | Penalizaciones de ruta vivas ahora mismo |
 
 Cuando una corrida muere en deadlock, el servidor entrega **una vez** el snapshot del atasco
 (con `finished_reason` puesto) y en la petición siguiente arranca otra corrida: `step` vuelve a 1
@@ -603,88 +635,279 @@ log y se sigue, con los mil episodios ya escritos en el CSV.
 
 `python3 python/main.py train --map warehouse --agents 4 --episodes 1000 --seed 42`:
 
+> Los números de abajo son los del **motor de la fase 8**, que es el que hay: penalizaciones que
+> caducan y desatasco forzado. La fase 8 cambió el mundo en el que se entrena, así que la Q-table
+> se volvió a entrenar entera con el mismo comando.
+
 ```
    episodios  epsilon  recompensa  r/decision  conflictos  deadlocks  completadas  makespan   espera  estados
 -------------------------------------------------------------------------------------------------------------
-    1-100       0.788      -328.8       -0.52       106.2       0.40         2.91     111.4    123.4       30
-  101-200       0.478       -51.9        2.95        95.4       0.20         3.07     116.5    107.0       31
-  201-300       0.289       109.2        5.48        69.3       0.26         3.05      97.8     79.4       31
-  301-400       0.175       178.6        6.61        65.1       0.27         3.07      90.1     69.9       31
-  401-500       0.106       186.0        7.27        68.7       0.31         3.00      88.4     74.8       31
-  501-600       0.064       183.9        5.52        78.6       0.31         2.89      95.1     84.2       31
-  601-700       0.050       128.7        7.17        85.6       0.34         2.68     100.3    107.8       31
-  701-800       0.050       193.1        7.21        69.7       0.38         2.93      77.4     76.9       31
-  801-900       0.050       184.8        7.60        75.0       0.30         2.89      89.4     83.9       31
-  901-1000      0.050       181.3        7.00        77.0       0.30         2.90      94.5     91.0       31
+    1-100       0.788      -277.4        0.16       105.5       0.00         3.52     129.3    140.5       36
+  101-200       0.478       -75.1        2.67       106.8       0.00         3.54     121.5    132.1       36
+  201-300       0.289        69.8        4.14       100.4       0.00         3.57     122.2    117.8       36
+  301-400       0.175       151.8        5.60       105.2       0.00         3.47     119.8    116.2       36
+  401-500       0.106       261.8        6.11        90.0       0.00         3.64     107.0    102.8       37
+  501-600       0.064       223.3        4.60       106.1       0.00         3.49     119.8    120.4       37
+  601-700       0.050       202.2        5.92       109.5       0.00         3.37     127.5    131.0       39
+  701-800       0.050       254.4        6.30       101.6       0.00         3.61     115.4    112.4       39
+  801-900       0.050       240.2        7.08        97.4       0.00         3.48     116.3    109.5       40
+  901-1000      0.050       170.0        5.28       112.7       0.00         3.40     123.5    135.6       40
 ```
 
-La recompensa media pasa de **-328.8 a +181.3** y deja de ser ruido sobre el episodio 300, que es
-donde epsilon baja de 0.3. Los conflictos por episodio bajan de **106.2 a 77.0** (mínimo 65.1 en el
-bloque 301-400), y el makespan de 111.4 a 94.5.
+La recompensa media pasa de **-277.4 a +170.0** y deja de ser ruido sobre el episodio 300, que es
+donde epsilon baja de 0.3. La columna que más cambia respecto a la fase 7 es `deadlocks`: **0.00 en
+los mil episodios**, porque el desatasco de la fase 8 no deja que ninguna corrida muera atascada.
 
 `evaluate` con 100 episodios, greedy puro, contra la baseline en los mismos escenarios:
 
 ```
 metrica            q-learning    baseline   diferencia
 ------------------------------------------------------
-recompensa             185.73     -503.08      +688.81
-completadas              2.78        1.55        +1.23
-deadlocks                0.43        0.91        -0.48
-makespan                79.10       33.36       +45.74
-conflictos              83.08       51.81       +31.27
-conflictos/tick          1.05        1.55        -0.50
-espera                  89.24       72.88       +16.36
-espera/tick              1.13        2.18        -1.06
+recompensa             321.88     -753.28     +1075.16
+completadas              3.69        3.79        -0.10
+deadlocks                0.00        0.00        +0.00
+makespan               106.68      107.83        -1.15
+conflictos              91.12      115.68       -24.56
+conflictos/tick          0.85        1.07        -0.22
+espera                  92.21      146.64       -54.43
+espera/tick              0.86        1.36        -0.50
 ```
 
-**Ojo con los totales crudos.** El baseline sale con menos conflictos y menos espera porque **se
-atasca antes**: deadlock en el 91 % de los episodios y makespan 33 contra 79. Entrega 1.55 tareas
-de 4; el Q-Learning entrega 2.78. Las que se pueden comparar entre corridas de distinta duración
-son las tasas por tick, y ahí gana el Q-Learning en las dos.
+**Y aquí está el resultado más interesante de la fase 8.** En la fase 7 la baseline entregaba 1.55
+tareas de 4 porque se moría atascada en el 91 % de los episodios, y el Q-Learning ganaba de calle.
+Con el desatasco del motor ya no se muere ninguna corrida, y entonces las dos entregan
+prácticamente lo mismo: **3.79 la baseline y 3.69 el Q-Learning**.
+
+No es que el Q-Learning haya empeorado: es que **quitarle los deadlocks a la baseline le quita su
+único problema grave**. Embestir contra el nodo ocupado sale carísimo en recompensa (-753 contra
++322, que son los -20 de cada intento) pero deja de ser fatal en cuanto el motor garantiza que
+nadie se queda trabado.
+
+Lo que el Q-Learning sigue ganando, y por bastante, es la **calidad** del tráfico: **0.85
+conflictos por tick contra 1.07** y **0.86 ticks de espera por tick contra 1.36**, con el mismo
+makespan (106.7 contra 107.8). Entrega lo mismo chocando un 20 % menos y esperando un 37 % menos:
+cede el paso y rodea en vez de embestir, y llega igual de rápido.
+
+Dicho de otro modo: el desatasco del motor y la política aprendida atacan el mismo problema por dos
+sitios, y con el primero puesto el segundo tiene menos que arreglar. Es justo la clase de cosa que
+la fase 10 tiene que medir, y por eso importa tanto que `policy` sea la **única** variable entre
+las dos corridas.
 
 ### Qué aprendió, celda a celda
 
-La regla que sale de las 111.079 actualizaciones es una sola, y es la que se buscaba: **si el nodo
-de delante está ocupado, no intentes entrar**. De los 23 estados con `next_node_occupied = 1`, en
-los 22 que tienen datos detrás `ADVANCE` no es la mejor acción en ninguno:
+La regla que sale es una sola, y es la que se buscaba: **si el nodo de delante está ocupado, no
+intentes entrar**. De los 24 estados con `next_node_occupied = 1` y al menos 50 visitas detrás,
+`ADVANCE` no es la mejor acción en **ninguno**, y es la peor de las tres en casi todos:
 
 ```
       estado  visitas  mejor    advance /    wait / reroute
-   0|0|0|0|1    13301  advance    77.39 /   20.02 /   16.48   nada delante -> pasa
-   0|0|0|1|1    14421  advance    29.42 /   11.41 /    9.47
-   1|0|0|0|0    12969  wait       -6.07 /   18.70 /   -0.82   ocupado -> cede el paso
-   1|0|0|0|1     9698  reroute    -4.46 /   14.38 /   27.88   ocupado y con prioridad -> rodea
-   1|0|1|0|0     6783  reroute   -21.96 /   -3.67 /    8.67   con cola delante, aun mas claro
-   1|0|2|0|0     1935  reroute   -25.26 /  -10.63 /   10.34
-   1|1|0|0|0        3  reroute    -1.88 /   -1.77 /    0.00   3 visitas: esto no es politica
+   0|0|0|0|1    17058  advance    68.69 /   11.68 /   16.82   nada delante -> pasa
+   0|0|0|1|1    14785  advance    24.06 /    5.54 /    3.22
+   1|0|0|0|0    21656  reroute   -11.56 /   -4.99 /   12.23   ocupado y sin prioridad -> rodea
+   1|0|0|0|1    16607  wait       -0.57 /   17.58 /    8.36   ocupado y con prioridad -> espera turno
+   1|0|0|1|0    13190  reroute   -14.80 /   -3.90 /    4.12
+   1|1|1|0|0     7993  reroute   -16.76 /   -2.39 /    8.29   de frente y con cola -> rodear
+   1|0|1|0|0     7801  reroute   -13.40 /    1.36 /    2.81
 ```
 
-`ADVANCE` va de **+77 con el camino libre a -25 con dos AGVs haciendo cola delante**: 100 puntos
-de diferencia entre la misma acción en dos sitios distintos, que es exactamente lo que el estado
-local tenía que poder distinguir.
+`ADVANCE` va de **+68.69 con el camino libre a -16.76 con alguien de frente y cola delante**: 85
+puntos de diferencia entre la misma acción en dos sitios distintos, que es exactamente lo que el
+estado local tenía que poder distinguir.
 
-De los 72 estados posibles solo se visitan **31**: los otros 41 no se dan en este mapa (no hay
-`edge_conflict` sin que el nodo de delante esté ocupado, por ejemplo). El contador de visitas va en
-la metadata del modelo justo para poder distinguir una fila aprendida de una que sigue casi en el
-cero con el que nació: `1|1|0|0|0` se visitó **3 veces** en mil episodios, y lo que hay en su fila
-no es política, es ruido.
+De los 72 estados posibles solo se visitan **40**: los otros 32 no se dan en este mapa. El contador
+de visitas va en la metadata del modelo justo para poder distinguir una fila aprendida de una que
+sigue casi en el cero con el que nació: hay estados visitados 2 o 3 veces en mil episodios, y lo
+que llevan dentro no es política, es ruido.
+
+Lo que conviene mirar con lupa es **cuánto pesa `REROUTE`**: es la mejor acción en 20 de los 33
+estados con datos detrás, y en una corrida de 6 AGVs se lleva la mayoría de las decisiones. Rodear
+evita el choque, pero alarga la ruta, y por eso el Q-Learning gana en conflictos y en espera mucho
+más de lo que gana en makespan.
 
 ### Lo que no resuelve
 
-Dos cosas, y las dos son del entorno, no del bucle de aprendizaje:
+Los dos problemas que la fase 7 dejó abiertos los cerró la fase 8, y los cerró **en el motor**, no
+en el aprendizaje: el cara a cara en un pasillo y el AGV aparcado encima del cuello de botella se
+deshacen ahora con el [desatasco](#el-desatasco-el-almacén-no-se-queda-trabado). De ahí que
+`deadlocks` valga 0.00 en toda la tabla de arriba, en los dos modos.
 
-- **El cara a cara en un pasillo no tiene salida.** Si dos AGVs se piden el nodo del otro, el gate
-  físico no deja pasar a ninguno y `REROUTE` no ayuda porque en un pasillo recto A\* no tiene otra
-  ruta que devolver. No hay acción de "dar marcha atrás", así que ese deadlock es estructural.
-  Aun así el Q-Learning los baja a la mitad del baseline.
-- **Un AGV que llegó se queda ocupando su nodo para siempre.** Si la ruta de otro pasa por ahí, lo
-  bloquea hasta el final del episodio, y esos son los episodios de 200 ticks con 2-3 tareas
-  completadas que se ven en el CSV. Arreglarlo es cambiar el modelo de ocupación de la fase 5, no
-  el entrenamiento.
+Lo que queda abierto ya no es un atasco, es **rendimiento**:
 
-Greedy puro (`evaluate`) se atasca **más** que el entrenamiento con `epsilon = 0.05` (0.43 contra
-0.30 deadlocks por episodio): sin nada de azar, dos AGVs en el mismo estado eligen lo mismo y el
-empate no se rompe nunca. Es el argumento de por qué `EPSILON_END` no es 0.
+- **Con el almacén muy lleno se acaban los ticks antes que las tareas.** Con 6 AGVs en 13 nodos
+  casi siempre hay alguien delante, y en diez corridas de 1000 ticks se quedan tareas sin terminar:
+  **51 de 60 con `qlearning` y 49 de 60 con la baseline** (con 4 AGVs terminan las 40 y las 38). No
+  es un atasco —no hay un solo deadlock, y el motor desatasca 390 veces por las 559 de la
+  baseline—, es que el cuello de botella no da más de sí.
+- **Un AGV que llegó sigue ocupando su nodo.** El desatasco lo aparta cuando estorba de verdad,
+  pero apartarlo es moverlo a otro sitio, donde puede volver a estorbar. La solución de fondo sigue
+  siendo la que ya decía la fase 7: cambiar el modelo de ocupación, o darle una tarea nueva al que
+  termina en vez de dejarlo aparcado.
+
+Al servir se juega **greedy puro** (`config.SERVE_EPSILON = 0.0`). El argumento de la fase 7 para
+dejar algo de azar —sin él, dos AGVs en el mismo estado eligen lo mismo y el empate no se rompe
+nunca— lo cubre ahora el desatasco, y una corrida determinista es lo que la fase 10 necesita para
+poder comparar.
+
+## La fase 8: A\* dice por dónde, Q-Learning dice qué hacer ahora
+
+Hasta aquí las dos piezas existían por separado: A\* trazaba rutas desde la fase 3 y una Q-table
+entrenada elegía acciones desde la fase 7, pero el servidor montaba siempre la baseline. La fase 8
+las junta en el mismo tick.
+
+**La idea, en una línea: A\* responde *por dónde* y el Q-Learning responde *qué conviene hacer
+ahora*.** Ninguna acción elige un nodo. Ni una.
+
+### El bucle de cada AGV en cada tick
+
+```
+1. recibe la tarea origen -> destino          Simulation._planea_rutas / routes
+2. A* traza el path                           Agent.assign_task -> astar.astar
+3. consulta el siguiente nodo del path        FASE A, _fase_a_intenciones
+4. construye el estado local (5 enteros)      qlearning.get_local_state
+5. elige ADVANCE / WAIT / REROUTE             policy.decide        <- lo unico que cambia de modo
+6. si ADVANCE y es seguro -> se mueve         _puede_entrar + _empieza_travesia
+7. si WAIT -> espera y acumula wait_time      _cede_el_paso
+8. si REROUTE -> penaliza y A* otra vez       _recalcula
+9. repetir hasta completar la tarea
+```
+
+| La pregunta | Quién la contesta | Dónde |
+|---|---|---|
+| ¿Por dónde se va de `S1` a `N6`? | **A\*** | `astar.astar()` |
+| ¿Qué hago ahora, con la ruta que ya tengo? | **Q-Learning** | `qlearning.QLearningPolicy.decide()` |
+| ¿Puedo hacerlo de verdad? | **El motor** | `Simulation._puede_entrar()` |
+
+Los tres tramos del tick están escritos en ese orden en
+`Simulation._fase_b_resuelve_y_aplica()`: detectar, decidir, aplicar. La decisión va **en medio**, y
+esa es la fase entera: la política propone y el motor dispone.
+
+### `policy` es la única variable experimental
+
+```python
+Simulation(grafo, 4, policy="baseline")
+Simulation(grafo, 4, policy="qlearning", model="python/models/q_table.json")
+Simulation(grafo, 4, policy=MiPolitica())   # un objeto tambien vale, como en la fase 5
+```
+
+Con `baseline` y con `qlearning` corre **exactamente el mismo motor**: mismo mapa, mismas rutas,
+misma semilla, misma detección de conflictos, mismo desatasco y misma caducidad de penalizaciones.
+Si cambiara algo más, comparar las dos corridas no mediría la política, y la comparación de la fase
+10 no valdría nada.
+
+Montar la política por nombre lo hace `simulation.make_policy()`. En modo `qlearning` sin Q-table
+legible **lanza** en vez de servir una tabla vacía: una tabla a ceros siempre avanza, o sea que
+parecería funcionar sin haber aprendido nada, y eso es peor que un error.
+
+### La acción es una intención, no una garantía
+
+El gate físico de la fase 5 no se toca: en un nodo ocupado no se entra, diga lo que diga la
+política. Lo que la fase 8 añade es **dejarlo por escrito**. Si dos AGVs eligen `ADVANCE` al mismo
+nodo, el motor aplica el desempate, uno pasa y el otro se queda donde estaba con `blocked` puesto:
+
+```json
+{"id":4,"state":"waiting","action":"advance","blocked":true, "...": "..."}
+```
+
+Ese `blocked` es lo que el entrenamiento cobra a **-20**, y así el AGV aprende que `ADVANCE` en ese
+estado es mala idea.
+
+> **A quién se le cobra el -20.** Al que eligió `ADVANCE` y se quedó donde estaba. **Al ganador
+> no**, y no es un descuido: el estado local no distingue "camino libre sin rivales" de "camino
+> libre y gano la disputa" —en los dos `next_node_occupied = 0` y `has_priority = 1`—, así que
+> cobrárselo al ganador envenenaría la celda `0|0|0|0|1`, la de 16.906 visitas y `advance = +78.91`
+> que sostiene toda la política, y el almacén se pararía entero. El que puede aprender algo del
+> choque es el perdedor, que tiene `has_priority = 0` y por tanto su propia celda.
+
+### El REROUTE penaliza, y la penalización caduca
+
+Recalcular es mecánica del **motor**: la política solo dice `reroute` y quien encarece el mapa y
+vuelve a llamar a A\* es `Simulation._recalcula()`. Antes lo hacía la propia política, y eso dejaba
+al motor con una intención que apuntaba a la ruta vieja.
+
+La tabla de penalizaciones es `astar.TemporaryPenalties`, un `Mapping` de verdad que entra en
+`astar.astar()` **sin tocar una línea de A\***, y hay **una sola por almacén**: que `G` esté
+congestionado es un hecho del mapa, no la opinión de un AGV.
+
+```python
+castigos.add("G", 10.0, step=12)     # suma (tope PENALTY_MAX) y arranca el reloj
+castigos.expire(step=28)             # a los PENALTY_TTL ticks, G vuelve a valer lo que vale
+```
+
+**Caducan a los `config.PENALTY_TTL` (15) ticks**, y esa es la mitad importante de la idea: sin
+reloj el mapa se degrada para siempre y A\* acaba esquivando pasillos que llevan cien ticks libres
+solo porque una vez hubo alguien parado ahí. Como las penalizaciones solo suman, la heurística
+sigue siendo admisible y A\* sigue devolviendo la ruta óptima del mapa encarecido.
+
+Dos reglas más, las dos aprendidas a base de verlas fallar:
+
+- **No hay reroute que esquive tu propio destino.** Si el nodo de delante es el destino, todas las
+  rutas acaban ahí; recalcular solo da una vuelta larga para volver al mismo sitio. Con dos AGVs
+  sentados en el destino del otro, eso es una persecución en círculo que no termina nunca.
+- **No se recalcula dos veces seguidas** (`config.REROUTE_COOLDOWN`, 8 ticks). El primer recalculo
+  penaliza el nodo de delante y A\* da la otra salida; el segundo penaliza esa y devuelve la
+  primera. Un ir y venir que además encarece medio mapa. Durante la pausa, un `REROUTE` es esperar.
+
+### El desatasco: el almacén no se queda trabado
+
+`config.DEADLOCK_TICKS` (20) sigue matando la corrida si nadie avanza, pero ahora **antes** de
+llegar ahí manda el motor. Dos atascos distintos, dos umbrales:
+
+| Cuándo salta | Umbral | Qué mira |
+|---|---|---|
+| El almacén entero parado | `DEADLOCK_FORCE_TICKS` (8) | Nadie se movió en 8 ticks |
+| Un AGV muriéndose de hambre | `STARVED_TICKS` (45) | **Ese** AGV lleva 45 ticks clavado |
+
+El segundo umbral no es un lujo: un contador global de "no se movió nadie" no ve nunca al AGV que
+lleva doscientos ticks en un rincón mientras otros dos dan vueltas por un pasillo. Va más alto
+porque esperar es normal —cruzar un tramo cuesta entre 4 y 8 ticks—, y esperar cuarenta y cinco es
+que nadie te va a dejar pasar nunca.
+
+Cuando salta, la escalada tiene tres peldaños y se prueban en orden hasta que uno cambia algo:
+
+```
+1. pasa el de id menor que tenga el nodo libre     el desempate por prioridad
+2. veto temporal y REROUTE al de id mayor          si de verdad hay otra ruta
+3. el que estorba se aparta a un hueco libre       aunque ya haya terminado su tarea
+```
+
+- **El peldaño 2 exige que la ruta nueva esquive el nodo en disputa del todo.** Que la ruta cambie
+  no basta: en un mapa con cuello de botella A\* devuelve encantado otro camino que vuelve a pasar
+  por el mismo sitio ocupado, y con eso los dos AGVs se pasan el día dando vueltas alrededor del que
+  estorba. Si el veto no sirve, se retira en vez de dejarlo caducar.
+- **El peldaño 3 busca el hueco libre más cercano con un BFS** que atraviesa solo nodos ocupados
+  —o sea, recorre la fila de AGVs atascados hasta ver dónde se acaba— y empuja al **último de la
+  fila**, que es el único que cabe. La fila se acorta en un AGV por desatasco, y a la segunda o la
+  tercera le toca al que estorbaba. El hueco que deja le queda **reservado** al que esperaba durante
+  `config.YIELD_TICKS`: sin eso el que se aparta vuelve, gana el desempate por id menor y el atasco
+  se rehace igual. Apartarse y volver es no apartarse.
+
+Apartarse **no es un movimiento nuevo**: es una ruta de un tramo que pasa por el gate como
+cualquier otra, así que la invariante "un nodo, un AGV" sigue intacta y el test de 500 ticks de la
+fase 5 sigue verde. Al que ya había terminado se le mueve el destino con él y se aparca en el
+hueco, que es lo que hace un AGV de verdad cuando le piden el pasillo.
+
+Todo AGV al que el motor tuvo que forzar algo queda marcado `forced` y sale por el log; al entrenar
+se le cobran los -20, sobre la acción que él eligió. La lección es esa: **quedarse todos parados
+sale caro**.
+
+Con `config.DEADLOCK_FORCE_TICKS = 0` el desatasco se apaga y el motor vuelve a ser el de la fase 5.
+Es lo que usan los tests de deadlock de `test_conflicts.py`, que si no no verían nunca lo que vienen
+a probar.
+
+> **Lo que sigue sin tener arreglo.** Si el que estorba no tiene **ningún** hueco al que ir en todo
+> su lado del mapa, no hay salida posible y la corrida muere como en la fase 5. Hace falta llenar
+> un componente entero del grafo para llegar ahí.
+
+### Cambiar de política en caliente
+
+```
+-> SET_MODE qlearning\n
+<- {"ok":true,"mode":"qlearning","run":3}\n
+```
+
+Para la demo: se enseña la baseline atascándose en el cuello de botella, se manda `SET_MODE
+qlearning` y se ve el mismo escenario con la política aprendida, sin reiniciar el servidor ni
+recargar Unity. Los detalles del comando están en [Comandos](#comandos).
 
 ## Estructura
 
@@ -696,10 +919,10 @@ agentesAGV/
 │   ├── protocol.py     el contrato: comandos, serialización y coordenadas
 │   ├── server.py       servidor TCP, solo transporte
 │   ├── graph.py        el mapa lógico: grafo, validación y carga desde JSON
-│   ├── astar.py        pathfinding con A\* y penalizaciones
+│   ├── astar.py        pathfinding con A\* y penalizaciones (que caducan)
 │   ├── agent.py        el AGV: ruta, estado y tarea
-│   ├── conflicts.py    conflictos, ocupación y la política base
-│   ├── simulation.py   el almacén en marcha: agentes, ticks y snapshot
+│   ├── conflicts.py    conflictos, ocupación, acciones, reroute y la política base
+│   ├── simulation.py   el almacén en marcha: ticks, modos, desatasco y snapshot
 │   ├── qlearning.py    Q-Learning: el entorno (fase 6) y el entrenamiento (fase 7)
 │   ├── main.py         CLI con argparse
 │   ├── maps/           los mapas en JSON (simple.json, warehouse.json)
@@ -764,10 +987,25 @@ python3 python/main.py serve --port 5055              # otro puerto
 python3 python/main.py serve --host 0.0.0.0 --port 5055
 python3 python/main.py serve --map simple             # sirve el otro mapa
 python3 python/main.py serve --agents 6               # con tráfico, para ver conflictos
+
+# la fase 8: el almacen con la politica aprendida
+python3 python/main.py serve --map warehouse --agents 4 --policy qlearning \
+        --model python/models/q_table.json
 ```
+
+| Opción | Por defecto | Para qué |
+|---|---|---|
+| `--map` | `config.DEFAULT_MAP` | Mapa a servir |
+| `--host` / `--port` | `127.0.0.1:5000` | Dónde escuchar |
+| `--agents` | `1` | Cuántos AGVs servir |
+| `--policy` | `baseline` | `baseline` o `qlearning`. **La única variable experimental** |
+| `--model` | `python/models/q_table.json` | La Q-table, solo con `--policy qlearning` |
 
 Con `--agents 1` (el defecto) no hay con quién chocar y `stats.conflicts` sale siempre 0. Para
 ver la fase 5 en marcha hacen falta varios AGVs.
+
+`--policy qlearning` sin modelo en el disco sale con código **2** y dice con qué comando
+entrenarlo. Y una vez levantado, `SET_MODE` cambia de política sin reiniciar.
 
 ### `simulate`
 
@@ -777,6 +1015,10 @@ para probar la lógica sola, sin Unity y sin sockets.
 ```bash
 python3 python/main.py simulate --map warehouse --agents 1 --steps 100 --headless
 python3 python/main.py simulate --map simple --from A --to F --headless
+
+# la fase 8 por el log, sin Unity y sin sockets: se ven WAIT y REROUTE, no solo ADVANCE
+python3 python/main.py simulate --map warehouse --agents 6 --steps 300 --headless \
+        --policy qlearning
 ```
 
 | Opción | Por defecto | Para qué |
@@ -786,12 +1028,19 @@ python3 python/main.py simulate --map simple --from A --to F --headless
 | `--steps` | `100` | Tope de pasos; corta antes si llegan todos |
 | `--headless` | apagado | Corre sin servidor, que es el único modo por ahora |
 | `--from` / `--to` | la ruta del mapa | Origen y destino (`simple`: `A→F`; `warehouse`: `S1→N6`) |
+| `--policy` | `baseline` | `baseline` o `qlearning`, igual que en `serve` |
+| `--model` | `python/models/q_table.json` | La Q-table, solo con `--policy qlearning` |
+
+La cuarta columna es la **acción elegida**, y el `!` de al lado dice que el motor no se la
+concedió: eso es un `ADVANCE` bloqueado, o sea los -20 de la fase 8 vistos por el log.
 
 ```
 AGV 1: S1 -> N6 | costo 27.4 | S1 -> S2 -> S3 -> G -> N4 -> N5 -> N6
-paso   1 | AGV 1 | moving  | S1   -> S2   |  25% | tramo 0/6 | espera   0 | tarea 1
+paso   1 | AGV 1 | moving  | advance  | S1   -> S2   |  25% | tramo 0/6 | espera   0 | tarea 1
+paso   5 | AGV 1 | waiting | reroute  | S2   -> S3   |   0% | tramo 0/6 | espera   1 | tarea 1
+paso  19 | AGV 4 | waiting | advance! | G    -> N3   |   0% | tramo 0/3 | espera   6 | tarea 4
 ...
-paso  28 | AGV 1 | done    | N6   -> -    |   0% | tramo 6/6 | espera   0 | tarea 1
+paso  28 | AGV 1 | done    | wait     | N6   -> -    |   0% | tramo 6/6 | espera   0 | tarea 1
 ```
 
 Con varios AGVs salen además los conflictos y el resumen de la corrida:
@@ -799,13 +1048,16 @@ Con varios AGVs salen además los conflictos y el resumen de la corrida:
 ```
 paso  19 | CONFLICTO edge       | AGV 4, 6 | G <-> N3
 paso  20 | CONFLICTO vertex     | AGV 1, 2, 4, 5, 6 | G
-deadlock en el paso 28: 20 ticks seguidos sin que avance nadie
+paso  30 | DESATASCO | el AGV 4 se aparta a N3 (le deja G al AGV 6) para descongestionar G
 --- resumen ---
-final       : deadlock, nadie avanzo en 20 ticks seguidos
+final       : llegaron todos
 conflictos  : 61 (vertex 28, edge 28, following 0, congestion 5)
 espera total: 128 ticks entre todos
-AGV 4      : waiting en G, tramo 0/3, 28 ticks esperando
+acciones    : advance 96, wait 41, reroute 12 (desatascos forzados: 3)
+AGV 4      : done en N3, tramo 3/3, 28 ticks esperando
 ```
+
+Un **deadlock ya no sale por aquí**: desde la fase 8 el motor desatasca antes de llegar a él.
 
 Sale con `0` si la corrida fue bien, `1` si algún AGV se quedó sin ruta y `2` si el mapa o los
 nodos que le pasaste no existen. Un **deadlock sale con `0`**: que el baseline se atasque es un
@@ -877,6 +1129,7 @@ python3 -m unittest tests.test_astar -v          # solo la fase 3
 python3 -m unittest tests.test_conflicts -v      # solo la fase 5
 python3 -m unittest tests.test_qlearning -v      # solo la fase 6
 python3 -m unittest tests.test_training -v       # solo la fase 7
+python3 -m unittest tests.test_phase8 -v         # solo la fase 8
 ```
 
 | Fichero | Qué cubre |
@@ -891,6 +1144,7 @@ python3 -m unittest tests.test_training -v       # solo la fase 7
 | `test_conflicts.py` | La fase 5: conflictos, política base, invariante y deadlock |
 | `test_qlearning.py` | La fase 6: estado, acciones, recompensa, Q-table y la política |
 | `test_training.py` | La fase 7: Bellman, los dos modos, que aprende y que es reproducible |
+| `test_phase8.py` | La fase 8: los dos modos, la acción en el snapshot, `SET_MODE` y el desatasco |
 
 `test_astar.py` compara A\* contra una **búsqueda exhaustiva** en los dos mapas (los 186 pares
 ordenados de nodos), comprueba que cada par consecutivo de una ruta es una arista de verdad, y
@@ -906,6 +1160,13 @@ bajan, y que en todos los estados con datos detrás (≥50 visitas) la política
 en un nodo ocupado. Comprueba además que dos entrenamientos con la misma semilla dan la **misma
 Q-table celda a celda**, que `evaluate` no toca la tabla, y que entrenar no abre ni un socket
 (`server.serve_forever` y `socket.socket` mockeados y sin llamar).
+
+`test_phase8.py` mide los cuatro criterios de aceptación de la fase tal y como están escritos: que
+con la Q-table entrenada se completan todas las tareas, que salen las tres acciones y no solo
+`ADVANCE`, que `SET_MODE` cambia de modo en caliente dejando la corrida limpia, y que en **10
+corridas de 1000 ticks con 6 AGVs no hay un solo deadlock** —ni con `qlearning` ni con `baseline`,
+porque el desatasco es del motor y no de la política—. Las diez corridas van con diez semillas
+distintas: con una sola serían la misma corrida diez veces.
 
 `test_conflicts.py` monta a propósito un cruce de frente y demuestra que se detecta como
 `edge conflict`, y corre **500 ticks con 6 AGVs** comprobando en cada tick que no hay dos en el

@@ -5,17 +5,133 @@ origen y un destino, y le sale la lista de nodos de la ruta mas barata, o None.
 
 `penalties` es el gancho del REROUTE de la fase 8: encarece nodos y tramos
 concretos para esquivar una congestion, sin tocar el mapa ni recargarlo.
+`TemporaryPenalties` es ese gancho con reloj: las penalizaciones CADUCAN.
 """
 
 import heapq
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
+import config
 from graph import WarehouseGraph
 
 # Una clave es un nodo ("G", extra por entrar en el) o una arista (("S3", "G"),
 # extra por cruzarla). Los dos tipos conviven en el mismo diccionario.
-Penalties = Mapping[str | tuple[str, str], float]
+PenaltyKey = str | tuple[str, str]
+Penalties = Mapping[PenaltyKey, float]
+
+
+class TemporaryPenalties(Mapping):
+    """Penalizaciones que caducan a los `ttl` ticks.
+
+    Es un `Mapping` de verdad, y por eso entra en `astar()` y en `path_cost()`
+    tal cual, **sin tocar una linea de A***: los dos leen las penalizaciones
+    con `.get()` y con el `if not penalties` de rigor.
+
+        castigos = TemporaryPenalties()
+        castigos.add("G", 10.0, step=12)
+        astar(grafo, "S1", "N6", castigos)      # esquiva G
+        castigos.expire(step=28)                # a los 15 ticks, G vuelve a valer lo que vale
+
+    --- Por que caducan ---
+
+    Un REROUTE encarece el nodo que tiene delante para que A* lo rodee. Si esa
+    penalizacion no expirara, el mapa se degradaria para siempre: A* acabaria
+    esquivando pasillos que llevan cien ticks libres solo porque una vez hubo
+    alguien parado ahi, y las rutas serian cada vez peores sin que nada en el
+    almacen lo justifique. El reloj es lo que separa "hay congestion AHORA" de
+    "hubo congestion una vez".
+
+    Acumular refresca: penalizar dos veces el mismo nodo suma (con tope
+    `PENALTY_MAX`) y le pone el reloj a cero otra vez, asi que insistir sube el
+    precio pero nunca lo hace infinito.
+
+    Las penalizaciones **solo suman**, asi que la heuristica de `astar()` sigue
+    siendo admisible: encarecer un tramo nunca puede hacer que `h` sobreestime.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl: int = config.PENALTY_TTL,
+        cap: float = config.PENALTY_MAX,
+    ) -> None:
+        self.ttl: int = int(ttl)
+        self.cap: float = float(cap)
+        # clave -> (cuanto, en que paso caduca)
+        self._items: dict[PenaltyKey, tuple[float, int]] = {}
+
+    def __repr__(self) -> str:
+        return f"TemporaryPenalties(activas={len(self._items)}, ttl={self.ttl})"
+
+    # --- Interfaz de Mapping, que es lo que A* consume --------------------
+
+    def __getitem__(self, key: PenaltyKey) -> float:
+        return self._items[key][0]
+
+    def __iter__(self) -> Iterator[PenaltyKey]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    # --- Lo que el motor usa ----------------------------------------------
+
+    def add(self, key: PenaltyKey, amount: float, *, step: int) -> float:
+        """Encarece `key` y (re)arranca su reloj. Devuelve cuanto vale ahora.
+
+        Un `amount` que no suma nada (<= 0) no crea entrada: una penalizacion de
+        cero no cambia ninguna ruta y solo ensuciaria las stats.
+        """
+        extra = float(amount)
+        if extra <= 0.0:
+            return self._items.get(key, (0.0, 0))[0]
+        acumulado = min(self._items.get(key, (0.0, 0))[0] + extra, self.cap)
+        self._items[key] = (acumulado, int(step) + self.ttl)
+        return acumulado
+
+    def ban(self, key: PenaltyKey, *, step: int) -> float:
+        """Veto del desatasco: caro de verdad, pero **finito**.
+
+        Con `math.inf` un nodo de paso obligado dejaria a A* sin ruta que
+        devolver, y sin ruta no hay desatasco que valga: mas vale una ruta
+        carisima por el unico sitio que hay que ninguna ruta.
+        """
+        self._items[key] = (config.PENALTY_BAN, int(step) + self.ttl)
+        return config.PENALTY_BAN
+
+    def discard(self, key: PenaltyKey) -> None:
+        """Retira una penalizacion antes de que caduque, si estaba.
+
+        La usa el desatasco cuando un veto no sirvio de nada: dejarlo expirar
+        solo encareceria el mapa para los demas durante `ttl` ticks a cambio de
+        nada.
+        """
+        self._items.pop(key, None)
+
+    def expire(self, step: int) -> int:
+        """Quita las vencidas. Devuelve cuantas se fueron; la llama el motor cada tick."""
+        vencidas = [
+            clave for clave, (_, caduca) in self._items.items() if caduca <= int(step)
+        ]
+        for clave in vencidas:
+            del self._items[clave]
+        return len(vencidas)
+
+    def clear(self) -> None:
+        """Empieza de cero. En cada `reset()` de la simulacion."""
+        self._items.clear()
+
+    def as_dict(self) -> dict[str, float]:
+        """Las penalizaciones vivas con claves serializables, para el log y las stats.
+
+        Un tramo sale como `"S3->G"`: JSON no admite tuplas como clave, y asi se
+        distingue de un nodo de un vistazo.
+        """
+        return {
+            (clave if isinstance(clave, str) else f"{clave[0]}->{clave[1]}"): cuanto
+            for clave, (cuanto, _) in sorted(self._items.items(), key=lambda par: str(par[0]))
+        }
 
 
 def heuristic_factor(graph: WarehouseGraph) -> float:

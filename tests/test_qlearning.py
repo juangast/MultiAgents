@@ -583,7 +583,9 @@ class TestPoliticaIntercambiable(unittest.TestCase):
             occupancy=conflicts.read_only(simulacion.occupancy),
             neighbors=tuple(simulacion.graph.neighbors(uno.current_node)),
         )
-        self.assertIn(politica.decide(uno, estado), conflicts.ACTIONS)
+        # Desde la fase 8 la politica declara una INTENCION de las tres, no
+        # el `go`/`wait` que entiende el motor: quien traduce es `conflicts`.
+        self.assertIn(politica.decide(uno, estado), conflicts.INTENTS)
 
     def test_con_la_tabla_a_ceros_siempre_avanza(self) -> None:
         simulacion = simulation.Simulation(graph.warehouse_graph(), 4)
@@ -641,11 +643,11 @@ class TestPoliticaIntercambiable(unittest.TestCase):
                 for anterior, siguiente in zip(agente.path, agente.path[1:]):
                     self.assertTrue(simulacion.graph.has_edge(anterior, siguiente))
 
-        self.assertTrue(
-            any(
-                politica.last_reroute(agente.id) is not None
-                for agente in simulacion.agents
-            ),
+        # Quien ejecuta el REROUTE es el motor desde la fase 8, asi que la
+        # prueba de que salio alguno esta en su registro, no en la politica.
+        self.assertGreater(
+            simulacion.stats()["actions"]["reroute"],
+            0,
             "con epsilon 0.3 y 200 ticks tenia que haber salido algun REROUTE",
         )
 

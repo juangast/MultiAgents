@@ -11,6 +11,7 @@ Lo que se demuestra aqui:
 
 import dataclasses
 import unittest
+from unittest import mock
 
 import agent
 import config
@@ -35,6 +36,15 @@ def agv(
     uno.state = state
     uno.wait_time = wait_time
     return uno
+
+
+# La fase 8 le puso al motor un desatasco que salta a los
+# `config.DEADLOCK_FORCE_TICKS` ticks sin que avance nadie, asi que un atasco ya
+# no llega a los `DEADLOCK_TICKS` y las pruebas de deadlock no verian nunca lo
+# que vienen a probar. Se apaga donde estorba, que es justo para lo que existe el
+# 0 en esa constante: asi estas siguen midiendo el motor de la fase 5, que es de
+# lo que van. Con el desatasco encendido, en `tests/test_phase8.py`.
+sin_desatasco = mock.patch.object(config, "DEADLOCK_FORCE_TICKS", 0)
 
 
 def cruce_frontal() -> simulation.Simulation:
@@ -312,6 +322,7 @@ class TestCruceFrontal(unittest.TestCase):
         self.assertEqual([a.current_node for a in self.simulacion.agents], ["A", "B"])
         self.assertEqual([a.wait_time for a in self.simulacion.agents], [5, 5])
 
+    @sin_desatasco
     def test_el_cruce_de_frente_acaba_en_deadlock(self) -> None:
         while not self.simulacion.done and self.simulacion.step < 200:
             self.simulacion.tick()
@@ -376,6 +387,7 @@ class TestInvarianteDeOcupacion(unittest.TestCase):
             simulacion.tick()
             self.revisa(simulacion)
 
+    @sin_desatasco
     def test_500_snapshots_con_6_agentes_y_reinicios_por_medio(self) -> None:
         # Por este camino el servidor arranca corridas nuevas cuando la anterior
         # muere atascada, asi que la invariante se prueba tambien en los reinicios.
@@ -426,6 +438,7 @@ class TestPoliticaIntercambiable(unittest.TestCase):
     def test_el_baseline_cumple_el_contrato(self) -> None:
         self.assertIsInstance(conflicts.BaselinePolicy(), conflicts.Policy)
 
+    @sin_desatasco
     def test_una_politica_que_siempre_espera_para_a_todo_el_mundo(self) -> None:
         class Quieta:
             name = "quieta"
@@ -520,12 +533,14 @@ class TestStats(unittest.TestCase):
         self.assertEqual(simulacion.conflict_records(), [])
 
     def test_los_campos_congelados_siguen_donde_estaban(self) -> None:
-        # `stats` se agrega al primer nivel; no toca ni `step` ni `agents`.
+        # `stats` (fase 5) y `mode` (fase 8) se agregan al primer nivel; no tocan
+        # ni `step` ni `agents`, que son los de la fase 1.
         instantanea = simulation.Simulation(graph.warehouse_graph(), 1).get_snapshot()
-        self.assertEqual(set(instantanea), {"step", "agents", "stats"})
+        self.assertEqual(set(instantanea), {"step", "agents", "stats", "mode"})
         self.assertEqual(instantanea["step"], 1)
 
 
+@sin_desatasco
 class TestDeadlock(unittest.TestCase):
     """La corrida no se queda colgada: si nadie avanza, se corta y se dice."""
 
