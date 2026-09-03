@@ -8,22 +8,27 @@ Unity es solo el cliente visual y lo desarrolla otra persona en otro repo.
 
 > En este repo **no** se escribe nada de C# ni de Unity.
 
-Estado actual: **fase 8 terminada**. Las dos piezas ya corren juntas en el mismo tick: **A\* dice
+Estado actual: **fase 9 terminada**. Ya no hay que fiarse de la intuición: `python/metrics.py` y
+`main.py benchmark` **miden** las dos políticas semilla a semilla bajo condiciones idénticas y
+escriben `results/baseline.csv`, `results/qlearning.csv` y `results/comparison.json`. El resultado
+real, con sus matices, está en [La fase 9](#la-fase-9-medir-en-vez-de-suponer) — y no es un triunfo
+limpio del Q-Learning.
+
+Antes: en la **fase 8** las dos piezas empezaron a correr juntas en el mismo tick: **A\* dice
 por dónde y el Q-Learning dice qué conviene hacer ahora**. `main.py serve --policy qlearning`
 levanta el almacén con la Q-table entrenada, la acción de cada AGV (`advance` / `wait` /
 `reroute`) sale en el snapshot para que Unity la pinte, y `SET_MODE` cambia de política en caliente
 sin reiniciar nada. El motor sigue siendo la autoridad —una acción es una intención, no una
 garantía— y ahora además desatasca: **cero deadlocks** en las dos políticas, donde antes moría el
 91 % de los episodios del baseline. Los detalles, en [La fase 8](#la-fase-8-a-dice-por-dónde-q-learning-dice-qué-hacer-ahora).
-
-Antes: la fase 7 puso el bucle que entrena la Q-table (`python/main.py train`, mil episodios sin
+La fase 7 puso el bucle que entrena la Q-table (`python/main.py train`, mil episodios sin
 servidor y sin Unity) sobre el entorno que definió la fase 6 (estado local de 72 valores, tres
 acciones y la recompensa). Los números están en [El entrenamiento](#el-entrenamiento). La fase 5 añadió la detección de conflictos y la política base (`python/conflicts.py`),
 partió el tick en dos fases y sacó los números de cada corrida en `snapshot["stats"]`; la política
 es **intercambiable**, así que el Q-Learning entró sin tocar el motor. La fase 3 trajo el
 pathfinding (`python/astar.py`), el agente (`python/agent.py`) y la simulación
-(`python/simulation.py`), y estrenó el subcomando `simulate`. Lo único que sigue siendo andamiaje
-es `benchmark`.
+(`python/simulation.py`), y estrenó el subcomando `simulate`. Ya no queda andamiaje: los seis
+subcomandos hacen algo.
 
 > El baseline **no** está para funcionar bien. Está para funcionar siempre igual y dejar números
 > que medir: gana el AGV de id menor y punto, así que se atasca en el cuello de botella. Sin esa
@@ -909,6 +914,128 @@ Para la demo: se enseña la baseline atascándose en el cuello de botella, se ma
 qlearning` y se ve el mismo escenario con la política aprendida, sin reiniciar el servidor ni
 recargar Unity. Los detalles del comando están en [Comandos](#comandos).
 
+## La fase 9: medir en vez de suponer
+
+Hasta aquí el proyecto tenía dos políticas y una intuición. La fase 9 pone los números:
+`python/metrics.py` recoge las métricas de cada corrida y `main.py benchmark` enfrenta las dos
+políticas **semilla a semilla**, escribiendo `results/baseline.csv`, `results/qlearning.csv`,
+`results/comparison.json` y (si hay matplotlib) `results/comparison.png`.
+
+```bash
+python3 python/main.py benchmark --map warehouse --agents 4 --runs 20 --seeds 1-20
+```
+
+### Lo que de verdad importa: que el escenario sea el mismo
+
+El riesgo de esta fase no es el código, es el sesgo. Si comparas una corrida fácil del baseline
+contra una difícil del Q-Learning, el argumento se cae solo. Por eso el escenario se construye
+**una vez por semilla, antes de que exista ninguna política**:
+
+```python
+for semilla in semillas:
+    escenario = build_scenario(grafo, n_agents, n_tasks, seed=semilla)   # todavía no hay política
+    for politica in politicas:
+        run_once(grafo, escenario, politica)
+```
+
+Que el `build_scenario()` esté **fuera** del bucle de políticas no es cosmético: es lo que hace
+imposible que una vea un trabajo distinto del que vio la otra. Las dos comparten mapa, AGVs,
+orígenes, destinos, la cola de tareas entera y la semilla. Lo único que cambia es el nombre de la
+política. `tests/test_metrics.py::TestMismasCondiciones` lo comprueba sobre 20 semillas, campo a
+campo, y `TestElEscenarioNoEsConstante` comprueba que ese test no pasa por ser trivial.
+
+### La cola de tareas vive en el runner
+
+El motor de las fases 5-8 da **una** ruta por AGV y termina cuando llegan todos. Para medir
+throughput hacen falta más tareas, así que la cola vive en `metrics.py` y no en `simulation.py`:
+ni una línea del motor cambia, y lo que se compara sigue siendo exactamente el motor que ya
+validan los tests de las fases anteriores.
+
+La cola se sortea **entera y de golpe** desde la semilla, nunca según hace falta. Si los destinos
+se sortearan al asignarlos, el orden de las extracciones dependería del orden de llegada, el orden
+de llegada depende de la política, y ahí se acabó la comparación pareada.
+
+Un detalle que cuesta ver: `Agent.assign_task()` pone `wait_time` a 0, y `wait_time` es justo la
+medida con la que se comparan las políticas. El runner lo guarda y lo restaura, por la misma razón
+por la que `conflicts.reroute()` evita `assign_task()` a propósito.
+
+### Las métricas
+
+| Métrica | Qué es |
+|---|---|
+| `makespan` | Ticks hasta despachar todas las tareas; si no se despacharon todas, los que duró |
+| `avg_task_time` | Ticks que costó una tarea de media |
+| `total_wait_time` / `wait_agv_N` | Ticks perdidos cediendo el paso, en total y por AGV |
+| `conflicts_vertex/edge/following/congestion` | Los cuatro tipos, con los ceros explícitos |
+| `deadlocks` | 1 si la corrida murió atascada |
+| `total_distance` | Suma del coste de los tramos realmente pisados |
+| `throughput` | Tareas completadas por 100 ticks |
+| `reroutes` | Cuántas veces la política pidió recalcular |
+| `conflicts_per_tick` / `wait_per_tick` | Las mismas, por tick |
+| `all_completed` / `finished_reason` | Si la corrida terminó, y por qué paró |
+
+La distancia se mide por **cambio de `current_node`**, nunca por `path_index`: un REROUTE pone el
+índice a cero sin mover al AGV ni un metro, y contar por índice inflaría la cifra justo en la
+política que más recalcula.
+
+Y hay una trampa que el informe avisa por escrito: **los totales crudos premian al que muere
+antes**. Una corrida que se atasca en el tick 30 acumula menos conflictos y menos espera que una
+que corre 300 y despacha el triple. Por eso van también las tasas por tick y las de completitud.
+
+### Resultados: 20 semillas, warehouse, 4 AGVs, 16 tareas
+
+Con la Q-table de la fase 7 (`warehouse`, 4 AGVs, 1000 episodios, semilla 42) y tope de 800 ticks:
+
+| Métrica | Baseline | Q-Learning | Diferencia | ¿Mejora? |
+|---|---:|---:|---:|:--:|
+| makespan (ticks) | 401.05 | 494.45 | +23.3 % | **NO** |
+| tiempo por tarea | 74.41 | 51.71 | −30.5 % | sí |
+| tareas completadas | 15.90 | 15.35 | −3.5 % | **NO** |
+| throughput /100t | 4.58 | 4.74 | +3.4 % | sí |
+| espera total | 845.80 | 644.95 | −23.7 % | sí |
+| espera por tick | 2.23 | 1.45 | −34.9 % | sí |
+| distancia recorrida | 398.12 | 588.36 | +47.8 % | **NO** |
+| conflictos | 621.35 | 535.65 | −13.8 % | sí |
+| conflictos por tick | 1.62 | 1.21 | −25.2 % | sí |
+| &nbsp;&nbsp;de nodo | 353.50 | 336.40 | −4.8 % | sí |
+| &nbsp;&nbsp;de arista | 141.10 | 101.20 | −28.3 % | sí |
+| &nbsp;&nbsp;de seguimiento | 122.75 | 91.75 | −25.3 % | sí |
+| &nbsp;&nbsp;de congestión | 4.00 | 6.30 | +57.5 % | **NO** |
+| deadlocks | 0.00 | 0.00 | — | igual |
+| reroutes | 18.15 | 484.70 | +2570.5 % | **NO** |
+| corridas completas % | 90.00 | 55.00 | −38.9 % | **NO** |
+| tareas despachadas % | 99.38 | 95.94 | −3.5 % | **NO** |
+| **semillas ganadas** | **7** | **11** | 2 empates | |
+
+### El veredicto honesto
+
+**El Q-Learning no gana.** Y el caso es interesante porque los dos números que se suelen mirar
+dicen cosas distintas:
+
+- **Gana en 11 de 20 semillas** contra 7 del baseline. Cuando funciona, funciona bien: espera un
+  35 % menos por tick, provoca un 25 % menos de conflictos por tick y cierra cada tarea en 30 %
+  menos ticks.
+- **Y aun así su makespan medio es un 23 % peor** (494 contra 401 ticks). No es que rinda peor de
+  media: es que **se cuelga del todo en 9 de las 20 semillas** (1, 3, 4, 7, 12, 16, 17, 18, 19),
+  que se van al tope de 800 ticks. El baseline solo llega al tope en 2. Nueve corridas al tope se
+  llevan la media por delante; la mediana, que no las nota tanto, queda casi empatada: 365 contra
+  340.
+
+La causa se ve en la fila de `reroutes`: **484 recálculos de media contra 18 del baseline**, y un
+47 % más de distancia recorrida. La política aprendida pide REROUTE constantemente, los AGVs dan
+vueltas largas, y en las corridas malas entra en un ir y venir del que no sale — dos rutas
+alternándose cada `REROUTE_COOLDOWN` ticks hasta que se acaba el reloj.
+
+Por qué pasa, y no es un fallo del benchmark: **la Q-table se entrenó fuera de esta distribución**.
+Los mil episodios de la fase 7 son de **una tarea por AGV y 200 ticks de tope**; aquí se le piden
+**cuatro tareas por AGV y 800 ticks**, con AGVs que terminan y se quedan aparcados ocupando nodos.
+El estado local de cinco enteros no distingue esa situación, así que la política aplica lo que
+aprendió en un almacén más vacío. El experimento está bien montado; lo que falta es reentrenar en
+el régimen en el que se va a evaluar.
+
+> Esto es el resultado real, sin maquillar. Un benchmark que solo sabe dar buenas noticias no sirve
+> para decidir nada.
+
 ## Estructura
 
 ```
@@ -924,10 +1051,12 @@ agentesAGV/
 │   ├── conflicts.py    conflictos, ocupación, acciones, reroute y la política base
 │   ├── simulation.py   el almacén en marcha: ticks, modos, desatasco y snapshot
 │   ├── qlearning.py    Q-Learning: el entorno (fase 6) y el entrenamiento (fase 7)
+│   ├── metrics.py      las métricas de una corrida y la comparación entre políticas (fase 9)
 │   ├── main.py         CLI con argparse
 │   ├── maps/           los mapas en JSON (simple.json, warehouse.json)
 │   └── models/         los modelos entrenados (q_table.json)
-├── results/            salidas de las corridas: training_log.csv, learning_curve.png
+├── results/            salidas: training_log.csv, learning_curve.png, baseline.csv,
+│                       qlearning.csv, comparison.json, comparison.png
 ├── tests/              tests con unittest, y el cliente falso de Unity
 ├── requirements.txt
 └── README.md
@@ -979,7 +1108,7 @@ python3 python/main.py --help
 | `simulate` | Corre la simulación sin servidor e imprime paso a paso qué hace el AGV |
 | `train` | Entrena la Q-table, sin servidor y sin Unity |
 | `evaluate` | Carga una Q-table y la juega greedy, contra la baseline |
-| `benchmark` | Mide el rendimiento de la simulación |
+| `benchmark` | Enfrenta las políticas semilla a semilla y escribe `results/` |
 
 ```bash
 python3 python/main.py serve                          # 127.0.0.1:5000
@@ -1110,6 +1239,49 @@ hyperparameters : alpha=0.2, gamma=0.95, epsilon_start=1.0, epsilon_end=0.05, ..
 states_visited  : 31
 ```
 
+### `benchmark`
+
+Enfrenta las políticas bajo condiciones idénticas y deja los números en `results/`.
+
+```bash
+# lo que pide la fase 9: 20 semillas pareadas
+python3 python/main.py benchmark --map warehouse --agents 4 --runs 20 --seeds 1-20
+
+python3 python/main.py benchmark --seeds 1-50              # más semillas, media más estable
+python3 python/main.py benchmark --agents 6 --tasks 30     # más tráfico y más trabajo
+python3 python/main.py benchmark --policies baseline       # solo la referencia, sin Q-table
+python3 python/main.py benchmark --out /tmp/prueba --no-plots
+```
+
+| Opción | Por defecto | Para qué |
+|---|---|---|
+| `--map` | `warehouse` | Mapa sobre el que medir |
+| `--agents` | `config.TRAIN_AGENTS` (4) | AGVs por corrida |
+| `--tasks` | 4 por AGV | Tareas totales del escenario |
+| `--runs` | `config.BENCHMARK_RUNS` (20) | Cuántas semillas si no se dan con `--seeds` |
+| `--seeds` | — | Semillas concretas: `1-20`, `1,2,3` o `1-5,10`; manda sobre `--runs` |
+| `--policies` | las dos | Qué políticas enfrentar |
+| `--model` | `config.Q_TABLE_FILE` | Q-table del modo `qlearning` |
+| `--max-steps` | `config.BENCHMARK_MAX_STEPS` (800) | Tope de ticks por corrida |
+| `--out` | `results/` | Dónde escribir los CSV y el JSON |
+| `--no-plots` | apagado | No dibuja aunque haya matplotlib |
+
+Todas menos `--policies` se aplican **idénticas** a las dos políticas: es la condición de que la
+comparación mida algo.
+
+Salen cuatro ficheros. Los CSV llevan una fila por semilla y se abren en Excel tal cual (coma,
+punto decimal, sin nada anidado); `comparison.json` lleva media, desviación típica, mediana,
+mínimo y máximo de cada métrica por política, más la cabecera del experimento.
+
+```bash
+head -3 results/baseline.csv
+python3 -c "import json;print(json.load(open('results/comparison.json'))['policies']['baseline']['metrics']['makespan'])"
+```
+
+matplotlib es **opcional**: sin él se avisa por el log y se sigue, porque los números ya están en
+los CSV. Con él sale `results/comparison.png` con barras de makespan, conflictos y espera, y
+barras de error de una desviación típica.
+
 ### Logs
 
 Todo sale por `stderr` con el módulo `logging`, nunca con `print`. Con `--verbose` (o `-v`)
@@ -1140,6 +1312,7 @@ python3 -m unittest tests.test_phase8 -v         # solo la fase 8
 | `test_server.py` | El servidor TCP contra un socket de verdad |
 | `test_graph.py` | El mapa lógico: grafo, `validate()` y ficheros |
 | `test_main.py` | El CLI |
+| `test_metrics.py` | La fase 9: escenarios pareados, métricas, CSV/JSON y el reporte |
 | `test_astar.py` | La fase 3: A\*, penalizaciones, `Agent`, `Simulation` y el snapshot |
 | `test_conflicts.py` | La fase 5: conflictos, política base, invariante y deadlock |
 | `test_qlearning.py` | La fase 6: estado, acciones, recompensa, Q-table y la política |

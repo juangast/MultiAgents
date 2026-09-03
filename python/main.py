@@ -7,6 +7,7 @@ from pathlib import Path
 import astar
 import config
 import graph
+import metrics
 import qlearning
 import server
 import simulation
@@ -373,8 +374,75 @@ def _informa_modelo(path: str | Path, metadata: dict[str, object]) -> None:
 
 
 def cmd_benchmark(args: argparse.Namespace) -> int:
-    """Mide el rendimiento de la simulacion."""
-    log.warning("benchmark: no implementado")
+    """Modo BENCHMARK: enfrenta las politicas semilla a semilla y escribe results/.
+
+    La regla de la fase: para cada semilla se construye UN escenario y se corre
+    con TODAS las politicas. Mismo mapa, mismos AGVs, mismos origenes, mismos
+    destinos, misma cola de tareas y misma semilla; lo unico que cambia es la
+    politica. Si cambiara algo mas, la comparacion no mediria la politica.
+
+    Devuelve 0 aunque el Q-Learning pierda: un resultado malo es un resultado, y
+    lo que aqui seria un fallo es no poder correr el experimento.
+    """
+    grafo, _origen, codigo = _abre_mapa(args.map)
+    if grafo is None:
+        return codigo
+
+    politicas = list(dict.fromkeys(args.policies))
+    modelo = Path(args.model)
+    if config.POLICY_QLEARNING in politicas and not modelo.is_file():
+        log.error(
+            "no existe el modelo %s; entrenalo antes con: "
+            "python3 python/main.py train --map %s --agents %d",
+            modelo,
+            args.map,
+            args.agents,
+        )
+        return 2
+
+    semillas = args.seeds if args.seeds else list(range(1, args.runs + 1))
+    if len(semillas) < config.BENCHMARK_RUNS:
+        log.warning(
+            "%d semillas: con menos de %d la media y la desviacion dicen poco",
+            len(semillas),
+            config.BENCHMARK_RUNS,
+        )
+
+    try:
+        resultados = metrics.run_comparison(
+            grafo,
+            args.agents,
+            args.tasks,
+            semillas,
+            politicas,
+            model=modelo,
+            max_steps=args.max_steps,
+        )
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
+
+    destino = Path(args.out)
+    for nombre, corridas in resultados.items():
+        metrics.write_runs_csv(corridas, destino / f"{nombre}.csv")
+    metrics.write_comparison_json(
+        resultados,
+        destino / config.COMPARISON_JSON.name,
+        header={
+            "map": grafo.name or args.map,
+            "agents": args.agents,
+            "tasks": resultados[politicas[0]][0].n_tasks,
+            "seeds": semillas,
+            "policies": politicas,
+            "model": str(modelo),
+            "max_steps": args.max_steps,
+        },
+    )
+    if not args.no_plots:
+        metrics.save_comparison_plot(resultados, destino / config.COMPARISON_PLOT.name)
+
+    for linea in metrics.comparison_lines(resultados):
+        log.info("%s", linea)
     return 0
 
 
@@ -489,6 +557,8 @@ def build_parser() -> argparse.ArgumentParser:
             _argumentos_de_politica(sub)
         elif name in ("train", "evaluate"):
             _argumentos_de_aprendizaje(sub, name)
+        elif name == "benchmark":
+            _argumentos_de_benchmark(sub)
 
     return parser
 
@@ -606,6 +676,110 @@ def _argumentos_de_aprendizaje(sub: argparse.ArgumentParser, name: str) -> None:
             default=None,
             help="CSV opcional con los episodios de la evaluacion",
         )
+
+
+def _semillas(valor: str) -> list[int]:
+    """Parsea `--seeds`: `1-20`, `1,2,3` o `1-5,10`. Sin repetidas y en orden.
+
+    Un rango se escribe `a-b` con `a <= b`. Las semillas son la identidad de cada
+    escenario, asi que repetirlas seria correr dos veces el mismo trabajo y
+    contarlo como dos medidas: se quitan las duplicadas y se avisa por el error
+    si el texto no se entiende.
+    """
+    numeros: list[int] = []
+    for trozo in valor.split(","):
+        trozo = trozo.strip()
+        if not trozo:
+            continue
+        try:
+            if "-" in trozo.lstrip("-"):
+                desde, hasta = trozo.split("-", 1)
+                arranque, final = int(desde), int(hasta)
+                if arranque > final:
+                    raise argparse.ArgumentTypeError(
+                        f"el rango {trozo!r} va al reves: {arranque} > {final}"
+                    )
+                numeros.extend(range(arranque, final + 1))
+            else:
+                numeros.append(int(trozo))
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                f"{trozo!r} no es una semilla ni un rango de semillas"
+            ) from None
+
+    unicas = list(dict.fromkeys(numeros))
+    if not unicas:
+        raise argparse.ArgumentTypeError(f"{valor!r} no tiene ni una semilla")
+    return unicas
+
+
+def _argumentos_de_benchmark(sub: argparse.ArgumentParser) -> None:
+    """Los argumentos de `benchmark`. Definen el escenario, no la politica.
+
+    Todos menos `--policies` se aplican **identicos** a las dos politicas: esa es
+    la condicion de que la comparacion mida algo. `--seeds` manda sobre `--runs`
+    cuando se dan los dos, porque decir cuales es mas concreto que decir cuantas.
+    """
+    sub.add_argument(
+        "--map",
+        default=config.DEFAULT_MAP,
+        help=f"Mapa sobre el que medir (por defecto {config.DEFAULT_MAP})",
+    )
+    sub.add_argument(
+        "--agents",
+        type=int,
+        default=config.TRAIN_AGENTS,
+        help=f"Cuantos AGVs por corrida (por defecto {config.TRAIN_AGENTS})",
+    )
+    sub.add_argument(
+        "--tasks",
+        type=int,
+        default=None,
+        help=(
+            f"Tareas totales por corrida "
+            f"(por defecto {config.BENCHMARK_TASKS_PER_AGENT} por AGV)"
+        ),
+    )
+    sub.add_argument(
+        "--runs",
+        type=int,
+        default=config.BENCHMARK_RUNS,
+        help=f"Cuantas semillas correr si no se dan con --seeds (por defecto {config.BENCHMARK_RUNS})",
+    )
+    sub.add_argument(
+        "--seeds",
+        type=_semillas,
+        default=None,
+        help="Semillas concretas: 1-20, 1,2,3 o 1-5,10 (manda sobre --runs)",
+    )
+    sub.add_argument(
+        "--policies",
+        nargs="+",
+        choices=list(config.POLICIES),
+        default=list(config.POLICIES),
+        help="Politicas a enfrentar (por defecto las dos)",
+    )
+    sub.add_argument(
+        "--model",
+        default=str(config.Q_TABLE_FILE),
+        help=f"Q-table del modo {config.POLICY_QLEARNING} (por defecto {config.Q_TABLE_FILE})",
+    )
+    sub.add_argument(
+        "--max-steps",
+        type=int,
+        default=config.BENCHMARK_MAX_STEPS,
+        help=f"Tope de ticks por corrida (por defecto {config.BENCHMARK_MAX_STEPS})",
+    )
+    sub.add_argument(
+        "--out",
+        default=str(config.RESULTS_DIR),
+        help=f"Carpeta donde escribir los CSV y el JSON (por defecto {config.RESULTS_DIR})",
+    )
+    sub.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="No dibuja las graficas aunque haya matplotlib",
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -115,3 +115,20 @@ DEFAULT_MAP: str = "warehouse"
 Q_TABLE_FILE: Path = MODELS_DIR / "q_table.json"
 TRAINING_LOG_FILE: Path = RESULTS_DIR / "training_log.csv"
 LEARNING_CURVE_FILE: Path = RESULTS_DIR / "learning_curve.png"
+
+# Benchmark de la fase 9. Comparar dos politicas exige que UNA sola cosa cambie
+# entre las dos corridas, asi que estos numeros definen el escenario y se
+# aplican identicos a las dos: mismo mapa, mismos AGVs, mismas tareas y misma
+# semilla. Lo unico distinto es `policy`.
+BENCHMARK_RUNS: int = 20            # semillas por escenario; el minimo para que la media diga algo
+BENCHMARK_TASKS_PER_AGENT: int = 4  # tareas totales = agentes x esto
+# Tope de ticks por corrida. Una tarea del `warehouse` son ~30 ticks y con 4 por
+# AGV salen ~120; 800 deja sitio de sobra para atascarse y aun asi terminar, que
+# es lo que hay que poder distinguir de un deadlock.
+BENCHMARK_MAX_STEPS: int = 800
+
+# Lo que produce la fase 9.
+BASELINE_CSV: Path = RESULTS_DIR / "baseline.csv"
+QLEARNING_CSV: Path = RESULTS_DIR / "qlearning.csv"
+COMPARISON_JSON: Path = RESULTS_DIR / "comparison.json"
+COMPARISON_PLOT: Path = RESULTS_DIR / "comparison.png"

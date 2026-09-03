@@ -1,5 +1,6 @@
 """Tests del CLI."""
 
+import argparse
 import contextlib
 import io
 import tempfile
@@ -10,10 +11,11 @@ from unittest import mock
 import config
 import graph
 import main
+import metrics
 import simulation
 
-# Lo unico que sigue siendo andamiaje es `benchmark`.
-IMPLEMENTADOS = {"serve", "map", "simulate", "train", "evaluate"}
+# Desde la fase 9 estan los seis: `benchmark` era el ultimo andamiaje.
+IMPLEMENTADOS = {"serve", "map", "simulate", "train", "evaluate", "benchmark"}
 PENDIENTES = [nombre for nombre in main.COMMANDS if nombre not in IMPLEMENTADOS]
 
 
@@ -61,7 +63,13 @@ class TestParser(unittest.TestCase):
 
 
 class TestMain(unittest.TestCase):
-    def test_los_subcomandos_pendientes_devuelven_cero(self) -> None:
+    def test_ya_no_queda_ningun_subcomando_por_implementar(self) -> None:
+        """La fase 9 cierra `benchmark`, que era el ultimo.
+
+        El bucle se queda puesto por si alguna fase vuelve a dejar andamiaje:
+        entonces `PENDIENTES` deja de estar vacio y esto vuelve a medir algo.
+        """
+        self.assertEqual(PENDIENTES, [])
         for name in PENDIENTES:
             with self.assertLogs(level="WARNING") as captured:
                 self.assertEqual(main.main([name]), 0)
@@ -137,8 +145,69 @@ class TestMain(unittest.TestCase):
         self.assertIn("subcomando", salida.getvalue())
 
     def test_verbose_no_truena(self) -> None:
-        with self.assertLogs(level="WARNING"):
-            self.assertEqual(main.main(["--verbose", "benchmark"]), 0)
+        # `benchmark` de verdad escribe ficheros, asi que va contra un tempdir y
+        # con una sola semilla del mapa pequeno: aqui se prueba el CLI, no la
+        # calidad de la comparacion.
+        with tempfile.TemporaryDirectory() as carpeta:
+            with self.assertLogs(level="WARNING"):
+                self.assertEqual(
+                    main.main(_benchmark_corto(carpeta, "--verbose")), 0
+                )
+
+
+def _benchmark_corto(carpeta: str, *antes: str) -> list[str]:
+    """Un `benchmark` minimo: mapa pequeno, una semilla y sin graficas."""
+    return [
+        *antes,
+        "benchmark",
+        "--map", "simple",
+        "--agents", "2",
+        "--tasks", "4",
+        "--seeds", "1",
+        "--policies", "baseline",
+        "--out", carpeta,
+        "--no-plots",
+    ]
+
+
+class TestBenchmark(unittest.TestCase):
+    """La fase 9 por el CLI."""
+
+    def test_escribe_el_csv_y_el_json_en_donde_le_digan(self) -> None:
+        with tempfile.TemporaryDirectory() as carpeta:
+            self.assertEqual(main.main(_benchmark_corto(carpeta)), 0)
+            destino = Path(carpeta)
+            self.assertTrue((destino / "baseline.csv").is_file())
+            self.assertTrue((destino / "comparison.json").is_file())
+            filas = metrics.read_runs_csv(destino / "baseline.csv")
+            self.assertEqual(len(filas), 1)
+            self.assertEqual(filas[0]["policy"], "baseline")
+            self.assertEqual(filas[0]["seed"], "1")
+
+    def test_sin_q_table_avisa_y_devuelve_dos(self) -> None:
+        with tempfile.TemporaryDirectory() as carpeta:
+            with self.assertLogs(level="ERROR") as capturado:
+                codigo = main.main([
+                    "benchmark", "--map", "simple", "--agents", "2",
+                    "--seeds", "1", "--out", carpeta,
+                    "--model", str(Path(carpeta) / "no-existe.json"),
+                ])
+            self.assertEqual(codigo, 2)
+            self.assertIn("no existe el modelo", capturado.output[0])
+
+    def test_el_parser_de_semillas(self) -> None:
+        self.assertEqual(main._semillas("1-5"), [1, 2, 3, 4, 5])
+        self.assertEqual(main._semillas("3,1,2"), [3, 1, 2])
+        self.assertEqual(main._semillas("1-3,7"), [1, 2, 3, 7])
+        # Repetidas fuera: correr dos veces la misma semilla es correr dos veces
+        # el mismo trabajo y contarlo como dos medidas.
+        self.assertEqual(main._semillas("1,1,2"), [1, 2])
+
+    def test_una_semilla_que_no_se_entiende_no_pasa(self) -> None:
+        for texto in ("hola", "5-1", "", "1-x"):
+            with self.subTest(seeds=texto):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    main._semillas(texto)
 
 
 if __name__ == "__main__":
