@@ -34,7 +34,7 @@ import json
 import random
 import statistics
 from collections import deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -451,6 +451,7 @@ def run_comparison(
     *,
     model: str | Path | None = None,
     max_steps: int = config.BENCHMARK_MAX_STEPS,
+    builder: Callable[[int], Scenario] | None = None,
 ) -> dict[str, list[RunMetrics]]:
     """Enfrenta las politicas semilla a semilla, bajo condiciones identicas.
 
@@ -459,6 +460,13 @@ def run_comparison(
     cosmetico: es lo que hace imposible que una politica vea un trabajo distinto
     del que vio la otra. Mismo mapa, mismos AGVs, mismos origenes, mismos
     destinos, misma cola y misma semilla; lo unico que cambia es el nombre.
+
+    `builder` es el gancho de la fase 10: una funcion `semilla -> Scenario` que
+    sustituye al sorteo de `build_scenario()`. Los escenarios A-E de
+    `scenarios.py` traen sus posiciones de salida escritas a mano, y esta es la
+    unica pieza que hacia falta para correrlos con el runner que ya estaba. Da
+    igual de donde salga el escenario: se sigue construyendo **una vez por
+    semilla y fuera del bucle de politicas**, que es la invariante de la fase 9.
 
     Devuelve `{politica: [RunMetrics por semilla]}`, con las listas en el mismo
     orden de semillas, que es lo que permite compararlas pareadas despues.
@@ -486,7 +494,11 @@ def run_comparison(
     # que leer. Los errores siguen saliendo.
     with qlearning._quiet("simulation", "agent", "conflicts"):
         for semilla in semillas:
-            escenario = build_scenario(graph, n_agents, n_tasks, seed=semilla)
+            escenario = (
+                builder(semilla)
+                if builder is not None
+                else build_scenario(graph, n_agents, n_tasks, seed=semilla)
+            )
             for nombre in policies:
                 resultados[nombre].append(
                     run_once(

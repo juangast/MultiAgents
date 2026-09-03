@@ -9,6 +9,7 @@ import config
 import graph
 import metrics
 import qlearning
+import scenarios
 import server
 import simulation
 from logs import get_logger, setup_logging
@@ -279,7 +280,15 @@ def cmd_train(args: argparse.Namespace) -> int:
     de miles de ticks: meter un socket en medio multiplicaria el tiempo por el
     ping y no le daria al algoritmo ni un dato mas. Unity entra despues, con
     `serve`, a ver correr lo aprendido.
+
+    Con `--scenario X` entrena **en** ese escenario de la fase 10: su mapa, sus
+    AGVs y sus posiciones de salida, en vez del sorteo abierto de todo el mapa.
+    Es la mitad "una Q-table por escenario" del experimento de la fase; la otra
+    mitad es la tabla general que ya esta en `python/models/q_table.json`.
     """
+    if getattr(args, "scenario", None):
+        return _entrena_escenario(args)
+
     grafo, _origen, codigo = _abre_mapa(args.map)
     if grafo is None:
         return codigo
@@ -298,6 +307,66 @@ def cmd_train(args: argparse.Namespace) -> int:
         return 2
 
     _informa_modelo(args.model, entrenador.metadata())
+    return 0
+
+
+def _entrena_escenario(args: argparse.Namespace) -> int:
+    """`train --scenario X`: entrena en las salidas y los destinos de ese escenario.
+
+    El mapa y el numero de AGVs los manda el escenario, no el CLI: entrenar en
+    `--map simple` una tabla que se va a servir en el `warehouse` del escenario
+    D no mediria lo que la fase pregunta. Y el modelo va por defecto a su propio
+    fichero (`q_table_<letra>.json`) para no pisar la tabla general, que es
+    contra la que hay que compararlo.
+    """
+    try:
+        spec = scenarios.get(args.scenario)
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
+
+    destino = (
+        Path(args.model)
+        if args.model != str(config.Q_TABLE_FILE)
+        else config.scenario_model(spec.letter)
+    )
+    log.info(
+        "entrenando en el escenario %s (%s): mapa %s, %d AGVs, salidas %s -> %s",
+        spec.letter,
+        spec.name,
+        spec.map_name,
+        spec.n_agents,
+        ", ".join(spec.starts),
+        destino,
+    )
+
+    try:
+        ajustes = qlearning.TrainingConfig(
+            map_name=spec.map_name,
+            agents=spec.n_agents,
+            episodes=args.episodes,
+            seed=args.seed,
+            alpha=args.alpha,
+            gamma=args.gamma,
+            epsilon_start=args.epsilon_start,
+            epsilon_end=args.epsilon_end,
+            epsilon_decay=args.epsilon_decay,
+            max_steps=args.max_steps,
+            enable_reroute=False if args.no_reroute else None,
+            scenario=spec.letter,
+        )
+        entrenador = scenarios.train_scenario(
+            spec,
+            ajustes,
+            model_path=destino,
+            log_path=args.log,
+            curve_path=None if args.no_curve else args.curve,
+        )
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
+
+    _informa_modelo(destino, entrenador.metadata())
     return 0
 
 
@@ -446,6 +515,114 @@ def cmd_benchmark(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_scenario(args: argparse.Namespace) -> int:
+    """Modo SCENARIO: corre los escenarios de la fase 10 y escribe la tabla resumen.
+
+    Cada escenario se corre con cada politica sobre las MISMAS semillas, con el
+    escenario construido una vez por semilla y fuera del bucle de politicas
+    (es la invariante de la fase 9, aqui intacta). Escribe un
+    `results/scenario_<letra>_<policy>.csv` por cada par y un
+    `results/summary_table.csv` con una fila por (escenario, politica).
+
+    Devuelve 0 aunque el Q-Learning pierda en los cinco: un resultado malo es un
+    resultado. Lo que aqui es un error es no poder correr el experimento.
+    """
+    if not args.all and not args.name:
+        log.error(
+            "hace falta decir que escenario: --name {%s} o --all para los cinco",
+            "|".join(scenarios.LETTERS),
+        )
+        return 2
+
+    try:
+        specs = scenarios.all_scenarios() if args.all else [scenarios.get(args.name)]
+    except ValueError as exc:
+        log.error("%s", exc)
+        return 2
+
+    politicas = [args.policy] if args.policy else list(config.POLICIES)
+    if config.POLICY_QLEARNING in politicas:
+        codigo = _comprueba_modelos(specs, args)
+        if codigo:
+            return codigo
+
+    destino = Path(args.out)
+    filas: list[dict[str, object]] = []
+    veredictos: list[str] = []
+
+    for spec in specs:
+        modelo = scenarios.model_for(
+            spec, per_scenario=args.per_scenario_model, model=args.model
+        )
+        try:
+            resultados = scenarios.run_scenario(
+                spec,
+                politicas,
+                runs=args.runs,
+                seeds=args.seeds,
+                model=modelo,
+                max_steps=args.max_steps,
+                out_dir=destino,
+            )
+        except ValueError as exc:
+            log.error("escenario %s: %s", spec.letter, exc)
+            return 2
+
+        for linea in metrics.comparison_lines(resultados):
+            log.info("%s", linea)
+        filas.extend(scenarios.summary_rows(spec, resultados, model=modelo))
+        if len(politicas) > 1:
+            veredictos.append(scenarios.scenario_verdict(spec, resultados))
+
+    if not args.no_summary:
+        scenarios.write_summary_table(filas, destino / config.SUMMARY_TABLE_FILE.name)
+
+    if veredictos:
+        log.info("--- veredicto por escenario ---")
+        for linea in veredictos:
+            log.info("%s", linea)
+    return 0
+
+
+def _comprueba_modelos(
+    specs: Sequence[scenarios.ScenarioSpec], args: argparse.Namespace
+) -> int:
+    """Que existan las Q-tables que hacen falta, antes de correr nada.
+
+    Se comprueban **todas** de golpe y no una por una segun toca: con `--all`,
+    reventar en el escenario D despues de haber corrido A, B y C dejaria
+    `results/` a medias y con una tabla resumen incompleta.
+    """
+    faltan: list[Path] = []
+    for spec in specs:
+        modelo = scenarios.model_for(
+            spec, per_scenario=args.per_scenario_model, model=args.model
+        )
+        if not modelo.is_file() and modelo not in faltan:
+            faltan.append(modelo)
+
+    if not faltan:
+        return 0
+
+    for modelo in faltan:
+        if args.per_scenario_model:
+            letra = modelo.stem.rsplit("_", 1)[-1]
+            log.error(
+                "no existe el modelo %s; entrenalo antes con: "
+                "python3 python/main.py train --scenario %s",
+                modelo,
+                letra,
+            )
+        else:
+            log.error(
+                "no existe el modelo %s; entrenalo antes con: "
+                "python3 python/main.py train --map %s",
+                modelo,
+                config.DEFAULT_MAP,
+            )
+    return 2
+
+
 COMMANDS: dict[str, str] = {
     "serve": "Levanta el servidor TCP para Unity",
     "map": "Muestra el mapa logico y lo valida",
@@ -453,6 +630,7 @@ COMMANDS: dict[str, str] = {
     "train": "Entrena los agentes con Q-Learning",
     "evaluate": "Evalua una politica ya entrenada",
     "benchmark": "Mide el rendimiento de la simulacion",
+    "scenario": "Corre los escenarios de la fase 10 y su tabla resumen",
 }
 
 HANDLERS = {
@@ -462,6 +640,7 @@ HANDLERS = {
     "train": cmd_train,
     "evaluate": cmd_evaluate,
     "benchmark": cmd_benchmark,
+    "scenario": cmd_scenario,
 }
 
 
@@ -559,6 +738,8 @@ def build_parser() -> argparse.ArgumentParser:
             _argumentos_de_aprendizaje(sub, name)
         elif name == "benchmark":
             _argumentos_de_benchmark(sub)
+        elif name == "scenario":
+            _argumentos_de_escenario(sub)
 
     return parser
 
@@ -633,6 +814,16 @@ def _argumentos_de_aprendizaje(sub: argparse.ArgumentParser, name: str) -> None:
     )
 
     if name == "train":
+        sub.add_argument(
+            "--scenario",
+            default=None,
+            help=(
+                "Entrena EN un escenario de la fase 10 ("
+                + ", ".join(scenarios.LETTERS)
+                + "): su mapa, sus AGVs y sus posiciones de salida. El modelo va "
+                "a python/models/q_table_<letra>.json salvo que se de --model"
+            ),
+        )
         sub.add_argument(
             "--episodes",
             type=int,
@@ -781,6 +972,77 @@ def _argumentos_de_benchmark(sub: argparse.ArgumentParser) -> None:
         help="No dibuja las graficas aunque haya matplotlib",
     )
 
+
+def _argumentos_de_escenario(sub: argparse.ArgumentParser) -> None:
+    """Los argumentos de `scenario` (fase 10).
+
+    `--name` y `--all` son excluyentes y hace falta uno de los dos: correr "el
+    escenario por defecto" no significa nada cuando el sentido de la fase es
+    justo que son cinco distintos. Que falten los dos lo comprueba `cmd_scenario`
+    y no argparse, para que salga por el log y con codigo de salida como el
+    resto de los errores del CLI.
+
+    `--policy` **omitido corre las dos**, que es lo que pide la fase. Sigue
+    siendo la unica variable experimental: mapa, AGVs, salidas, cola y semillas
+    son identicos para las dos, y por eso la comparacion mide la politica.
+    """
+    cual = sub.add_mutually_exclusive_group()
+    cual.add_argument(
+        "--name",
+        help="Escenario a correr: " + ", ".join(scenarios.LETTERS),
+    )
+    cual.add_argument(
+        "--all",
+        action="store_true",
+        help="Corre los cinco escenarios seguidos",
+    )
+    sub.add_argument(
+        "--policy",
+        choices=list(config.POLICIES),
+        default=None,
+        help="Politica con la que correr (omitido: corre las dos y las compara)",
+    )
+    sub.add_argument(
+        "--runs",
+        type=int,
+        default=config.SCENARIO_RUNS,
+        help=f"Semillas por escenario (por defecto {config.SCENARIO_RUNS})",
+    )
+    sub.add_argument(
+        "--seeds",
+        type=_semillas,
+        default=None,
+        help="Semillas concretas: 1-20, 1,2,3 o 1-5,10 (manda sobre --runs)",
+    )
+    sub.add_argument(
+        "--model",
+        default=str(config.Q_TABLE_FILE),
+        help=f"La Q-table general (por defecto {config.Q_TABLE_FILE})",
+    )
+    sub.add_argument(
+        "--per-scenario-model",
+        action="store_true",
+        help=(
+            "Usa la Q-table de cada escenario (python/models/q_table_<letra>.json) "
+            "en vez de la general; se entrenan con train --scenario"
+        ),
+    )
+    sub.add_argument(
+        "--max-steps",
+        type=int,
+        default=None,
+        help="Tope de ticks por corrida (por defecto, el de cada escenario)",
+    )
+    sub.add_argument(
+        "--out",
+        default=str(config.RESULTS_DIR),
+        help=f"Carpeta donde escribir los CSV (por defecto {config.RESULTS_DIR})",
+    )
+    sub.add_argument(
+        "--no-summary",
+        action="store_true",
+        help=f"No escribe {config.SUMMARY_TABLE_FILE.name}",
+    )
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Punto de entrada del CLI."""

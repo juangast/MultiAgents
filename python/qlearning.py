@@ -71,7 +71,7 @@ import math
 import random
 import statistics
 from collections import Counter, defaultdict
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
@@ -1022,11 +1022,16 @@ class TrainingConfig:
     max_steps: int = config.MAX_STEPS_PER_EPISODE
     enable_reroute: bool | None = None
     report_every: int = config.REPORT_EVERY
+    # Letra del escenario de la fase 10 con el que se entreno, o "" si se
+    # entreno con el sorteo abierto. Va a la metadata: un modelo que no dice en
+    # que regimen aprendio no se puede volver a leer dentro de un mes.
+    scenario: str = ""
 
     def as_dict(self) -> dict[str, Any]:
         """Los hiperparametros en JSON, para la metadata del modelo."""
         return {
             "map": self.map_name,
+            "scenario": self.scenario,
             "agents": self.agents,
             "episodes": self.episodes,
             "seed": self.seed,
@@ -1276,6 +1281,11 @@ class TrainingEnv:
     **Cada `reset()` es un escenario nuevo** (ver `random_routes`), sacado del
     generador sembrado en el constructor: la secuencia de episodios de una
     semilla es siempre la misma.
+
+    `routes_factory` cambia **de donde** salen esas rutas, y nada mas: con el se
+    entrena en las posiciones de salida y los destinos de un escenario de la
+    fase 10 en vez de en el sorteo abierto. Por defecto es `None` y entonces
+    esto es exactamente la fase 7, hasta el ultimo numero de la Q-table.
     """
 
     def __init__(
@@ -1286,12 +1296,17 @@ class TrainingEnv:
         *,
         seed: int = config.RANDOM_SEED,
         max_steps: int = config.MAX_STEPS_PER_EPISODE,
+        routes_factory: Callable[[random.Random], Sequence[tuple[str, str]]] | None = None,
     ) -> None:
         self.graph = graph
         self.n_agents = int(n_agents)
         self.policy = policy
         self.max_steps = int(max_steps)
         self._rng = random.Random(seed)
+        # De donde salen las rutas de cada episodio. Por defecto, el sorteo de
+        # siempre; la fase 10 le pasa el de un escenario concreto para poder
+        # entrenar en las salidas y los destinos en los que se va a evaluar.
+        self._routes_factory = routes_factory
 
         self.simulation: simulation.Simulation | None = None
         self._abiertas: dict[int, _Abierta] = {}
@@ -1318,7 +1333,11 @@ class TrainingEnv:
 
     def reset(self) -> None:
         """Arranca un episodio nuevo, con un reparto de tareas nuevo."""
-        rutas = random_routes(self.graph, self.n_agents, self._rng)
+        rutas = (
+            list(self._routes_factory(self._rng))
+            if self._routes_factory is not None
+            else random_routes(self.graph, self.n_agents, self._rng)
+        )
         self.simulation = simulation.Simulation(
             self.graph, self.n_agents, routes=rutas, policy=self.policy
         )
@@ -1555,6 +1574,7 @@ class Trainer:
         *,
         q_table: QTable | None = None,
         learn: bool = True,
+        routes_factory: Callable[[random.Random], Sequence[tuple[str, str]]] | None = None,
     ) -> None:
         self.graph = graph
         self.cfg = cfg
@@ -1592,6 +1612,7 @@ class Trainer:
             self.policy,
             seed=semilla_escenarios,
             max_steps=cfg.max_steps,
+            routes_factory=routes_factory,
         )
 
     def __repr__(self) -> str:
@@ -1742,13 +1763,21 @@ def train(
     model_path: str | Path = config.Q_TABLE_FILE,
     log_path: str | Path | None = config.TRAINING_LOG_FILE,
     curve_path: str | Path | None = config.LEARNING_CURVE_FILE,
+    routes_factory: Callable[[random.Random], Sequence[tuple[str, str]]] | None = None,
 ) -> Trainer:
     """Modo TRAIN: entrena, guarda el modelo, el CSV y la curva. Sin servidor.
+
+    Con `routes_factory` se entrena en las salidas y los destinos de un
+    escenario concreto (fase 10); sin el, en el sorteo abierto de siempre.
 
     Devuelve el `Trainer` con `history` lleno, por si quien llama quiere seguir
     mirando los numeros.
     """
-    entrenador = Trainer(graph, cfg if cfg is not None else TrainingConfig())
+    entrenador = Trainer(
+        graph,
+        cfg if cfg is not None else TrainingConfig(),
+        routes_factory=routes_factory,
+    )
     entrenador.run()
 
     entrenador.save(model_path)

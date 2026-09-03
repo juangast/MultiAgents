@@ -139,3 +139,27 @@ COMPARISON_PLOT: Path = RESULTS_DIR / "comparison.png"
 # vale 0.0 y le gana a TODO lo aprendido. Sin este filtro la politica acaba
 # eligiendo justo la accion de la que no sabe nada. Con 0 se apaga el filtro.
 SERVE_MIN_VISITS: int = 30
+
+# Escenarios de la fase 10. Cinco escenarios reproducibles que barren el rango
+# de congestion, cada uno con sus posiciones de salida escritas a mano. Lo que
+# la semilla sortea es solo QUE destinos tocan; la estructura del escenario
+# (mapa, AGVs, donde arranca cada uno) es fija, o las N corridas serian la misma
+# corrida N veces y la desviacion tipica saldria 0.
+SCENARIO_SEED: int = 100          # semilla base; las corridas son SEED, SEED+1, ...
+SCENARIO_RUNS: int = BENCHMARK_RUNS  # corridas por escenario y politica
+SCENARIO_MAX_STEPS: int = BENCHMARK_MAX_STEPS
+
+# Lo que produce la fase 10. El CSV por escenario y politica lleva la letra y el
+# nombre de la politica en el nombre; la tabla resumen es una sola, con una fila
+# por (escenario, politica), y es la que se pega en el reporte.
+SUMMARY_TABLE_FILE: Path = RESULTS_DIR / "summary_table.csv"
+
+
+def scenario_csv(letter: str, policy: str) -> Path:
+    """Donde va el CSV de un escenario corrido con una politica."""
+    return RESULTS_DIR / f"scenario_{letter.upper()}_{policy}.csv"
+
+
+def scenario_model(letter: str) -> Path:
+    """La Q-table entrenada para UN escenario, frente a la general."""
+    return MODELS_DIR / f"q_table_{letter.upper()}.json"

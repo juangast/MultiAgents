@@ -12,10 +12,14 @@ import config
 import graph
 import main
 import metrics
+import qlearning
+import scenarios
 import simulation
 
-# Desde la fase 9 estan los seis: `benchmark` era el ultimo andamiaje.
-IMPLEMENTADOS = {"serve", "map", "simulate", "train", "evaluate", "benchmark"}
+# Desde la fase 10 estan los siete: `scenario` es el ultimo.
+IMPLEMENTADOS = {
+    "serve", "map", "simulate", "train", "evaluate", "benchmark", "scenario",
+}
 PENDIENTES = [nombre for nombre in main.COMMANDS if nombre not in IMPLEMENTADOS]
 
 
@@ -64,7 +68,7 @@ class TestParser(unittest.TestCase):
 
 class TestMain(unittest.TestCase):
     def test_ya_no_queda_ningun_subcomando_por_implementar(self) -> None:
-        """La fase 9 cierra `benchmark`, que era el ultimo.
+        """La fase 10 cierra `scenario`, que era el ultimo.
 
         El bucle se queda puesto por si alguna fase vuelve a dejar andamiaje:
         entonces `PENDIENTES` deja de estar vacio y esto vuelve a medir algo.
@@ -208,6 +212,126 @@ class TestBenchmark(unittest.TestCase):
             with self.subTest(seeds=texto):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     main._semillas(texto)
+
+
+class TestScenario(unittest.TestCase):
+    """La fase 10 por el CLI."""
+
+    def setUp(self) -> None:
+        carpeta = tempfile.TemporaryDirectory()
+        self.addCleanup(carpeta.cleanup)
+        self.carpeta = Path(carpeta.name)
+
+    def _corre(self, *extra: str) -> int:
+        return main.main(
+            ["scenario", "--runs", "2", "--out", str(self.carpeta), *extra]
+        )
+
+    def test_un_escenario_escribe_su_csv_y_la_tabla_resumen(self) -> None:
+        self.assertEqual(self._corre("--name", "A"), 0)
+        for politica in config.POLICIES:
+            self.assertTrue((self.carpeta / f"scenario_A_{politica}.csv").is_file())
+        self.assertTrue((self.carpeta / "summary_table.csv").is_file())
+
+    def test_una_sola_politica_escribe_solo_su_csv(self) -> None:
+        self.assertEqual(self._corre("--name", "A", "--policy", "baseline"), 0)
+        self.assertTrue((self.carpeta / "scenario_A_baseline.csv").is_file())
+        self.assertFalse((self.carpeta / "scenario_A_qlearning.csv").is_file())
+
+    def test_all_corre_los_cinco_con_las_dos_politicas(self) -> None:
+        self.assertEqual(self._corre("--all"), 0)
+        for letra in scenarios.LETTERS:
+            for politica in config.POLICIES:
+                ruta = self.carpeta / f"scenario_{letra}_{politica}.csv"
+                self.assertTrue(ruta.is_file(), f"falta {ruta}")
+        filas = scenarios.read_summary_table(self.carpeta / "summary_table.csv")
+        self.assertEqual(len(filas), len(scenarios.LETTERS) * len(config.POLICIES))
+        self.assertEqual([f["scenario"] for f in filas[::2]], list(scenarios.LETTERS))
+
+    def test_hace_falta_name_o_all(self) -> None:
+        """Parsea, pero no corre: avisa por el log y sale con 2, como el resto."""
+        args = main.build_parser().parse_args(["scenario"])
+        self.assertIsNone(args.name)
+        self.assertFalse(args.all)
+        with self.assertLogs(level="ERROR") as capturado:
+            self.assertEqual(main.main(["scenario"]), 2)
+        self.assertIn("--name", capturado.output[0])
+
+    def test_name_y_all_a_la_vez_no_pasan(self) -> None:
+        with self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()):
+                main.build_parser().parse_args(["scenario", "--name", "A", "--all"])
+
+    def test_un_escenario_que_no_existe_devuelve_dos(self) -> None:
+        with self.assertLogs(level="ERROR") as capturado:
+            self.assertEqual(self._corre("--name", "Z"), 2)
+        self.assertIn("no conozco el escenario", capturado.output[0])
+
+    def test_sin_q_table_avisa_y_devuelve_dos(self) -> None:
+        with self.assertLogs(level="ERROR") as capturado:
+            codigo = self._corre(
+                "--name", "A", "--model", str(self.carpeta / "no-existe.json")
+            )
+        self.assertEqual(codigo, 2)
+        self.assertIn("no existe el modelo", capturado.output[0])
+        # Y no ha escrito nada: se comprueban los modelos ANTES de correr.
+        self.assertEqual(list(self.carpeta.glob("*.csv")), [])
+
+    def test_sin_la_q_table_del_escenario_dice_como_entrenarla(self) -> None:
+        with mock.patch.object(config, "MODELS_DIR", self.carpeta):
+            with self.assertLogs(level="ERROR") as capturado:
+                codigo = self._corre("--name", "D", "--per-scenario-model")
+        self.assertEqual(codigo, 2)
+        self.assertIn("train --scenario D", "\n".join(capturado.output))
+
+    def test_no_summary_deja_la_tabla_sin_tocar(self) -> None:
+        self.assertEqual(self._corre("--name", "A", "--no-summary"), 0)
+        self.assertFalse((self.carpeta / "summary_table.csv").exists())
+
+    def test_solo_la_baseline_no_necesita_modelo(self) -> None:
+        codigo = self._corre(
+            "--name", "A", "--policy", "baseline",
+            "--model", str(self.carpeta / "no-existe.json"),
+        )
+        self.assertEqual(codigo, 0)
+
+    def test_dos_corridas_iguales_dan_los_mismos_csv(self) -> None:
+        """El criterio de la fase: misma semilla, mismo resultado."""
+        self.assertEqual(self._corre("--name", "D"), 0)
+        primera = (self.carpeta / "scenario_D_qlearning.csv").read_text(
+            encoding=config.ENCODING
+        )
+        self.assertEqual(self._corre("--name", "D"), 0)
+        segunda = (self.carpeta / "scenario_D_qlearning.csv").read_text(
+            encoding=config.ENCODING
+        )
+        self.assertEqual(primera, segunda)
+
+
+class TestTrainPorEscenario(unittest.TestCase):
+    """`train --scenario X` entrena en el escenario y no pisa la tabla general."""
+
+    def test_entrena_en_el_mapa_del_escenario_y_escribe_su_modelo(self) -> None:
+        with tempfile.TemporaryDirectory() as carpeta:
+            destino = Path(carpeta)
+            with mock.patch.object(config, "MODELS_DIR", destino):
+                codigo = main.main([
+                    "train", "--scenario", "E", "--episodes", "10",
+                    "--max-steps", "100", "--no-curve",
+                    "--log", str(destino / "log.csv"),
+                ])
+            self.assertEqual(codigo, 0)
+            modelo = destino / "q_table_E.json"
+            self.assertTrue(modelo.is_file())
+            metadata = qlearning.load_metadata(modelo)
+            # El escenario manda sobre --map: E corre en la rejilla.
+            self.assertEqual(metadata["map"], "grid")
+            self.assertEqual(metadata["hyperparameters"]["scenario"], "E")
+
+    def test_un_escenario_que_no_existe_devuelve_dos(self) -> None:
+        with self.assertLogs(level="ERROR") as capturado:
+            self.assertEqual(main.main(["train", "--scenario", "Z"]), 2)
+        self.assertIn("no conozco el escenario", capturado.output[0])
 
 
 if __name__ == "__main__":

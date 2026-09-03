@@ -378,6 +378,53 @@ WAREHOUSE_EDGES: tuple[tuple[str, str, float], ...] = (
 )
 
 
+# --- Mapa "grid": la rejilla 4x4 con caminos redundantes ---------------------
+#
+# Cuatro columnas (A-D, de oeste a este) por cuatro filas (1-4, de sur a norte),
+# todos los tramos del mismo costo:
+#
+#   A4--B4--C4--D4      y = 12
+#    |   |   |   |
+#   A3--B3--C3--D3      y = 8
+#    |   |   |   |
+#   A2--B2--C2--D2      y = 4
+#    |   |   |   |
+#   A1--B1--C1--D1      y = 0
+#   x=0  4   8   12
+#
+# Es el contrario exacto del `warehouse`: aqui **no hay ningun nodo de
+# articulacion**, y entre dos nodos cualesquiera hay varias rutas del MISMO
+# costo (todas las de Manhattan que no se desvian). Esa es la condicion para que
+# REROUTE pueda aportar algo: en el almacen, penalizar G no da una ruta
+# alternativa, da una ruta peor o ninguna; aqui da otra igual de buena.
+
+GRID_COLUMNS: tuple[str, ...] = ("A", "B", "C", "D")
+GRID_ROWS: tuple[int, ...] = (1, 2, 3, 4)
+GRID_SPACING: float = 4.0
+
+GRID_POSITIONS: Positions = {
+    f"{columna}{fila}": (GRID_SPACING * x, GRID_SPACING * y)
+    for x, columna in enumerate(GRID_COLUMNS)
+    for y, fila in enumerate(GRID_ROWS)
+}
+
+# Cada tramo una sola vez, como (a, b, costo): primero los horizontales de cada
+# fila y despues los verticales de cada columna. `_adyacencia_desde_tramos()` los
+# duplica en los dos sentidos.
+GRID_EDGES: tuple[tuple[str, str, float], ...] = tuple(
+    [
+        (f"{GRID_COLUMNS[i]}{fila}", f"{GRID_COLUMNS[i + 1]}{fila}", GRID_SPACING)
+        for fila in GRID_ROWS
+        for i in range(len(GRID_COLUMNS) - 1)
+    ]
+    + [
+        (f"{columna}{GRID_ROWS[j]}", f"{columna}{GRID_ROWS[j + 1]}", GRID_SPACING)
+        for columna in GRID_COLUMNS
+        for j in range(len(GRID_ROWS) - 1)
+    ]
+)
+
+
 def simple_graph() -> WarehouseGraph:
     """El grafo de 6 nodos de la guia."""
     return WarehouseGraph(SIMPLE_ADJACENCY, SIMPLE_POSITIONS, name="simple")
@@ -392,9 +439,19 @@ def warehouse_graph() -> WarehouseGraph:
     )
 
 
+def grid_graph() -> WarehouseGraph:
+    """La rejilla 4x4 de 16 nodos, sin cuellos de botella y con rutas redundantes."""
+    return WarehouseGraph(
+        _adyacencia_desde_tramos(GRID_EDGES, GRID_POSITIONS),
+        GRID_POSITIONS,
+        name="grid",
+    )
+
+
 BUILTIN_MAPS: dict[str, Callable[[], WarehouseGraph]] = {
     "simple": simple_graph,
     "warehouse": warehouse_graph,
+    "grid": grid_graph,
 }
 
 

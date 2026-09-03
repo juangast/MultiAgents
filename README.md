@@ -192,12 +192,13 @@ coordenadas ya convertidas para que quien monte la escena pueda generarla desde 
 ```bash
 python3 python/main.py map --name warehouse   # el almacén (es el de por defecto)
 python3 python/main.py map --name simple      # el grafo de 6 nodos de la guía
+python3 python/main.py map --name grid        # la rejilla 4×4 de la fase 10
 ```
 
 Imprime la cabecera, los nodos con sus coordenadas lógicas **y** las de Unity, las aristas con
 su costo, y el resultado de `validate()`. Sale con código 1 si el mapa no es válido.
 
-### Los dos mapas
+### Los tres mapas
 
 `simple` es el grafo de 6 nodos de la guía, para pruebas rápidas.
 
@@ -216,6 +217,25 @@ S1──S2──S3            S4──S5──S6      y = 0
 `G` es un **nodo de articulación**: es la única unión entre la zona izquierda y la derecha, así
 que toda ruta que cruce el almacén pasa por él a la fuerza y quitarlo parte el grafo en dos. De
 ahí salen los escenarios de congestión de las fases siguientes.
+
+`grid` (fase 10) es lo contrario exacto: una rejilla 4×4 de 16 nodos y 24 tramos, **todos del
+mismo coste**, sin un solo punto de articulación.
+
+```
+A4──B4──C4──D4      y = 12
+ │   │   │   │
+A3──B3──C3──D3      y = 8
+ │   │   │   │
+A2──B2──C2──D2      y = 4
+ │   │   │   │
+A1──B1──C1──D1      y = 0
+x=0  4   8   12
+```
+
+Entre dos nodos cualesquiera hay **varias rutas de coste mínimo**, así que penalizar uno le deja a
+A\* una alternativa igual de buena en vez de un rodeo. Es la condición para que el `REROUTE` del
+Q-Learning pueda aportar algo, y sin ese mapa no habría con qué comparar el cuello de botella del
+`warehouse`: es el par D/E de [la fase 10](#la-fase-10-cinco-escenarios-y-dónde-el-q-learning-sí-sirve).
 
 > El costo de una arista **no** tiene por qué ser la distancia entre sus nodos. En `simple`,
 > `A(0,0) → D(0,3)` mide 3 pero cuesta 4: un pasillo puede ser lento sin ser largo. Por eso
@@ -1111,6 +1131,183 @@ Quedan tres cosas para la fase 10, en orden:
    rutas cada 21 ticks: mismo estado, misma acción, para siempre. Un `recently_rerouted` pasa el
    espacio de 72 a 144 estados y rompe la simetría.
 
+## La fase 10: cinco escenarios, y dónde el Q-Learning sí sirve
+
+La fase 9 midió **un** experimento y concluyó que el Q-Learning no gana. Lo que no dijo es
+*dónde* falla, porque con un solo escenario no se puede saber. La fase 10 monta cinco escenarios
+reproducibles que barren el rango, de un almacén casi vacío a un cuello de botella, y los corre
+con las dos políticas bajo condiciones idénticas.
+
+```bash
+python3 python/main.py scenario --name C --policy qlearning --runs 20
+python3 python/main.py scenario --all --runs 20      # los cinco con las dos politicas
+```
+
+| | Escenario | Mapa | AGVs | Tareas | Qué prueba |
+|---|---|---|--:|--:|---|
+| **A** | Baja congestión | `warehouse` | 2 | 6 | Cada AGV en su mitad: nadie se cruza con nadie |
+| **B** | Congestión media | `warehouse` | 4 | 12 | Cuatro rutas que se cruzan en `S3`, dos de ellas de frente |
+| **C** | Alta congestión | `warehouse` | 6 | 18 | Seis AGVs en trece nodos: el almacén por encima de su capacidad |
+| **D** | Cuello de botella | `warehouse` | 4 | 16 | Toda tarea cruza `G`, que es el **único** paso entre las dos mitades |
+| **E** | Rutas alternativas | `grid` | 4 | 16 | El mismo cruce constante que D, pero con rutas de **igual coste** |
+
+### El par D/E es el experimento
+
+Los otros tres escenarios son el contexto; la pregunta del proyecto la contesta el par D/E, que
+está construido como una comparación controlada: **mismo número de AGVs, mismas tareas, misma
+presión** (1.74 conflictos por tick en D contra 1.70 en E), y los dos mandan a los AGVs a cruzar
+el mapa de lado a lado sin parar. Lo único que cambia es si existe una ruta alternativa.
+
+- En **D**, `G` es punto de articulación: penalizar `G` no le da a A\* otra ruta, le da una peor
+  o ninguna. El REROUTE del Q-Learning no tiene a dónde ir.
+- En **E**, el mapa `grid` es una rejilla 4×4 con todos los tramos del mismo coste, así que entre
+  dos nodos cualesquiera hay **varias rutas mínimas**. Penalizar un nodo devuelve una alternativa
+  igual de buena.
+
+Si "el Q-Learning rerutea mucho" es un defecto o una virtud depende de eso, y por eso hacía falta
+un mapa nuevo: `simple` es un anillo de 6 nodos donde con 4 AGVs no cabe un rodeo, y `warehouse`
+es justo el mapa sin alternativas.
+
+### Qué es reproducible, y qué no
+
+De un escenario **no se sortea nada estructural**: el mapa, cuántos AGVs hay, dónde arranca cada
+uno y de qué conjunto de nodos salen las tareas están escritos a mano en la `ScenarioSpec`. Lo
+único que depende de la semilla es **qué destinos concretos** tocan esta vez.
+
+```python
+spec.build(k)   # el mismo metrics.Scenario campo a campo, siempre
+spec.seeds(20)  # las semillas de 20 corridas: 100, 101, ... 119
+```
+
+Por eso `diff -r` de dos invocaciones idénticas no da ni una diferencia, y por eso las 20 corridas
+de un escenario no son la misma corrida 20 veces (si lo fueran, la desviación típica saldría 0 y
+el test de reproducibilidad pasaría sin medir nada; `TestElEscenarioNoEsConstante` lo comprueba).
+
+Del motor no cambia una línea. El escenario se sigue construyendo **una vez por semilla y fuera
+del bucle de políticas**, que es la invariante de la fase 9: `metrics.run_comparison()` ganó un
+parámetro `builder` y nada más.
+
+### Resultados: 5 escenarios × 2 políticas × 20 semillas
+
+Con la Q-table general del repo (`warehouse`, 4 AGVs, 1000 episodios, semilla 42). Es
+`results/summary_table.csv` tal cual:
+
+| Esc. | Escenario | AGVs | Política | Makespan | Completas | Tareas | Conf/tick | Espera/tick | Reroutes | Gana |
+|---|---|--:|---|--:|--:|--:|--:|--:|--:|:--:|
+| A | Baja congestión | 2 | baseline | 50.5 | 95 % | 96.7 % | 0.10 | 0.13 | 0.3 | — |
+| | | | Q-Learning | **122.8** | 85 % | 93.3 % | 0.09 | 0.13 | 37.6 | 3/20 |
+| B | Congestión media | 4 | baseline | 308.7 | 85 % | 98.8 % | 1.72 | 2.17 | 10.5 | — |
+| | | | Q-Learning | 294.5 | 75 % | 97.5 % | 1.14 | 1.22 | 172.7 | **15/20** |
+| C | Alta congestión | 6 | baseline | 1831.8 | 25 % | 93.9 % | 2.53 | 3.51 | 171.0 | — |
+| | | | Q-Learning | 1724.2 | 25 % | 94.7 % | 1.56 | 1.98 | 2450.6 | 4/20 |
+| D | Cuello de botella | 4 | baseline | 497.1 | 95 % | 99.7 % | 1.74 | 2.42 | 23.3 | — |
+| | | | Q-Learning | 505.5 | **70 %** | 97.2 % | 1.41 | 1.71 | 620.6 | 10/20 |
+| E | Rutas alternativas | 4 | baseline | 216.5 | 100 % | 100.0 % | 1.70 | 2.29 | 6.2 | — |
+| | | | Q-Learning | **103.0** | 100 % | 100.0 % | 0.71 | 0.83 | 57.1 | **20/20** |
+
+**Dónde mejora y dónde no, sin maquillar:**
+
+- **E (rutas alternativas): mejora, y mucho.** −52 % de makespan, −58 % de conflictos por tick,
+  −64 % de espera por tick, y gana **las 20 semillas**, sin perder ni una tarea. Es el único
+  escenario donde el Q-Learning gana limpio.
+- **B (congestión media): mixto, y la media engaña.** Gana 15 de 20 semillas y baja los
+  conflictos por tick un 34 %, pero completa menos corridas (75 % contra 85 %). Va mejor casi
+  siempre y se cuelga de vez en cuando.
+- **D (cuello de botella): no aporta.** Empata en makespan (+1.7 %) y **termina 25 puntos menos de
+  corridas** (70 % contra 95 %), a cambio de 620 reroutes contra 23. Es la confirmación directa de
+  la hipótesis: donde no hay ruta alternativa, recalcular sólo cuesta ticks.
+- **C (alta congestión): empate, y el makespan no dice nada** (ver abajo). Despacha un 0.8 % más
+  de tareas, con 2450 reroutes de media contra 171.
+- **A (baja congestión): no aporta, y encima estorba.** Con dos AGVs que no se cruzan, el baseline
+  tarda 50 ticks y el Q-Learning **123**: dos veces y media más, por 37 reroutes que no evitan
+  ningún conflicto (los conflictos por tick son los mismos, 0.09 contra 0.10). No es que aprenda
+  mal a ceder el paso; es que rerutea aunque no haya nadie delante.
+
+El patrón es limpio y es el que se buscaba: **el Q-Learning gana exactamente donde el REROUTE
+tiene a dónde ir (E), empata donde hay congestión pero también sitio (B, C), y pierde donde
+recalcular no puede ayudar (D) o no hace falta (A).**
+
+### Lo que C destapó: 6 AGVs no caben en 13 nodos
+
+C tiene tope de 2000 ticks y no de 800 como los demás, y hay una razón medida. Con 6 AGVs el
+almacén **se satura**: con tope 800 el baseline no completa ni una de 20 corridas y despacha el
+25.6 % de las tareas.
+
+Pero además, con cualquier tope, **15 de las 20 corridas se quedan a 1, 2 o 3 tareas del final y
+ya no avanzan nunca**. Subir el tope de 2000 a 5000 no cambia ni una: siguen siendo 5 completas y
+el mismo 93.9 %. La causa es el AGV que se queda sin trabajo: **aparca**, y con 6 AGVs sobre 13
+nodos es casi seguro que uno acabe aparcado justo encima del último destino que queda por servir
+—el mismo riesgo que ya documentaba `Simulation._planea_rutas`—.
+
+Así que en C el makespan de esas 15 corridas es el tope que uno elija, no una medida de nada. Por
+eso `scenarios.scenario_verdict()` decide por **`task_rate`** cuando la completitud baja de
+`SATURATED_BELOW`, y por eso hay que leer C por trabajo despachado y no por ticks. Es un límite
+del montaje, no del motor ni de las políticas: las dos lo sufren igual y el escenario sigue
+siendo pareado. Sacarlo por escrito es preferible a publicar un makespan que sólo mide el tope.
+
+### ¿Una Q-table por escenario, o una general?
+
+Se probaron las dos. `train --scenario X` entrena en el mapa, los AGVs y las posiciones de salida
+de ese escenario (`TrainingEnv` ganó un `routes_factory` opcional; sin él la fase 7 no cambia ni
+un número), y escribe en `python/models/q_table_<letra>.json`.
+
+```bash
+for L in A B C D E; do python3 python/main.py train --scenario $L --episodes 1000; done
+python3 python/main.py scenario --all --runs 20 --per-scenario-model --out results/per_scenario
+```
+
+| Esc. | makespan base | Q general | Q por esc. | completas base | Q gen | Q esc | reroutes base | Q gen | Q esc |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| A | 50.5 | 122.8 | 123.8 | 95 % | 85 % | 85 % | 0.3 | 37.6 | 35.4 |
+| B | 308.7 | **294.5** | 311.6 | 85 % | 75 % | **85 %** | 10.5 | 172.7 | 215.7 |
+| C | 1831.8 | 1724.2 | **1410.5** | 25 % | 25 % | **55 %** | 171.0 | 2450.6 | **1509.0** |
+| D | 497.1 | 505.5 | **480.3** | 95 % | 70 % | **75 %** | 23.3 | 620.6 | **567.0** |
+| E | 216.5 | **103.0** | 138.1 | 100 % | 100 % | 100 % | 6.2 | **57.1** | 108.8 |
+| **media** | **580.9** | **550.0** | **492.9** | **80 %** | **71 %** | **80 %** | **42.2** | **667.7** | **487.2** |
+
+**Gana la tabla por escenario, pero no en todos.** De media baja el makespan un 10 % respecto a la
+general (492.9 contra 550.0) y, sobre todo, **recupera la completitud del baseline**: 80 % contra
+el 71 % de la general. Donde más se nota es en los dos escenarios cargados —C pasa de 25 % a 55 %
+de corridas completas, D de 70 % a 75 %—, que es justo lo que predecía el README de la fase 9:
+entrenar en el régimen en que se evalúa. Donde pierde es en B y en E, y en los dos por el mismo
+motivo: rerutea más (215 contra 172, 108 contra 57).
+
+Recomendación: **una por escenario**, porque nunca hunde la completitud como la general y arregla
+el escenario peor. Si sólo se puede mantener una, la general sigue siendo la mejor para E.
+
+### Y entrenar más lo empeora
+
+Es el dato que cierra el diagnóstico. Reentrenando B y E con 3000 episodios en vez de 1000
+(`python3 python/main.py train --scenario B --episodes 3000 --model /tmp/q_B_3000.json`):
+
+| | makespan B | reroutes B | completas B | makespan E | reroutes E |
+|---|--:|--:|--:|--:|--:|
+| baseline | 308.7 | 10.5 | 85 % | 216.5 | 6.2 |
+| Q por escenario, 1000 ep. | **311.6** | **215.7** | **85 %** | **138.1** | **108.8** |
+| Q por escenario, 3000 ep. | 406.8 | 451.4 | 65 % | 155.2 | 165.2 |
+
+Tres veces más entrenamiento da **el doble de reroutes y peor makespan en los dos escenarios**. El
+problema no es que la tabla esté poco entrenada: es que la recompensa está mal puesta, exactamente
+como dejó escrito la fase 9. Rerutear cuesta −3 **una sola vez** y sólo el 45 % de las veces,
+mientras que esperar cuesta −1 **por tick**; la recompensa no cobra nunca la distancia extra del
+rodeo. Cuanto mejor optimiza el algoritmo esa recompensa, más rerutea, y rerutear es lo que hace
+daño. Que en E ayude y en D estorbe no cambia el diagnóstico: lo confirma.
+
+De las tres cosas que la fase 9 dejó apuntadas, la fase 10 hizo la **segunda** (entrenar en el
+régimen en que se evalúa) y midió que ayuda pero no basta. La primera (cobrar el reroute
+proporcional a `cost(nueva) − cost(vieja)`) es ahora la que tiene los datos más claros a favor.
+
+### Los ficheros que salen
+
+| Fichero | Qué lleva |
+|---|---|
+| `results/scenario_<letra>_<policy>.csv` | Una fila por semilla, las mismas 28 columnas que la fase 9 |
+| `results/summary_table.csv` | Una fila por (escenario, política) y 33 columnas: identificación, tasas, la **media** de cada métrica y las semillas ganadas contra el baseline |
+
+`summary_table.csv` es el que se pega en el reporte: plano, con coma y punto decimal, y se abre en
+Excel tal cual.
+
+
 ## Estructura
 
 ```
@@ -1127,19 +1324,22 @@ agentesAGV/
 │   ├── simulation.py   el almacén en marcha: ticks, modos, desatasco y snapshot
 │   ├── qlearning.py    Q-Learning: el entorno (fase 6) y el entrenamiento (fase 7)
 │   ├── metrics.py      las métricas de una corrida y la comparación entre políticas (fase 9)
+│   ├── scenarios.py    los cinco escenarios, su runner y la tabla resumen (fase 10)
 │   ├── main.py         CLI con argparse
-│   ├── maps/           los mapas en JSON (simple.json, warehouse.json)
-│   └── models/         los modelos entrenados (q_table.json)
+│   ├── maps/           los mapas en JSON (simple.json, warehouse.json, grid.json)
+│   └── models/         los modelos entrenados (q_table.json y q_table_A..E.json)
 ├── results/            salidas: training_log.csv, learning_curve.png, baseline.csv,
-│                       qlearning.csv, comparison.json, comparison.png
+│                       qlearning.csv, comparison.json, comparison.png,
+│                       scenario_<letra>_<policy>.csv, summary_table.csv
 ├── tests/              tests con unittest, y el cliente falso de Unity
 ├── requirements.txt
 └── README.md
 ```
 
 `results/` **no se versiona** (está en `.gitignore`, salvo el `.gitkeep`): son salidas de corridas
-y se regeneran con `train`. `python/models/q_table.json` **sí**, que es el modelo entrenado y lo
-que `evaluate` necesita.
+y se regeneran con `train` y `scenario`. Los modelos de `python/models/` **sí**: la `q_table.json`
+general y las cinco `q_table_A..E.json` por escenario, que es lo que `evaluate` y
+`scenario --per-scenario-model` necesitan.
 
 El servidor recibe la simulación por **inyección de dependencia**: `serve_forever()` acepta
 cualquier objeto con `get_snapshot()` y `reset()` (el `Protocol` está declarado en
@@ -1184,6 +1384,7 @@ python3 python/main.py --help
 | `train` | Entrena la Q-table, sin servidor y sin Unity |
 | `evaluate` | Carga una Q-table y la juega greedy, contra la baseline |
 | `benchmark` | Enfrenta las políticas semilla a semilla y escribe `results/` |
+| `scenario` | Corre los cinco escenarios de la fase 10 y escribe la tabla resumen |
 
 ```bash
 python3 python/main.py serve                          # 127.0.0.1:5000
@@ -1295,6 +1496,7 @@ python3 python/main.py evaluate --map warehouse --agents 4 --model python/models
 | `--alpha` `--gamma` | `config.py` | La tasa de aprendizaje y el descuento | `train` |
 | `--epsilon-start` `--epsilon-end` `--epsilon-decay` | `config.py` | La exploración | `train` |
 | `--no-reroute` | apagado | Deja fuera `REROUTE`: solo `ADVANCE` y `WAIT` | `train` |
+| `--scenario` | — | Entrena **en** un escenario de la fase 10 (A–E): su mapa, sus AGVs y sus salidas | `train` |
 | `--log` | `results/training_log.csv` | El CSV por episodio (en `evaluate` es opcional) | ambos |
 | `--curve` / `--no-curve` | `results/learning_curve.png` | El PNG de la curva | `train` |
 
@@ -1357,6 +1559,53 @@ matplotlib es **opcional**: sin él se avisa por el log y se sigue, porque los n
 los CSV. Con él sale `results/comparison.png` con barras de makespan, conflictos y espera, y
 barras de error de una desviación típica.
 
+### `scenario`
+
+Los cinco escenarios de la fase 10, con las dos políticas y bajo condiciones idénticas.
+
+```bash
+python3 python/main.py scenario --name C --policy qlearning --runs 20
+python3 python/main.py scenario --all --runs 20              # los cinco con las dos politicas
+
+python3 python/main.py scenario --name E --runs 50           # mas semillas, media mas estable
+python3 python/main.py scenario --all --per-scenario-model \
+        --out results/per_scenario                           # con la Q-table de cada escenario
+```
+
+| Opción | Por defecto | Para qué |
+|---|---|---|
+| `--name` | — | Escenario a correr: `A`–`E` (da igual la mayúscula) |
+| `--all` | — | Los cinco seguidos. Excluyente con `--name`; hace falta uno de los dos |
+| `--policy` | **las dos** | `baseline` o `qlearning`; omitido corre las dos y las compara |
+| `--runs` | `config.SCENARIO_RUNS` (20) | Semillas por escenario: `seed`, `seed+1`, … |
+| `--seeds` | — | Semillas concretas: `1-20`, `1,2,3` o `1-5,10`; manda sobre `--runs` |
+| `--model` | `config.Q_TABLE_FILE` | La Q-table general |
+| `--per-scenario-model` | apagado | Usa `python/models/q_table_<letra>.json` en vez de la general |
+| `--max-steps` | el de cada escenario | Tope de ticks por corrida |
+| `--out` | `results/` | Dónde escribir los CSV |
+| `--no-summary` | apagado | No escribe `summary_table.csv` |
+
+Sale con `0` aunque el Q-Learning pierda en los cinco (un resultado malo es un resultado) y con
+`2` si el escenario, el mapa o la Q-table no existen. Los modelos se comprueban **todos antes de
+correr nada**: con `--all`, reventar en el escenario D después de haber corrido A, B y C dejaría
+`results/` a medias y la tabla resumen incompleta.
+
+Por cada escenario imprime su ficha (mapa, AGVs, salidas, cola, qué prueba), la tabla comparativa
+de la fase 9 y, al final, un veredicto por escenario:
+
+```
+A (Baja congestion): NO APORTA. makespan 122.8 contra 50.5 (+143.3%), gana 3 de 20 semillas, ...
+E (Rutas alternativas): MEJORA. makespan 103.0 contra 216.5 (-52.4%), gana 20 de 20 semillas, ...
+```
+
+**Es repetible byte a byte.** Misma semilla, mismo resultado:
+
+```bash
+python3 python/main.py scenario --name D --runs 5 --out /tmp/a
+python3 python/main.py scenario --name D --runs 5 --out /tmp/b
+diff -r /tmp/a /tmp/b     # sin diferencias
+```
+
 ### Logs
 
 Todo sale por `stderr` con el módulo `logging`, nunca con `print`. Con `--verbose` (o `-v`)
@@ -1377,6 +1626,7 @@ python3 -m unittest tests.test_conflicts -v      # solo la fase 5
 python3 -m unittest tests.test_qlearning -v      # solo la fase 6
 python3 -m unittest tests.test_training -v       # solo la fase 7
 python3 -m unittest tests.test_phase8 -v         # solo la fase 8
+python3 -m unittest tests.test_scenarios -v      # solo la fase 10
 ```
 
 | Fichero | Qué cubre |
@@ -1388,6 +1638,7 @@ python3 -m unittest tests.test_phase8 -v         # solo la fase 8
 | `test_graph.py` | El mapa lógico: grafo, `validate()` y ficheros |
 | `test_main.py` | El CLI |
 | `test_metrics.py` | La fase 9: escenarios pareados, métricas, CSV/JSON y el reporte |
+| `test_scenarios.py` | La fase 10: los cinco escenarios, su reproducibilidad y la tabla resumen |
 | `test_astar.py` | La fase 3: A\*, penalizaciones, `Agent`, `Simulation` y el snapshot |
 | `test_conflicts.py` | La fase 5: conflictos, política base, invariante y deadlock |
 | `test_qlearning.py` | La fase 6: estado, acciones, recompensa, Q-table y la política |
