@@ -286,6 +286,21 @@ class MissionManager:
             m for m in self.missions.values() if m.status is MissionStatus.PENDING
         ]
 
+    def busy_nodes(self) -> set[str]:
+        """Los nodos de recogida que ya tienen un AGV yendo a por su caja.
+
+        Una estanteria es un callejon sin salida con sitio para un solo AGV, y
+        suele guardar dos cajas, una por nivel. Sin esto sus dos misiones se
+        reparten a la vez, los dos AGVs van al mismo hueco y el que llega
+        segundo se queda clavado en el cruce del pasillo, tapando a todos los
+        demas. Se libera al recoger: a partir de ahi el primero ya se va.
+        """
+        return {
+            m.node
+            for m in self.missions.values()
+            if m.status is MissionStatus.ACCEPTED
+        }
+
     def publish(self, t: int) -> list[Mission]:
         """Saca al bus todo lo que queda pendiente."""
         pendientes = self.pool()
@@ -359,14 +374,19 @@ def resolve_auctions(
     """Resuelve todas las subastas del paso. Devuelve (agv, mision, utilidad).
 
     Un AGV solo puede ganar una mision por paso: en cuanto se lleva una sale de
-    `libres` y sus pujas por las demas ya no cuentan.
+    `libres` y sus pujas por las demas ya no cuentan. Y al reves, un nodo de
+    recogida solo admite un AGV a la vez: en cuanto alguien acepta la mision de
+    una estanteria, esa estanteria sale de la subasta hasta que se recoja.
     """
     por_id = {agv.id: agv for agv in agents}
     libres = {agv.id for agv in agents if agv.available()}
+    ocupados = manager.busy_nodes()
     del_paso = bus.read(MessageType.BID, t)
     ganadas: list[tuple[Any, Mission, float]] = []
 
     for mision in manager.pool():
+        if mision.node in ocupados:
+            continue
         pujas = [
             (m.contenido["agv"], m.contenido["utilidad"])
             for m in del_paso
@@ -382,6 +402,7 @@ def resolve_auctions(
         }))
         manager.accepted(t, mision, agv_id)
         libres.discard(agv_id)
+        ocupados.add(mision.node)
         ganadas.append((por_id[agv_id], mision, utilidad))
 
     return ganadas
@@ -413,20 +434,23 @@ def estimated_cost(
 ) -> float:
     """Bateria que cuesta la mision entera: ida a la caja, transporte y salida al cargador.
 
-    Las tres distancias van en linea recta, que es lo que sale barato de calcular
-    al pujar; `BATTERY_DETOUR` corrige que la ruta de verdad rodea.
+    Los tres tramos se miden en ticks de viaje por la ruta de verdad, que es lo
+    que gasta la bateria. Con la linea recta, o contando el costo en vez de los
+    ticks, el calculo se queda corto y el AGV acepta viajes que no puede
+    terminar: se planta a cero en mitad de un pasillo y, como los pasillos son
+    de un solo carril, deja el almacen tapado para todos los demas.
     """
-    ida = _recta(graph, node, mission.node)
-    carga = _recta(graph, mission.node, mission.destination)
+    ida = _ticks(graph, node, mission.node)
+    carga = _ticks(graph, mission.node, mission.destination)
     al_cargador = min(
-        (_recta(graph, mission.destination, c) for c in chargers), default=0.0
+        (_ticks(graph, mission.destination, c) for c in chargers), default=0.0
     )
-    return config.BATTERY_DRAIN * config.BATTERY_DETOUR * (ida + carga + al_cargador)
+    return config.BATTERY_DRAIN * (ida + carga + al_cargador)
 
 
-def battery_cost(distance: float) -> float:
-    """Lo que cuesta en bateria recorrer esa distancia en linea recta."""
-    return config.BATTERY_DRAIN * config.BATTERY_DETOUR * distance
+def battery_cost(ticks: float) -> float:
+    """Lo que cuesta en bateria un viaje de esos ticks."""
+    return config.BATTERY_DRAIN * ticks
 
 
 def reaches(
@@ -445,7 +469,11 @@ def reaches(
     return battery - gasto >= config.BATTERY_RESERVE
 
 
-def _recta(graph: WarehouseGraph, a: str, b: str) -> float:
-    """Distancia en linea recta entre dos nodos. 0.0 si falta una posicion."""
-    p, q = graph.positions.get(a), graph.positions.get(b)
-    return 0.0 if p is None or q is None else math.dist(p, q)
+def _ticks(graph: WarehouseGraph, a: str, b: str) -> float:
+    """Ticks de viaje de `a` a `b`. Infinito si no hay ruta.
+
+    Una mision sin ruta no se puede terminar, y con infinito ningun AGV la ve
+    viable en vez de aceptarla y quedarse tirado a medio camino.
+    """
+    ticks = graph.route_ticks(a, b)
+    return math.inf if ticks is None else float(ticks)

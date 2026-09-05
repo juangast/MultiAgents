@@ -492,50 +492,132 @@ class Simulation:
             caja.status = missions.BoxStatus.STORED
 
     def _fase_bateria(self) -> None:
-        """Los enchufados cargan; el que se quedo a cero se queda tirado."""
+        """Los enchufados cargan, y nadie empieza un tramo del que no pueda volver.
+
+        El orden importa: primero el que ya esta enchufado o tirado, luego el que
+        va de camino a un cargador, y solo al final se mira si alguien mas tiene
+        que dejar lo que hace e ir a enchufarse.
+        """
+        cargadores = self.graph.nodes_with_role(ROLE_CHARGING)
         for agente in self.agents:
             if agente.state == State.CHARGING:
-                if agente.charge():
-                    agente.charges += 1
-                    agente.state = State.IDLE
-                    log.debug("paso %3d | AGV %s | cargado al 100%%, vuelve a pujar",
-                              self.step, agente.id)
-            elif (
-                agente.mission is not None
-                and agente.leg is not Leg.TO_CHARGER
-                and not agente.can_reach_charger(
-                    self.graph.nodes_with_role(ROLE_CHARGING)
-                )
-            ):
-                log.warning(
-                    "AGV %s abandona %s al %.0f%%: no llegaria a un cargador",
-                    agente.id, agente.mission, agente.battery,
-                )
-                self._suelta_mision(agente)
-                self._al_cargador(agente)
-
+                self._carga(agente)
             elif agente.is_dead():
-                if agente.mission is not None:
-                    log.warning("AGV %s se quedo sin bateria en %s con %s a medias",
-                                agente.id, agente.current_node, agente.mission)
-                    self._suelta_mision(agente)
-                agente.state = State.IDLE
+                self._da_por_tirado(agente)
+            elif agente.leg is Leg.TO_CHARGER:
+                self._revisa_el_viaje_al_cargador(agente, cargadores)
+            elif (
+                not agente.can_reach_charger(cargadores)
+                or agente.would_strand(cargadores)
+            ):
+                self._manda_a_cargar(agente, cargadores)
 
-    def _al_cargador(self, agente: Agent) -> bool:
-        """Le traza ruta al cargador mas cercano. False si no hay ninguno."""
-        cargadores = self.graph.nodes_with_role(ROLE_CHARGING)
+    def _carga(self, agente: Agent) -> None:
+        """Un tick enchufado. En cuanto se llena vuelve a la subasta."""
+        if not agente.charge():
+            return
+        agente.charges += 1
+        agente.state = State.IDLE
+        log.debug("paso %3d | AGV %s | cargado al 100%%, vuelve a pujar",
+                  self.step, agente.id)
+
+    def _da_por_tirado(self, agente: Agent) -> None:
+        """El que llego a cero suelta lo que llevaba y se queda donde esta."""
+        if agente.mission is not None:
+            log.warning("AGV %s se quedo sin bateria en %s con %s a medias",
+                        agente.id, agente.current_node, agente.mission)
+            self._suelta_mision(agente)
+        agente.state = State.IDLE
+
+    def _manda_a_cargar(self, agente: Agent, cargadores: Sequence[str]) -> None:
+        """Le corta lo que estuviera haciendo y lo manda a enchufarse."""
+        if agente.mission is not None:
+            log.warning(
+                "AGV %s abandona %s al %.0f%%: se quedaria sin vuelta a un cargador",
+                agente.id, agente.mission, agente.battery,
+            )
+            self._suelta_mision(agente)
+        self._al_cargador(agente, cargadores)
+
+    def _revisa_el_viaje_al_cargador(
+        self, agente: Agent, cargadores: Sequence[str]
+    ) -> None:
+        """Al que ya va a cargar le busca otro cargador si el suyo se le escapo.
+
+        Cada reroute alarga la ruta de verdad, asi que el cargador que si
+        alcanzaba deja de alcanzarse. Sin esta revision el AGV sigue conduciendo
+        hacia el mismo hasta quedarse seco en mitad del pasillo.
+        """
+        destino = agente.target_node
+        if destino is None or agente.progress > 0.0:
+            return
+
+        queda = self.graph.route_ticks(agente.current_node, destino)
+        alcanza = (
+            queda is not None
+            and agente.battery - missions.battery_cost(queda) >= 0.0
+        )
+        if alcanza and not agente.would_strand(cargadores):
+            return
+
+        log.debug(
+            "paso %3d | AGV %s | al %.0f%% ya no le da para %s, busca otro cargador",
+            self.step, agente.id, agente.battery, destino,
+        )
+        self._al_cargador(agente, cargadores)
+
+    def _cargadores_tomados(self, agente: Agent) -> set[str]:
+        """Los cargadores que ya tiene otro AGV, enchufado o de camino.
+
+        Un cargador es un fondo de saco de un solo hueco, igual que una
+        estanteria: si dos AGVs van al mismo, el segundo se planta en el pasillo
+        a esperar, y ahi lo hace con la bateria en las ultimas.
+        """
+        tomados: set[str] = set()
+        for otro in self.agents:
+            if otro.id == agente.id:
+                continue
+            if otro.state == State.CHARGING:
+                tomados.add(otro.current_node)
+            elif otro.leg is Leg.TO_CHARGER and otro.target_node is not None:
+                tomados.add(otro.target_node)
+        return tomados
+
+    def _al_cargador(
+        self, agente: Agent, cargadores: Sequence[str] | None = None
+    ) -> bool:
+        """Le traza ruta a un cargador: libre si puede ser, y que le alcance seguro.
+
+        Cerca es por ruta, no en linea recta: el cargador que parece al lado
+        puede colgar de otro pasillo y estar a media nave por carretera. Y la
+        exclusividad es una preferencia, no una regla: antes que dejar a un AGV
+        sin plan se le manda a uno ocupado, porque hacer cola con bateria se
+        arregla solo y quedarse seco en un pasillo no.
+
+        La ruta va sin penalizaciones a proposito. Esquivar atascos alarga el
+        camino, y este es justo el viaje que no puede permitirse ni un metro de
+        mas: aqui manda la bateria y no el trafico.
+        """
+        if cargadores is None:
+            cargadores = self.graph.nodes_with_role(ROLE_CHARGING)
         if not cargadores:
             return False
 
-        candidatos = sorted(
+        alcanzables = sorted(
             (d, nodo)
             for nodo in cargadores
-            if (d := agente.distance_to(nodo)) is not None
+            if (d := self.graph.route_ticks(agente.current_node, nodo)) is not None
         )
-        for _, nodo in candidatos:
-            if agente.assign_task(
-                agente.current_node, nodo, task=agente.task, penalties=self.penalties
-            ):
+        asequibles = [
+            par
+            for par in alcanzables
+            if agente.battery - missions.battery_cost(par[0]) >= 0.0
+        ]
+        tomados = self._cargadores_tomados(agente)
+        libres = [par for par in asequibles if par[1] not in tomados]
+
+        for _, nodo in libres or asequibles or alcanzables:
+            if agente.assign_task(agente.current_node, nodo, task=agente.task):
                 agente.leg = Leg.TO_CHARGER
                 if len(agente.path) == 1:
                     agente.leg = Leg.NONE
@@ -715,6 +797,7 @@ class Simulation:
     def _fase_a_intenciones(self) -> dict[int, str]:
         """FASE A: cada agente parado dice a que nodo quiere entrar este tick."""
         intenciones: dict[int, str] = {}
+        cargadores = self.graph.nodes_with_role(ROLE_CHARGING)
         for agente in self.agents:
             if agente.state not in (State.MOVING, State.WAITING):
                 continue
@@ -723,6 +806,10 @@ class Simulation:
 
             siguiente = agente.next_node()
             if siguiente is None:
+                continue
+
+            if agente.would_strand(cargadores):
+                self._espera_por_bateria(agente, siguiente)
                 continue
 
             if not self.graph.has_edge(agente.current_node, siguiente):
@@ -738,6 +825,20 @@ class Simulation:
 
             intenciones[agente.id] = siguiente
         return intenciones
+
+    def _espera_por_bateria(self, agente: Agent, siguiente: str) -> None:
+        """Lo deja parado antes que dejarlo sin vuelta a un cargador.
+
+        Esperar no gasta bateria y conducir si, asi que ante la duda se para. El
+        pasillo se despeja solo y entonces la ruta corta al cargador vuelve a
+        salir; un AGV parado con bateria se recupera, uno seco no.
+        """
+        agente.state = State.WAITING
+        log.debug(
+            "paso %3d | AGV %s | al %.0f%% se queda en %s: pasar a %s lo dejaria "
+            "sin vuelta a un cargador",
+            self.step, agente.id, agente.battery, agente.current_node, siguiente,
+        )
 
     def _fase_b_resuelve_y_aplica(self, intenciones: dict[int, str]) -> None:
         """FASE B: detectar -> decidir -> desatascar -> aplicar. En ese orden."""

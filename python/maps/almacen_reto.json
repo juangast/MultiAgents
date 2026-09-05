@@ -1,0 +1,1723 @@
+{
+  "name": "almacen_reto",
+  "directed": false,
+  "coordinate_system": {
+    "units": "meters",
+    "origin": "Prefab_reto",
+    "node_id": "M=muelle camion, B=banda transportadora, C=cargador, E=estanteria, P=pasillo",
+    "layout": "irregular, medido de la escena. No hay 'spacing' ni 'cell': la regla 8 del contrato prohibe declararlos si las posiciones no caen en rejilla, y aqui no caen.",
+    "levels": [
+      1,
+      2
+    ],
+    "level_height": 0.69,
+    "level_base": 0.154,
+    "level_to_height": "y_balda = 0.154 + (level - 1) * 0.69",
+    "caja_offset_y": 0.218,
+    "caja_to_height": "y_caja = y_balda + 0.218",
+    "unity": "x -> x, y -> z, altura -> y, escala en config.UNITY_SCALE",
+    "unity_scale": 1.0,
+    "unity_root": "Prefab_reto",
+    "unity_root_world_position": [
+      45.21769,
+      0.0,
+      -4.63
+    ],
+    "unity_root_rotation": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "unity_root_scale": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "unity_from_logical": "world = unity_root_world_position + (px, altura, py)",
+    "floor_bounds": {
+      "px": [
+        -8.514,
+        7.644
+      ],
+      "py": [
+        -6.434,
+        7.566
+      ]
+    }
+  },
+  "roles": {
+    "storage": "estanteria: aqui hay cajas que recoger o dejar",
+    "transit": "pasillo: solo se pasa por el",
+    "dock": "muelle de camion: entra y sale mercancia del almacen",
+    "conveyor": "banda transportadora: entrega y recogida automatica (rol anadido, no esta en el contrato original)",
+    "charging": "estacion de carga: el AGV se enchufa aqui"
+  },
+  "nodes": {
+    "B1": {
+      "role": "conveyor",
+      "unity_object": [
+        "Bandas"
+      ],
+      "capacity": 1,
+      "unity_local": [
+        2.98,
+        0.11,
+        -7.06
+      ]
+    },
+    "B2": {
+      "role": "conveyor",
+      "unity_object": [
+        "Bandas (1)"
+      ],
+      "capacity": 1,
+      "unity_local": [
+        4.58,
+        0.11,
+        -7.06
+      ]
+    },
+    "B3": {
+      "role": "conveyor",
+      "unity_object": [
+        "Bandas (2)"
+      ],
+      "capacity": 1,
+      "unity_local": [
+        6.28,
+        0.11,
+        -7.06
+      ]
+    },
+    "C1": {
+      "role": "charging",
+      "unity_object": [
+        "cargador"
+      ],
+      "capacity": 1,
+      "unity_local": [
+        6.5,
+        0.1,
+        -2.0
+      ]
+    },
+    "C2": {
+      "role": "charging",
+      "unity_object": [
+        "cargador (1)"
+      ],
+      "capacity": 1,
+      "unity_local": [
+        6.5,
+        0.1,
+        -3.5
+      ]
+    },
+    "C3": {
+      "role": "charging",
+      "unity_object": [
+        "cargador (2)"
+      ],
+      "capacity": 1,
+      "unity_local": [
+        6.5,
+        0.1,
+        -5.0
+      ]
+    },
+    "E01": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet",
+        "Pallet (2)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        -4.236,
+        0.154,
+        -5.514
+      ]
+    },
+    "E02": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (1)",
+        "Pallet (3)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        -3.675,
+        0.154,
+        -5.514
+      ]
+    },
+    "E03": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (4)",
+        "Pallet (5)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        -2.253,
+        0.154,
+        -5.514
+      ]
+    },
+    "E04": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (12)",
+        "Pallet (6)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        -0.25,
+        0.154,
+        -1.155
+      ]
+    },
+    "E05": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (11)"
+      ],
+      "levels": [
+        1
+      ],
+      "capacity": 1,
+      "unity_local": [
+        0.225,
+        0.154,
+        -1.155
+      ]
+    },
+    "E06": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (10)",
+        "Pallet (8)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        1.171,
+        0.154,
+        -1.155
+      ]
+    },
+    "E07": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (9)"
+      ],
+      "levels": [
+        1
+      ],
+      "capacity": 1,
+      "unity_local": [
+        1.614,
+        0.154,
+        -1.155
+      ]
+    },
+    "E08": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (13)",
+        "Pallet (7)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        2.857,
+        0.154,
+        -1.155
+      ]
+    },
+    "E09": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (27)"
+      ],
+      "levels": [
+        1
+      ],
+      "capacity": 1,
+      "unity_local": [
+        -4.766,
+        0.154,
+        -0.666
+      ]
+    },
+    "E10": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (28)"
+      ],
+      "levels": [
+        1
+      ],
+      "capacity": 1,
+      "unity_local": [
+        -4.766,
+        0.154,
+        -0.159
+      ]
+    },
+    "E11": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (31)"
+      ],
+      "levels": [
+        2
+      ],
+      "capacity": 1,
+      "unity_local": [
+        -4.766,
+        0.154,
+        0.616
+      ]
+    },
+    "E12": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (26)",
+        "Pallet (29)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        -4.766,
+        0.154,
+        1.948
+      ]
+    },
+    "E13": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (19)"
+      ],
+      "levels": [
+        1
+      ],
+      "capacity": 1,
+      "unity_local": [
+        -0.318,
+        0.154,
+        2.475
+      ]
+    },
+    "E14": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (18)",
+        "Pallet (24)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        0.217,
+        0.154,
+        2.475
+      ]
+    },
+    "E15": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (17)",
+        "Pallet (23)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        1.052,
+        0.154,
+        2.475
+      ]
+    },
+    "E16": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (16)",
+        "Pallet (22)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        1.577,
+        0.154,
+        2.475
+      ]
+    },
+    "E17": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (15)",
+        "Pallet (21)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        2.375,
+        0.154,
+        2.475
+      ]
+    },
+    "E18": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (14)",
+        "Pallet (20)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        2.894,
+        0.154,
+        2.475
+      ]
+    },
+    "E19": {
+      "role": "storage",
+      "unity_object": [
+        "Pallet (25)",
+        "Pallet (30)"
+      ],
+      "levels": [
+        1,
+        2
+      ],
+      "capacity": 2,
+      "unity_local": [
+        -4.766,
+        0.154,
+        2.505
+      ]
+    },
+    "E20": {
+      "role": "storage",
+      "unity_object": [],
+      "levels": [
+        1
+      ],
+      "capacity": 1,
+      "unity_local": [
+        -2.77,
+        0.154,
+        -5.514
+      ]
+    },
+    "E22": {
+      "role": "storage",
+      "unity_object": [],
+      "levels": [
+        2
+      ],
+      "capacity": 1,
+      "unity_local": [
+        -4.739,
+        0.154,
+        1.136
+      ]
+    },
+    "M1": {
+      "role": "dock",
+      "unity_object": [
+        "Cube (3)"
+      ],
+      "capacity": 1,
+      "unity_local": [
+        -9.711,
+        -0.282,
+        -4.569
+      ]
+    },
+    "M2": {
+      "role": "dock",
+      "unity_object": [
+        "Cube (4)"
+      ],
+      "capacity": 1,
+      "unity_local": [
+        -9.711,
+        -0.282,
+        -1.04
+      ]
+    },
+    "M3": {
+      "role": "dock",
+      "unity_object": [
+        "Cube (5)"
+      ],
+      "capacity": 1,
+      "unity_local": [
+        -9.711,
+        -0.282,
+        2.3
+      ]
+    },
+    "P01": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -7.964,
+        0.0,
+        -5.884
+      ]
+    },
+    "P02": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -5.764,
+        0.0,
+        -5.884
+      ]
+    },
+    "P03": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        0.836,
+        0.0,
+        -5.884
+      ]
+    },
+    "P04": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        3.036,
+        0.0,
+        -5.884
+      ]
+    },
+    "P05": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        5.236,
+        0.0,
+        -5.884
+      ]
+    },
+    "P06": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -7.964,
+        0.0,
+        -3.684
+      ]
+    },
+    "P07": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -5.764,
+        0.0,
+        -3.684
+      ]
+    },
+    "P08": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -3.564,
+        0.0,
+        -3.684
+      ]
+    },
+    "P09": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -1.364,
+        0.0,
+        -3.684
+      ]
+    },
+    "P10": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        0.836,
+        0.0,
+        -3.684
+      ]
+    },
+    "P11": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        3.036,
+        0.0,
+        -3.684
+      ]
+    },
+    "P12": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        5.236,
+        0.0,
+        -3.684
+      ]
+    },
+    "P13": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -7.964,
+        0.0,
+        -1.484
+      ]
+    },
+    "P14": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -3.564,
+        0.0,
+        -1.484
+      ]
+    },
+    "P15": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -1.364,
+        0.0,
+        -1.484
+      ]
+    },
+    "P16": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        5.236,
+        0.0,
+        -1.484
+      ]
+    },
+    "P17": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -7.964,
+        0.0,
+        0.716
+      ]
+    },
+    "P18": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -3.564,
+        0.0,
+        0.716
+      ]
+    },
+    "P19": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -1.364,
+        0.0,
+        0.716
+      ]
+    },
+    "P20": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        0.836,
+        0.0,
+        0.716
+      ]
+    },
+    "P21": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        3.036,
+        0.0,
+        0.716
+      ]
+    },
+    "P22": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        5.236,
+        0.0,
+        0.716
+      ]
+    },
+    "P23": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -7.964,
+        0.0,
+        2.916
+      ]
+    },
+    "P24": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -3.564,
+        0.0,
+        2.916
+      ]
+    },
+    "P25": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        5.236,
+        0.0,
+        2.916
+      ]
+    },
+    "P26": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -7.964,
+        0.0,
+        5.116
+      ]
+    },
+    "P27": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -5.764,
+        0.0,
+        5.116
+      ]
+    },
+    "P28": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -3.564,
+        0.0,
+        5.116
+      ]
+    },
+    "P29": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        -1.364,
+        0.0,
+        5.116
+      ]
+    },
+    "P30": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        0.836,
+        0.0,
+        5.116
+      ]
+    },
+    "P31": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        3.036,
+        0.0,
+        5.116
+      ]
+    },
+    "P32": {
+      "role": "transit",
+      "unity_object": [],
+      "unity_local": [
+        5.236,
+        0.0,
+        5.116
+      ]
+    }
+  },
+  "boxes": [
+    {
+      "id": "E03-L2",
+      "node": "E03",
+      "level": 2,
+      "unity_object": "Caja (5)",
+      "unity_local": [
+        -2.209,
+        1.03,
+        -5.534
+      ],
+      "dist_al_nodo": 0.048
+    },
+    {
+      "id": "E01-L1",
+      "node": "E01",
+      "level": 1,
+      "unity_object": "Caja",
+      "unity_local": [
+        -4.236,
+        0.374,
+        -5.514
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E01-L2",
+      "node": "E01",
+      "level": 2,
+      "unity_object": "Caja (2)",
+      "unity_local": [
+        -4.236,
+        1.03,
+        -5.514
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E02-L1",
+      "node": "E02",
+      "level": 1,
+      "unity_object": "Caja (1)",
+      "unity_local": [
+        -3.675,
+        0.374,
+        -5.514
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E02-L2",
+      "node": "E02",
+      "level": 2,
+      "unity_object": "Caja (3)",
+      "unity_local": [
+        -3.675,
+        1.03,
+        -5.514
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E20-L1",
+      "node": "E20",
+      "level": 1,
+      "unity_object": "Caja (6)",
+      "unity_local": [
+        -2.77,
+        0.322,
+        -5.514
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E03-L1",
+      "node": "E03",
+      "level": 1,
+      "unity_object": "Caja (4)",
+      "unity_local": [
+        -2.298,
+        0.374,
+        -5.514
+      ],
+      "dist_al_nodo": 0.045
+    },
+    {
+      "id": "E04-L1",
+      "node": "E04",
+      "level": 1,
+      "unity_object": "Caja (13)",
+      "unity_local": [
+        -0.269,
+        0.366,
+        -1.155
+      ],
+      "dist_al_nodo": 0.019
+    },
+    {
+      "id": "E04-L2",
+      "node": "E04",
+      "level": 2,
+      "unity_object": "Caja (7)",
+      "unity_local": [
+        -0.231,
+        0.934,
+        -1.155
+      ],
+      "dist_al_nodo": 0.019
+    },
+    {
+      "id": "E05-L1",
+      "node": "E05",
+      "level": 1,
+      "unity_object": "Caja (12)",
+      "unity_local": [
+        0.225,
+        0.366,
+        -1.155
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E06-L1",
+      "node": "E06",
+      "level": 1,
+      "unity_object": "Caja (11)",
+      "unity_local": [
+        1.039,
+        0.366,
+        -1.155
+      ],
+      "dist_al_nodo": 0.132
+    },
+    {
+      "id": "E06-L2",
+      "node": "E06",
+      "level": 2,
+      "unity_object": "Caja (9)",
+      "unity_local": [
+        1.304,
+        1.035,
+        -1.155
+      ],
+      "dist_al_nodo": 0.133
+    },
+    {
+      "id": "E07-L1",
+      "node": "E07",
+      "level": 1,
+      "unity_object": "Caja (10)",
+      "unity_local": [
+        1.614,
+        0.366,
+        -1.155
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E08-L2",
+      "node": "E08",
+      "level": 2,
+      "unity_object": "Caja (8)",
+      "unity_local": [
+        2.819,
+        0.985,
+        -1.155
+      ],
+      "dist_al_nodo": 0.038
+    },
+    {
+      "id": "E08-L1",
+      "node": "E08",
+      "level": 1,
+      "unity_object": "Caja (14)",
+      "unity_local": [
+        2.894,
+        0.379,
+        -1.155
+      ],
+      "dist_al_nodo": 0.037
+    },
+    {
+      "id": "E09-L1",
+      "node": "E09",
+      "level": 1,
+      "unity_object": "Caja (24)",
+      "unity_local": [
+        -4.766,
+        0.387,
+        -0.666
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E10-L1",
+      "node": "E10",
+      "level": 1,
+      "unity_object": "Caja (25)",
+      "unity_local": [
+        -4.766,
+        0.387,
+        -0.159
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E11-L2",
+      "node": "E11",
+      "level": 2,
+      "unity_object": "Caja (28)",
+      "unity_local": [
+        -4.773,
+        1.095,
+        0.616
+      ],
+      "dist_al_nodo": 0.007
+    },
+    {
+      "id": "E22-L2",
+      "node": "E22",
+      "level": 2,
+      "unity_object": "Caja (29)",
+      "unity_local": [
+        -4.739,
+        1.095,
+        1.136
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E12-L1",
+      "node": "E12",
+      "level": 1,
+      "unity_object": "Caja (23)",
+      "unity_local": [
+        -4.766,
+        0.387,
+        1.948
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E12-L2",
+      "node": "E12",
+      "level": 2,
+      "unity_object": "Caja (26)",
+      "unity_local": [
+        -4.766,
+        1.095,
+        1.948
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E13-L1",
+      "node": "E13",
+      "level": 1,
+      "unity_object": "Caja (20)",
+      "unity_local": [
+        -0.318,
+        0.371,
+        2.475
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E14-L1",
+      "node": "E14",
+      "level": 1,
+      "unity_object": "Caja (19)",
+      "unity_local": [
+        0.211,
+        0.371,
+        2.475
+      ],
+      "dist_al_nodo": 0.006
+    },
+    {
+      "id": "E15-L1",
+      "node": "E15",
+      "level": 1,
+      "unity_object": "Caja (18)",
+      "unity_local": [
+        1.05,
+        0.371,
+        2.475
+      ],
+      "dist_al_nodo": 0.002
+    },
+    {
+      "id": "E16-L1",
+      "node": "E16",
+      "level": 1,
+      "unity_object": "Caja (17)",
+      "unity_local": [
+        1.579,
+        0.371,
+        2.475
+      ],
+      "dist_al_nodo": 0.002
+    },
+    {
+      "id": "E17-L1",
+      "node": "E17",
+      "level": 1,
+      "unity_object": "Caja (16)",
+      "unity_local": [
+        2.365,
+        0.371,
+        2.475
+      ],
+      "dist_al_nodo": 0.01
+    },
+    {
+      "id": "E18-L1",
+      "node": "E18",
+      "level": 1,
+      "unity_object": "Caja (15)",
+      "unity_local": [
+        2.894,
+        0.371,
+        2.475
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E18-L2",
+      "node": "E18",
+      "level": 2,
+      "unity_object": "Caja (21)",
+      "unity_local": [
+        2.894,
+        1.075,
+        2.475
+      ],
+      "dist_al_nodo": 0.0
+    },
+    {
+      "id": "E19-L1",
+      "node": "E19",
+      "level": 1,
+      "unity_object": "Caja (22)",
+      "unity_local": [
+        -4.766,
+        0.387,
+        2.503
+      ],
+      "dist_al_nodo": 0.002
+    },
+    {
+      "id": "E19-L2",
+      "node": "E19",
+      "level": 2,
+      "unity_object": "Caja (27)",
+      "unity_local": [
+        -4.766,
+        1.095,
+        2.506
+      ],
+      "dist_al_nodo": 0.001
+    }
+  ],
+  "agvs": [
+    {
+      "id": "AGV_Aaron",
+      "unity_object": "AGV_Aaron",
+      "unity_local": [
+        6.12,
+        0.046,
+        2.45
+      ],
+      "nodo_mas_cercano": "P25",
+      "dentro_de_la_nave": true
+    },
+    {
+      "id": "AGV_2_Aaron",
+      "unity_object": "AGV_2_Aaron",
+      "unity_local": [
+        9.41,
+        0.22,
+        5.85
+      ],
+      "nodo_mas_cercano": "P32",
+      "dentro_de_la_nave": false
+    },
+    {
+      "id": "AGV_Daniel",
+      "unity_object": "AGV_Daniel",
+      "unity_local": [
+        10.34,
+        0.4,
+        1.2
+      ],
+      "nodo_mas_cercano": "C1",
+      "dentro_de_la_nave": false
+    },
+    {
+      "id": "AGV_Fernando (2)",
+      "unity_object": "AGV_Fernando (2)",
+      "unity_local": [
+        10.38,
+        0.285,
+        3.9
+      ],
+      "nodo_mas_cercano": "P25",
+      "dentro_de_la_nave": false
+    },
+    {
+      "id": "AGBLuisR1",
+      "unity_object": "AGBLuisR1",
+      "unity_local": [
+        10.17,
+        0.054,
+        6.45
+      ],
+      "nodo_mas_cercano": "P32",
+      "dentro_de_la_nave": false
+    }
+  ],
+  "positions": {
+    "B1": [
+      2.98,
+      -7.06
+    ],
+    "B2": [
+      4.58,
+      -7.06
+    ],
+    "B3": [
+      6.28,
+      -7.06
+    ],
+    "C1": [
+      6.5,
+      -2.0
+    ],
+    "C2": [
+      6.5,
+      -3.5
+    ],
+    "C3": [
+      6.5,
+      -5.0
+    ],
+    "E01": [
+      -4.236,
+      -5.514
+    ],
+    "E02": [
+      -3.675,
+      -5.514
+    ],
+    "E03": [
+      -2.253,
+      -5.514
+    ],
+    "E04": [
+      -0.25,
+      -1.155
+    ],
+    "E05": [
+      0.225,
+      -1.155
+    ],
+    "E06": [
+      1.171,
+      -1.155
+    ],
+    "E07": [
+      1.614,
+      -1.155
+    ],
+    "E08": [
+      2.857,
+      -1.155
+    ],
+    "E09": [
+      -4.766,
+      -0.666
+    ],
+    "E10": [
+      -4.766,
+      -0.159
+    ],
+    "E11": [
+      -4.766,
+      0.616
+    ],
+    "E12": [
+      -4.766,
+      1.948
+    ],
+    "E13": [
+      -0.318,
+      2.475
+    ],
+    "E14": [
+      0.217,
+      2.475
+    ],
+    "E15": [
+      1.052,
+      2.475
+    ],
+    "E16": [
+      1.577,
+      2.475
+    ],
+    "E17": [
+      2.375,
+      2.475
+    ],
+    "E18": [
+      2.894,
+      2.475
+    ],
+    "E19": [
+      -4.766,
+      2.505
+    ],
+    "E20": [
+      -2.77,
+      -5.514
+    ],
+    "E22": [
+      -4.739,
+      1.136
+    ],
+    "M1": [
+      -9.711,
+      -4.569
+    ],
+    "M2": [
+      -9.711,
+      -1.04
+    ],
+    "M3": [
+      -9.711,
+      2.3
+    ],
+    "P01": [
+      -7.964,
+      -5.884
+    ],
+    "P02": [
+      -5.764,
+      -5.884
+    ],
+    "P03": [
+      0.836,
+      -5.884
+    ],
+    "P04": [
+      3.036,
+      -5.884
+    ],
+    "P05": [
+      5.236,
+      -5.884
+    ],
+    "P06": [
+      -7.964,
+      -3.684
+    ],
+    "P07": [
+      -5.764,
+      -3.684
+    ],
+    "P08": [
+      -3.564,
+      -3.684
+    ],
+    "P09": [
+      -1.364,
+      -3.684
+    ],
+    "P10": [
+      0.836,
+      -3.684
+    ],
+    "P11": [
+      3.036,
+      -3.684
+    ],
+    "P12": [
+      5.236,
+      -3.684
+    ],
+    "P13": [
+      -7.964,
+      -1.484
+    ],
+    "P14": [
+      -3.564,
+      -1.484
+    ],
+    "P15": [
+      -1.364,
+      -1.484
+    ],
+    "P16": [
+      5.236,
+      -1.484
+    ],
+    "P17": [
+      -7.964,
+      0.716
+    ],
+    "P18": [
+      -3.564,
+      0.716
+    ],
+    "P19": [
+      -1.364,
+      0.716
+    ],
+    "P20": [
+      0.836,
+      0.716
+    ],
+    "P21": [
+      3.036,
+      0.716
+    ],
+    "P22": [
+      5.236,
+      0.716
+    ],
+    "P23": [
+      -7.964,
+      2.916
+    ],
+    "P24": [
+      -3.564,
+      2.916
+    ],
+    "P25": [
+      5.236,
+      2.916
+    ],
+    "P26": [
+      -7.964,
+      5.116
+    ],
+    "P27": [
+      -5.764,
+      5.116
+    ],
+    "P28": [
+      -3.564,
+      5.116
+    ],
+    "P29": [
+      -1.364,
+      5.116
+    ],
+    "P30": [
+      0.836,
+      5.116
+    ],
+    "P31": [
+      3.036,
+      5.116
+    ],
+    "P32": [
+      5.236,
+      5.116
+    ]
+  },
+  "adjacency": {
+    "B1": {
+      "P04": 1.18
+    },
+    "B2": {
+      "P05": 1.35
+    },
+    "B3": {
+      "P05": 1.57
+    },
+    "C1": {
+      "P16": 1.37
+    },
+    "C2": {
+      "P12": 1.28
+    },
+    "C3": {
+      "P05": 1.54
+    },
+    "E01": {
+      "P02": 1.57
+    },
+    "E02": {
+      "P08": 1.83
+    },
+    "E03": {
+      "P09": 2.03
+    },
+    "E04": {
+      "P15": 1.16
+    },
+    "E05": {
+      "P20": 1.97
+    },
+    "E06": {
+      "P20": 1.9
+    },
+    "E07": {
+      "P20": 2.03
+    },
+    "E08": {
+      "P21": 1.88
+    },
+    "E09": {
+      "P07": 3.18
+    },
+    "E10": {
+      "P17": 3.32
+    },
+    "E11": {
+      "P18": 1.21
+    },
+    "E12": {
+      "P23": 3.34
+    },
+    "E13": {
+      "P29": 2.84
+    },
+    "E14": {
+      "P20": 1.86
+    },
+    "E15": {
+      "P20": 1.77
+    },
+    "E16": {
+      "P20": 1.91
+    },
+    "E17": {
+      "P21": 1.88
+    },
+    "E18": {
+      "P21": 1.76
+    },
+    "E19": {
+      "P24": 1.27
+    },
+    "E20": {
+      "P08": 1.99
+    },
+    "E22": {
+      "P18": 1.25
+    },
+    "M1": {
+      "P06": 1.96
+    },
+    "M2": {
+      "P13": 1.8
+    },
+    "M3": {
+      "P23": 1.85
+    },
+    "P01": {
+      "P02": 2.2,
+      "P06": 2.2
+    },
+    "P02": {
+      "E01": 1.57,
+      "P01": 2.2,
+      "P07": 2.2
+    },
+    "P03": {
+      "P04": 2.2,
+      "P10": 2.2
+    },
+    "P04": {
+      "B1": 1.18,
+      "P03": 2.2,
+      "P05": 2.2,
+      "P11": 2.2
+    },
+    "P05": {
+      "B2": 1.35,
+      "B3": 1.57,
+      "C3": 1.54,
+      "P04": 2.2,
+      "P12": 2.2
+    },
+    "P06": {
+      "M1": 1.96,
+      "P01": 2.2,
+      "P07": 2.2,
+      "P13": 2.2
+    },
+    "P07": {
+      "E09": 3.18,
+      "P02": 2.2,
+      "P06": 2.2,
+      "P08": 2.2
+    },
+    "P08": {
+      "E02": 1.83,
+      "E20": 1.99,
+      "P07": 2.2,
+      "P09": 2.2,
+      "P14": 2.2
+    },
+    "P09": {
+      "E03": 2.03,
+      "P08": 2.2,
+      "P10": 2.2,
+      "P15": 2.2
+    },
+    "P10": {
+      "P03": 2.2,
+      "P09": 2.2,
+      "P11": 2.2
+    },
+    "P11": {
+      "P04": 2.2,
+      "P10": 2.2,
+      "P12": 2.2
+    },
+    "P12": {
+      "C2": 1.28,
+      "P05": 2.2,
+      "P11": 2.2,
+      "P16": 2.2
+    },
+    "P13": {
+      "M2": 1.8,
+      "P06": 2.2,
+      "P17": 2.2
+    },
+    "P14": {
+      "P08": 2.2,
+      "P15": 2.2,
+      "P18": 2.2
+    },
+    "P15": {
+      "E04": 1.16,
+      "P09": 2.2,
+      "P14": 2.2,
+      "P19": 2.2
+    },
+    "P16": {
+      "C1": 1.37,
+      "P12": 2.2,
+      "P22": 2.2
+    },
+    "P17": {
+      "E10": 3.32,
+      "P13": 2.2,
+      "P23": 2.2
+    },
+    "P18": {
+      "E11": 1.21,
+      "E22": 1.25,
+      "P14": 2.2,
+      "P19": 2.2,
+      "P24": 2.2
+    },
+    "P19": {
+      "P15": 2.2,
+      "P18": 2.2,
+      "P20": 2.2
+    },
+    "P20": {
+      "E05": 1.97,
+      "E06": 1.9,
+      "E07": 2.03,
+      "E14": 1.86,
+      "E15": 1.77,
+      "E16": 1.91,
+      "P19": 2.2,
+      "P21": 2.2
+    },
+    "P21": {
+      "E08": 1.88,
+      "E17": 1.88,
+      "E18": 1.76,
+      "P20": 2.2,
+      "P22": 2.2
+    },
+    "P22": {
+      "P16": 2.2,
+      "P21": 2.2,
+      "P25": 2.2
+    },
+    "P23": {
+      "E12": 3.34,
+      "M3": 1.85,
+      "P17": 2.2,
+      "P26": 2.2
+    },
+    "P24": {
+      "E19": 1.27,
+      "P18": 2.2,
+      "P28": 2.2
+    },
+    "P25": {
+      "P22": 2.2,
+      "P32": 2.2
+    },
+    "P26": {
+      "P23": 2.2,
+      "P27": 2.2
+    },
+    "P27": {
+      "P26": 2.2,
+      "P28": 2.2
+    },
+    "P28": {
+      "P24": 2.2,
+      "P27": 2.2,
+      "P29": 2.2
+    },
+    "P29": {
+      "E13": 2.84,
+      "P28": 2.2,
+      "P30": 2.2
+    },
+    "P30": {
+      "P29": 2.2,
+      "P31": 2.2
+    },
+    "P31": {
+      "P30": 2.2,
+      "P32": 2.2
+    },
+    "P32": {
+      "P25": 2.2,
+      "P31": 2.2
+    }
+  }
+}

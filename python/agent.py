@@ -269,12 +269,49 @@ class Agent:
         return bool(pool) and not self.viable(pool, chargers)
 
     def can_reach_charger(self, chargers) -> bool:
-        """Le da la bateria para llegar al cargador mas cercano y quedar con reserva."""
-        cerca = [d for c in chargers if (d := self.distance_to(c)) is not None]
+        """Le da la bateria para llegar al cargador mas cercano y quedar con reserva.
+
+        Se mira en cada tick, asi que tambien cubre al que se desvio: un reroute
+        alarga la ruta de verdad, y en cuanto la bateria deja de dar para volver
+        a un cargador el AGV suelta la mision y se va a enchufar.
+        """
+        cerca = [
+            d
+            for c in chargers
+            if (d := self.graph.route_ticks(self.current_node, c)) is not None
+        ]
         if not cerca:
             return True
         gasto = missions.battery_cost(min(cerca))
         return self.battery - gasto >= config.BATTERY_RESERVE
+
+    def would_strand(self, chargers) -> bool:
+        """True si meterse en el siguiente tramo le dejaria sin vuelta a un cargador.
+
+        Es la garantia de que ninguno se queda tirado, y va por induccion: si
+        cada tramo que empieza conserva la vuelta, siempre le queda vuelta. El
+        umbral y la reserva son margen para decidir con holgura; esto es el
+        suelo que no se pisa. Solo mira en los nodos, que es donde todavia se
+        puede elegir: a mitad de tramo ya no hay decision que tomar.
+        """
+        siguiente = self.next_node()
+        if siguiente is None or self.progress > 0.0:
+            return False
+
+        tramo = self.graph.route_ticks(self.current_node, siguiente)
+        if tramo is None:
+            return False
+
+        vuelta = [
+            d
+            for c in chargers
+            if (d := self.graph.route_ticks(siguiente, c)) is not None
+        ]
+        if not vuelta:
+            return False
+
+        queda = self.battery - missions.battery_cost(tramo)
+        return queda - missions.battery_cost(min(vuelta)) < 0.0
 
     def bid(self, bus, t: int, pool, chargers=()) -> list:
         """Mira lo publicado, calcula su utilidad y puja. O dice que no puede.

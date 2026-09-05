@@ -41,6 +41,26 @@ def to_unity(px: float, py: float) -> tuple[float, float, float]:
     return (px * config.UNITY_SCALE, UNITY_Y, py * config.UNITY_SCALE)
 
 
+def travel_ticks(cost: float) -> int:
+    """Ticks que tarda un AGV en cruzar un tramo de ese costo.
+
+    El progreso sube 1/costo por tick y el tramo se acaba al llegar a 1.0, asi
+    que uno de 2.2 se come 3 ticks enteros. Como la bateria se gasta por tick,
+    medirla con el costo en vez de con los ticks la subestima casi un tercio, y
+    el AGV acepta viajes que no puede terminar.
+    """
+    if not math.isfinite(cost) or cost <= 0.0:
+        return 1
+
+    paso = 1.0 / cost
+    ticks = 0
+    progreso = 0.0
+    while progreso < 1.0:
+        progreso += paso
+        ticks += 1
+    return ticks
+
+
 class GraphError(ValueError):
     """Un grafo, o el fichero que lo describe, no sirve como mapa."""
 
@@ -93,6 +113,7 @@ class WarehouseGraph:
         }
         self.boxes: list[Box] = list(boxes or ())
         self.coordinate_system: dict[str, Any] = dict(coordinate_system or {})
+        self._rutas: dict[tuple[str, str], int | None] = {}
 
     def __repr__(self) -> str:
         return (
@@ -123,6 +144,27 @@ class WarehouseGraph:
         if not self.has_edge(a, b):
             raise KeyError(f"no hay arista {a!r} -> {b!r}")
         return self.adjacency[a][b]
+
+    def route_ticks(self, a: str, b: str) -> int | None:
+        """Ticks de viaje de `a` a `b` por la ruta mas barata, o None si no hay.
+
+        Cuenta ticks y no distancia porque es lo que mide la bateria, que se
+        gasta por tick. Y va por la ruta, no en linea recta: en un almacen de
+        estanterias en fondo de saco dos huecos a medio metro cuelgan de
+        pasillos distintos y hay que dar toda la vuelta. Se cachea porque el
+        mapa no cambia durante la corrida y esto se pregunta en cada puja.
+        """
+        clave = (a, b)
+        if clave not in self._rutas:
+            ruta = astar(self, a, b)
+            self._rutas[clave] = (
+                None
+                if ruta is None
+                else sum(
+                    travel_ticks(self.cost(x, y)) for x, y in zip(ruta, ruta[1:])
+                )
+            )
+        return self._rutas[clave]
 
     def edges(self) -> list[tuple[str, str, float]]:
         """Aristas ordenadas como (origen, destino, costo).

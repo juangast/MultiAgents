@@ -33,8 +33,7 @@ BATTERY_FULL: float = 100.0
 BATTERY_DRAIN: float = 0.8
 BATTERY_THRESHOLD: float = 25.0
 BATTERY_CHARGE_RATE: float = 5.0
-BATTERY_RESERVE: float = 10.0
-BATTERY_DETOUR: float = 1.5
+BATTERY_RESERVE: float = 30.0
 
 
 REWARD_TASK_COMPLETE: float = 100.0
@@ -58,7 +57,7 @@ PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 RESULTS_DIR: Path = PROJECT_ROOT / "results"
 MAPS_DIR: Path = PROJECT_ROOT / "python" / "maps"
 MODELS_DIR: Path = PROJECT_ROOT / "python" / "models"
-DEFAULT_MAP: str = "warehouse"
+DEFAULT_MAP: str = "almacen_reto"
 
 Q_TABLE_FILE: Path = MODELS_DIR / "q_table.json"
 TRAINING_LOG_FILE: Path = RESULTS_DIR / "training_log.csv"
