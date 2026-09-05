@@ -5,18 +5,18 @@ mueven por un almacén, se disputan los pasillos y aprenden a ceder el paso.
 
 Python es dueño de **toda** la lógica: el mapa, los agentes, el pathfinding, la detección de
 conflictos y el aprendizaje. Unity es solo el cliente visual, lo desarrolla otra persona en otro
-repo, y habla con Python por un socket TCP.
+repo, y habla con Python por HTTP.
 
 > En este repo **no** se escribe nada de C# ni de Unity.
 
-**Estado: terminado.** 529 tests en verde, cinco escenarios reproducibles medidos con las dos
-políticas, y una demo que enseña la diferencia en un comando.
+Los AGVs recogen cajas de las estanterías y las llevan a los muelles. **Nadie les asigna el
+trabajo**: las misiones se publican y cada AGV puja por las que le convienen. Y por Q-Learning
+aprenden a quién le toca ceder el paso cuando se cruzan.
 
 | | |
 |---|---|
 | Escribir el cliente de Unity | **[docs/PROTOCOL.md](docs/PROTOCOL.md)** — el contrato solo, autosuficiente |
-| Por qué el código es como es | [docs/DESIGN.md](docs/DESIGN.md) — el diario de las fases 2 a 10 |
-| Verlo funcionar en un comando | `python3 python/demo.py` |
+| Verlo funcionar en un comando | `python3 python/main.py simulate --map grid --agents 3 --deliveries` |
 
 ---
 
@@ -27,9 +27,8 @@ políticas, y una demo que enseña la diferencia en un comando.
 3. [Coordenadas y escala](#3-coordenadas-y-escala)
 4. [Instalación y uso](#4-instalación-y-uso)
 5. [Diseño del Q-Learning](#5-diseño-del-q-learning)
-6. [Resultados](#6-resultados)
-7. [Limitaciones y qué haría falta](#7-limitaciones-y-qué-haría-falta)
-8. [Estructura del repo y tests](#8-estructura-del-repo-y-tests)
+6. [Limitaciones y qué haría falta](#6-limitaciones-y-qué-haría-falta)
+7. [Estructura del repo](#7-estructura-del-repo)
 
 ---
 
@@ -66,7 +65,7 @@ conflicto interesante.
 > **A\* responde *por dónde* se va. El Q-Learning responde *qué conviene hacer ahora*.**
 
 Ninguna acción del aprendizaje elige un nodo: la ruta la traza siempre A\*. Lo que se aprende es
-mucho más pequeño —avanzar, esperar o pedir otra ruta— y por eso cabe en una tabla de 72 estados en
+mucho más pequeño —avanzar, esperar o pedir otra ruta— y por eso cabe en una tabla de 144 estados en
 vez de explotar. Está desarrollado en la [sección 5](#5-diseño-del-q-learning).
 
 Y por encima de las dos está **el motor, que es la autoridad**: una acción es una intención, no una
@@ -76,15 +75,71 @@ garantía. En un nodo ocupado no se entra, diga lo que diga la política.
 
 | Pieza | Fichero | Qué hace |
 |---|---|---|
-| Mapa | `python/graph.py` | El almacén como grafo, con validación y carga desde JSON |
-| Rutas | `python/astar.py` | A\* con penalizaciones temporales, que es el gancho del reroute |
-| AGV | `python/agent.py` | Un vehículo: su ruta, su estado y su tarea |
+| Mapa y rutas | `python/graph.py` | El almacén como grafo, las cajas, la validación y A\* |
+| AGV | `python/agent.py` | Un vehículo: su ruta, su estado, su entrega y **su puja** |
+| Negociación | `python/missions.py` | Las misiones, el bus de mensajes y la subasta |
 | Conflictos | `python/conflicts.py` | Los cuatro tipos de choque y la política baseline |
 | Motor | `python/simulation.py` | El tick en dos fases, el gate físico y el desatasco |
 | Aprendizaje | `python/qlearning.py` | Estado, acciones, recompensa, Q-table y entrenamiento |
-| Medición | `python/metrics.py` | Métricas pareadas de una corrida, y los CSV/JSON |
-| Escenarios | `python/scenarios.py` | Los cinco escenarios reproducibles A-E |
-| Transporte | `python/server.py`, `python/protocol.py` | El socket y el contrato, sin lógica de almacén |
+| Transporte | `python/server.py` | El servidor HTTP y el contrato, sin lógica de almacén |
+
+### Dos flujos, y se encadenan
+
+El almacén mueve cajas por dos caminos:
+
+```
+1. produccion -> rack     guardar lo que sale de la linea de produccion
+2. rack -> muelle         sacar del almacen lo que ya estaba guardado
+```
+
+Y **se encadenan**: en cuanto una caja de producción queda guardada en un rack, el almacén le abre
+su misión de salida. Por eso 12 cajas dan 18 misiones — las 6 de producción pasan por los dos
+flujos y las 6 que ya estaban en el rack solo por el segundo.
+
+La caja **se mueve de verdad**: `graph.boxes` del mapa es el inventario inicial, y durante la
+corrida cada caja tiene posición y estado propios (`WAITING_PICKUP`, `RESERVED`, `IN_TRANSIT`,
+`STORED`, `DELIVERED`), que es lo que Unity necesita para pintarla donde está.
+
+### El reparto del trabajo es una subasta
+
+Una **misión** es una entrega entera: recoger una caja y dejarla en su destino, que es un rack o un
+muelle según el flujo. El
+`MissionManager` las publica al bus y **no decide nada**: no calcula distancias, no compara AGVs y
+no elige ganador.
+
+Cada AGV mira lo publicado y calcula **su propia** utilidad para cada misión:
+
+```
+U = -W_D · distancia  -  W_L · carga_de_trabajo  -  W_N · (nivel - 1)
+     2.0                 20.0                       4.0
+```
+
+Los tres términos van en contra, así que gana el AGV **libre, cercano y con la caja más baja** (una
+caja del nivel 2 cuesta el doble de ticks de recoger). A igualdad de utilidad gana el id menor, o la
+corrida dependería del orden de un diccionario.
+
+Un AGV lleva **una misión a la vez**: puja solo si está libre, y no vuelve a pujar hasta que deja la
+caja en el muelle. Se ve entero en el bus con `--bus`:
+
+```
+[t=  1] MANAGER -> TODOS   MISSION_PUBLISHED  mision=M01 flujo=produccion -> rack caja=A1-L1 nodo=A1 destino=D1
+[t=  1]   AGV-1 -> TODOS   BID                agv=1 mision=M01 utilidad=49.9
+[t=  1]   AGV-2 -> TODOS   BID                agv=2 mision=M01 utilidad=21.1
+[t=  1]   AGV-1 -> MANAGER ACCEPT             mision=M01 utilidad=49.9
+[t=  2]   AGV-1 -> MANAGER PICKED_UP          mision=M01 caja=A1-L1
+[t=  2]   AGV-2 -> TODOS   UNAVAILABLE        agv=2 motivo=moving M03
+[t= 12]   AGV-1 -> MANAGER COMPLETED          mision=M01 caja=A1-L1 destino=D1
+[t= 13] MANAGER -> TODOS   MISSION_PUBLISHED  mision=M13 flujo=rack -> muelle caja=A1-L1 nodo=D1 destino=B1
+[t=136]   AGV-1 -> TODOS   UNAVAILABLE        agv=1 motivo=bateria insuficiente 30%
+[t=136]   AGV-1 -> MANAGER CHARGING           agv=1 estacion=C4 bateria=29.6
+```
+
+La última línea del `COMPLETED` y la primera del `MISSION_PUBLISHED` siguiente son el encadenado:
+la caja `A1-L1` acaba de quedarse guardada en `D1` y el almacén ya le abre su salida al muelle.
+
+El AGV‑1 arrancaba en `A1`, que es donde está la caja de M01: puja 0.0 y gana. El AGV‑2, a 14 metros,
+puja −28.84 y se lleva otra. Entre el `ACCEPT` de una misión y el de la siguiente, el AGV publica
+`UNAVAILABLE` en cada paso en vez de pujar.
 
 ---
 
@@ -93,49 +148,51 @@ garantía. En un nodo ocupado no se entra, diga lo que diga la política.
 ### PULL: Unity pide, Python responde
 
 ```
-Unity  ──────  "GET_STATE\n"  ─────▶  Python
-Unity  ◀────  "{...json...}\n"  ────  Python
+Unity  ──────  POST /step  ─────▶  Python
+Unity  ◀────  {...json...}  ────  Python
 ```
 
 Python **nunca** empuja datos por su cuenta y Unity nunca calcula nada: solo dibuja lo que recibe.
 
-> **`GET_STATE` avanza la simulación un paso.** El mundo se mueve porque alguien pregunta, así que
-> el ritmo lo marca el cliente: pidiendo 10 veces por segundo, el almacén corre a 10 ticks/s.
+> **`POST /step` avanza la simulación un paso; `GET /state` no.** El mundo se mueve porque alguien
+> lo pide, así que el ritmo lo marca el cliente: llamando 10 veces por segundo, el almacén corre a
+> 10 ticks/s.
 
 Reglas del contrato:
 
-- TCP contra `127.0.0.1:5000`, codificación `utf-8`, mensajes delimitados por `\n`.
-- **Una línea entra, una línea sale.** Siempre, incluso si el comando es desconocido o la línea
-  venía vacía: así el cliente nunca pierde el emparejamiento.
-- La respuesta es **una** línea: el JSON no lleva saltos de línea internos.
+- **HTTP** contra `127.0.0.1:5000`, JSON en los dos sentidos, `utf-8`.
 - El estado es completo en cada respuesta, no incremental. Unity no guarda historia.
-- El comando no distingue mayúsculas de minúsculas y se admite `\r\n`.
+- Mirar y avanzar son rutas distintas, así que dos clientes ya no se roban los ticks.
 
-> **Cuidado al leer del socket.** TCP entrega un flujo de bytes, no mensajes: un `send()` puede
-> llegar partido en tres `recv()`, y tres respuestas pueden llegar pegadas en una. Hay que acumular
-> en un buffer y cortar por `\n`. Está explicado con código en
-> [PROTOCOL.md §1](docs/PROTOCOL.md#1-transporte).
+### Las cinco rutas
 
-### Los cuatro comandos
-
-| Comando | Qué hace | Respuesta | Avanza el tick |
+| Ruta | Qué hace | Respuesta | Avanza el tick |
 |---|---|---|:--:|
-| `GET_STATE` | Pide el estado actual | El snapshot completo | **sí** |
-| `RESET` | Reinicia la corrida | `{"ok":true}` | no |
-| `PING` | Comprueba que el servidor vive | `{"ok":true}` | no |
-| `SET_MODE baseline\|qlearning` | Cambia de política **en caliente** | `{"ok":true,"mode":"qlearning","run":3}` | no |
+| `GET /state` | El estado actual | El snapshot completo | no |
+| `GET /health` | Comprueba que el servidor vive | `{"ok":true}` | no |
+| `POST /step` | Avanza un paso | El snapshot completo | **sí** |
+| `POST /reset` | Reinicia la corrida | `{"ok":true}` | no |
+| `POST /mode` | Cambia de política **en caliente** | `{"ok":true,"mode":"qlearning","run":3}` | no |
 
-Un comando desconocido **no** cierra la conexión: responde y sigue.
+Se prueba entero sin Unity:
+
+```bash
+curl localhost:5000/state
+curl -X POST localhost:5000/step
+curl -X POST -d '{"mode":"qlearning"}' localhost:5000/mode
+```
+
+Una ruta desconocida **no** cierra nada: contesta 404 con la lista de las que hay.
 
 ```
--> BASURA algo
-<- {"error":"unknown_command","command":"BASURA"}
+-> GET /loquesea
+<- 404 {"error":"unknown_route","path":"/loquesea","routes":[...]}
 
--> SET_MODE turbo
-<- {"error":"bad_mode","command":"SET_MODE","mode":"turbo","modes":["baseline","qlearning"]}
+-> POST /mode {"mode":"turbo"}
+<- 400 {"error":"bad_mode","mode":"turbo","modes":["baseline","qlearning"]}
 ```
 
-`SET_MODE` reinicia siempre, también si el modo pedido es el que ya estaba: media corrida con una
+`POST /mode` reinicia siempre, también si el modo pedido es el que ya estaba: media corrida con una
 política y media con otra no es una corrida de ninguna de las dos. Sube `run` y `step` vuelve a 1;
 lo único que sobrevive es `stats.deadlocks`, que cuenta los de la sesión.
 
@@ -163,7 +220,7 @@ en una sola):
 | `agents[].id` | int | Identificador del AGV, estable toda la sesión |
 | `agents[].x/y/z` | float | Posición **ya en coordenadas de Unity**, lista para un `Vector3` |
 | `agents[].rotation` | float | Giro en grados sobre el eje vertical, 0-360 |
-| `agents[].state` | str | `idle`, `moving`, `waiting` o `done` |
+| `agents[].state` | str | `idle`, `moving`, `waiting`, `picking`, `dropping` o `done` |
 | `agents[].node` | str | Nodo en el que está, o del que acaba de salir |
 | `agents[].next_node` | str \| null | Hacia dónde va; `null` si ya llegó |
 | `agents[].path` | list[str] | La ruta entera, para poder pintarla |
@@ -171,6 +228,14 @@ en una sola):
 | `agents[].wait_time` | int | Ticks **acumulados** cediendo el paso |
 | `agents[].action` | str | Lo que **eligió** hacer: `advance`, `wait` o `reroute` |
 | `agents[].blocked` | bool | Eligió `advance` y el motor **no le dejó** pasar |
+| `agents[].leg` | str | `none`, `to_pick` (va a por la caja) o `to_drop` (la lleva al muelle) |
+| `agents[].mission` | str \| null | Id de la misión que ganó pujando |
+| `agents[].box` | str \| null | Id de la caja que tiene que recoger |
+| `agents[].destination` | str \| null | Donde tiene que dejarla: un rack o un muelle |
+| `agents[].carrying` | str \| null | Id de la caja que lleva **encima ahora mismo** |
+| `agents[].busy` | int | Ticks que le quedan de la recogida o de la entrega |
+| `agents[].battery` | float | Bateria que le queda, 0-100 |
+| `boxes[]` | list | Cada caja: `id`, `node`, `level`, `status`, `mission` |
 | `stats` | object | Los números de la corrida: conflictos por tipo, esperas, deadlocks, acciones |
 
 **`action` y `blocked` son lo más útil para enseñar qué pasa**: uno es lo que el AGV quiso y el otro
@@ -245,16 +310,9 @@ python3 --version
 > vale**: el proyecto usa `X | Y` en las anotaciones, que es 3.10+. Con `brew install python@3.12`
 > tendrás uno en `/opt/homebrew/bin/python3.12`, y ese es el que hay que usar.
 
-Para **desarrollar** (correr los tests y dibujar las curvas) hay dos opcionales:
+No hay dependencias, ni obligatorias ni opcionales: el proyecto corre con la librería estándar.
 
-```bash
-python3 -m pip install -r requirements-dev.txt      # pytest y matplotlib
-```
-
-Sin matplotlib todo funciona: se avisa por el log y no se dibuja el PNG. Sin pytest también, con
-`python3 -m unittest discover -s tests -t .`.
-
-### Los siete subcomandos
+### Los cinco subcomandos
 
 ```bash
 python3 python/main.py --help
@@ -262,15 +320,11 @@ python3 python/main.py --help
 
 | Subcomando | Qué hace |
 |---|---|
-| [`serve`](#serve) | Levanta el servidor TCP y atiende a Unity |
+| [`serve`](#serve) | Levanta el servidor HTTP y atiende a Unity |
 | [`map`](#map) | Muestra el mapa lógico y lo valida |
 | [`simulate`](#simulate) | Corre la simulación sin servidor, paso a paso por el log |
 | [`train`](#train) | Entrena la Q-table, sin servidor y sin Unity |
 | [`evaluate`](#evaluate) | Carga una Q-table y la juega greedy, contra la baseline |
-| [`benchmark`](#benchmark) | Enfrenta las políticas semilla a semilla y escribe `results/` |
-| [`scenario`](#scenario) | Corre los cinco escenarios y saca la tabla resumen |
-
-Y aparte del CLI, la demo: [`demo.py`](#la-demo).
 
 #### `serve`
 
@@ -327,8 +381,8 @@ botella), `simple` (6 nodos, para pruebas rápidas) y `grid` (rejilla 4×4 con r
 Corre sin servidor y cuenta por el log lo que hace cada AGV en cada paso.
 
 ```bash
-python3 python/main.py simulate --map warehouse --agents 1 --steps 100 --headless
-python3 python/main.py simulate --map warehouse --agents 6 --steps 300 --headless \
+python3 python/main.py simulate --map warehouse --agents 1 --steps 100
+python3 python/main.py simulate --map warehouse --agents 6 --steps 300 \
         --policy qlearning
 ```
 
@@ -346,15 +400,37 @@ acciones    : advance 96, wait 41, reroute 12 (desatascos forzados: 3)
 
 La cuarta columna es la **acción elegida**, y el `!` dice que el motor no se la concedió.
 
+Con `--deliveries` el trabajo sale de la subasta y el resumen cuenta las misiones; con `--bus`
+además escupe la negociación entera, mensaje a mensaje.
+
+```bash
+python3 python/main.py simulate --map grid --agents 4 --steps 400 --deliveries
+python3 python/main.py simulate --map grid --agents 3 --steps 60 --deliveries --bus
+```
+
+```
+cajas       : 12 entregada(s) de 12
+misiones    : 18 abiertas en total, 18 servidas, 0 en la bolsa
+negociacion : 4090 mensajes en el bus, AGV 1 sirvio 4, AGV 2 sirvio 2, AGV 3 sirvio 7, AGV 4 sirvio 5
+--- las misiones ---
+M01  produccion -> rack caja A1-L1  A1  nivel 1 -> D1  | COMPLETED   | AGV 1
+M07  rack -> muelle     caja D1-L1  D1  nivel 1 -> B1  | COMPLETED   | AGV 3
+M13  rack -> muelle     caja A1-L1  D1  nivel 1 -> B1  | COMPLETED   | AGV 4
+```
+
+`M13` es `M01` encadenada: la misma caja, ya guardada en `D1`, saliendo ahora por el muelle.
+
+Los números por AGV son las misiones que sirvió **a lo largo de la corrida**, una detrás de otra:
+nunca lleva más de una a la vez.
+
 #### `train`
 
 Entrena la Q-table. **Sin servidor y sin Unity**: mil episodios son ~130.000 ticks y meter un
-socket en medio multiplicaría el tiempo por el ping sin darle al algoritmo ni un dato más. Tarda
+servidor en medio multiplicaría el tiempo sin darle al algoritmo ni un dato más. Tarda
 unos 8 segundos.
 
 ```bash
 python3 python/main.py train --map warehouse --agents 4 --episodes 1000 --seed 42
-python3 python/main.py train --scenario C --episodes 1000     # entrenar EN un escenario
 ```
 
 Escribe `python/models/q_table.json` (la tabla **y su metadata**: mapa, agentes, hiperparámetros,
@@ -363,7 +439,7 @@ semilla, fecha y visitas por estado), `results/training_log.csv` y `results/lear
 #### `evaluate`
 
 Carga una Q-table y la juega **greedy puro** (epsilon 0, la tabla no se toca), contra la baseline
-sobre los mismos escenarios.
+sobre los mismos episodios.
 
 ```bash
 python3 python/main.py evaluate --map warehouse --agents 4
@@ -371,58 +447,6 @@ python3 python/main.py evaluate --map warehouse --agents 4
 
 Sale con **2** si el modelo no está, y con **1** si está pero es de otro formato: una Q-table
 cargada a ciegas sobre estados que no son los suyos no da error, da resultados malos.
-
-#### `benchmark`
-
-Enfrenta las políticas **semilla a semilla**: para cada semilla se construye un escenario y se
-corre con las dos. Mismo mapa, mismos AGVs, mismos destinos, misma cola; lo único que cambia es la
-política.
-
-```bash
-python3 python/main.py benchmark --agents 4 --runs 20
-```
-
-Escribe `results/<policy>.csv` (una fila por semilla), `results/comparison.json` con el resumen
-de las dos y `results/comparison.png` con los paneles.
-
-#### `scenario`
-
-Los cinco escenarios de la [sección 6](#6-resultados), con las dos políticas y su tabla resumen.
-
-```bash
-python3 python/main.py scenario --name C --policy qlearning --runs 20
-python3 python/main.py scenario --all --runs 20                    # los cinco, las dos
-python3 python/main.py scenario --all --runs 20 --per-scenario-model
-```
-
-Escribe `results/scenario_<letra>_<policy>.csv` y `results/summary_table.csv`, que es el que se
-pega en el reporte.
-
-### La demo
-
-```bash
-python3 python/demo.py                       # escenario C con las dos politicas
-python3 python/demo.py --scenario B          # otro escenario
-python3 python/demo.py --rate 10             # al ritmo de Unity
-python3 python/demo.py --policy qlearning    # solo una
-```
-
-Levanta el servidor de verdad, se conecta a él como cliente —el mundo avanza porque alguien
-pregunta, que es el contrato— y va imprimiendo métricas cada 50 ticks. Al terminar manda
-`SET_MODE` para repetir **el mismo escenario** con la otra política y compara las dos.
-
-Unity puede conectarse al mismo puerto y mirar mientras corre.
-
-```
---- BASELINE | escenario B: Congestion media ---
-paso    50 | baseline  | tareas  0/12 | conf/tick  2.68 | espera/tick  3.44 | reroutes     2 | desatascos   4
-paso   210 | baseline  | tareas 12/12 | conf/tick  1.98 | espera/tick  2.45 | reroutes     6 | desatascos  10  <- final
-
---- QLEARNING | escenario B: Congestion media ---
-paso   112 | qlearning | tareas 12/12 | conf/tick  1.25 | espera/tick  1.20 | reroutes    99 | desatascos   1  <- final
-
-VEREDICTO: el Q-Learning MEJORA. Makespan medio 112.0 contra 210.0 ticks (-46.7%).
-```
 
 ### Logs
 
@@ -459,9 +483,9 @@ contar rutas ni destinos. Con el estado local de aquí abajo son **72**.
 Hay una tercera capa y es la que manda: **el motor es la autoridad**. Una acción es una intención,
 no una garantía; en un nodo ocupado no se entra venga la política que venga.
 
-### El estado: cinco enteros, discreto y local
+### El estado: seis enteros, discreto y local
 
-`get_local_state(agent, simulation)` devuelve **siempre** una tupla de cinco enteros, hasheable y
+`get_local_state(agent, simulation)` devuelve **siempre** una tupla de seis enteros, hasheable y
 con cada campo en su rango. Es la clave de la Q-table.
 
 | Campo | Valores | Qué pregunta |
@@ -471,6 +495,7 @@ con cada campo en su rango. Es la clave de la Q-table.
 | `queue_ahead` | 0/1/2 | ¿cuántos AGVs esperan en mis 2 nodos siguientes? (saturado en 2) |
 | `distance_bucket` | 0/1/2 | ¿cuánto me falta? cerca / medio / lejos |
 | `has_priority` | 0/1 | ¿soy el id menor de los que estamos en conflicto? |
+| `carrying` | 0/1 | ¿voy cargado con una caja? |
 
 ```
 2 × 2 × 3 × 3 × 2 = 72 estados × 3 acciones = 216 celdas de Q(s, a)
@@ -520,94 +545,15 @@ que aprende el AGV 3 vale igual para el 1; cada episodio produce N veces más ex
 el número de AGVs no invalida el modelo. Lo que se pierde es la especialización, y en un almacén de
 AGVs idénticos eso no es una pérdida.
 
-El desarrollo completo —cuándo se cobra cada recompensa, por qué la transición no se cierra en el
-mismo tick, y cómo se enchufa la política sin tocar el motor— está en
-[DESIGN.md](docs/DESIGN.md#el-entorno-de-q-learning).
+Cuándo se cobra cada recompensa y por qué la transición no se cierra en el mismo tick está
+comentado en `python/qlearning.py`, junto al código que lo hace.
 
 ---
 
-## 6. Resultados
-
-### Qué aprendió
-
-La regla que sale de las 111.000 actualizaciones es una sola, y es la que se buscaba: **si el nodo
-de delante está ocupado, no intentes entrar**. De los 24 estados con `next_node_occupied = 1` y al
-menos 50 visitas detrás, `ADVANCE` no es la mejor acción en **ninguno**:
-
-```
-      estado  visitas  mejor    advance /    wait / reroute
-   0|0|0|0|1    17058  advance    68.69 /   11.68 /   16.82   nada delante -> pasa
-   1|0|0|0|0    21656  reroute   -11.56 /   -4.99 /   12.23   ocupado y sin prioridad -> rodea
-   1|0|0|0|1    16607  wait       -0.57 /   17.58 /    8.36   ocupado y con prioridad -> espera turno
-   1|1|1|0|0     7993  reroute   -16.76 /   -2.39 /    8.29   de frente y con cola -> rodear
-```
-
-`ADVANCE` va de **+68.69 con el camino libre a −16.76 con alguien de frente y cola delante**: 85
-puntos de diferencia entre la misma acción en dos sitios distintos, que es exactamente lo que el
-estado local tenía que poder distinguir.
-
-### Los cinco escenarios
-
-Cinco escenarios reproducibles que barren el rango, de un almacén casi vacío a un cuello de
-botella. **De un escenario no se sortea nada estructural**: el mapa, cuántos AGVs, dónde arranca
-cada uno y de qué conjunto salen las tareas están escritos a mano. Lo único que depende de la
-semilla es qué destinos concretos tocan.
-
-| | Escenario | Mapa | AGVs | Tareas | Qué prueba |
-|---|---|---|--:|--:|---|
-| **A** | Baja congestión | `warehouse` | 2 | 6 | Cada AGV en su mitad: nadie se cruza con nadie |
-| **B** | Congestión media | `warehouse` | 4 | 12 | Cuatro rutas que se cruzan en `S3` |
-| **C** | Alta congestión | `warehouse` | 6 | 18 | Seis AGVs en trece nodos: por encima de su capacidad |
-| **D** | Cuello de botella | `warehouse` | 4 | 16 | Toda tarea cruza `G`, el **único** paso |
-| **E** | Rutas alternativas | `grid` | 4 | 16 | El mismo cruce que D, pero con rutas de **igual coste** |
-
-**El par D/E es el experimento.** Mismo número de AGVs, mismas tareas, misma presión (1.74
-conflictos por tick en D contra 1.70 en E); lo único que cambia es si existe una ruta alternativa.
-En D, `G` es punto de articulación y penalizarlo no le da a A\* otra ruta, le da una peor. En E, la
-rejilla tiene varias rutas mínimas entre dos nodos cualesquiera.
-
-### Baseline contra Q-Learning: 5 escenarios × 2 políticas × 20 semillas
-
-Con la Q-table general del repo. Es `results/summary_table.csv` tal cual:
-
-| Esc. | Escenario | AGVs | Política | Makespan | Completas | Tareas | Conf/tick | Espera/tick | Reroutes | Gana |
-|---|---|--:|---|--:|--:|--:|--:|--:|--:|:--:|
-| A | Baja congestión | 2 | baseline | **50.5** | 95 % | 96.7 % | 0.10 | 0.13 | 0.3 | — |
-| | | | Q-Learning | 122.8 | 85 % | 93.3 % | 0.09 | 0.13 | 37.6 | 3/20 |
-| B | Congestión media | 4 | baseline | 308.7 | 85 % | 98.8 % | 1.72 | 2.17 | 10.5 | — |
-| | | | Q-Learning | **294.5** | 75 % | 97.5 % | 1.14 | 1.22 | 172.7 | **15/20** |
-| C | Alta congestión | 6 | baseline | 1831.8 | 25 % | 93.9 % | 2.53 | 3.51 | 171.0 | — |
-| | | | Q-Learning | 1724.2 | 25 % | 94.7 % | 1.56 | 1.98 | 2450.6 | 4/20 |
-| D | Cuello de botella | 4 | baseline | 497.1 | **95 %** | 99.7 % | 1.74 | 2.42 | 23.3 | — |
-| | | | Q-Learning | 505.5 | 70 % | 97.2 % | 1.41 | 1.71 | 620.6 | 10/20 |
-| E | Rutas alternativas | 4 | baseline | 216.5 | 100 % | 100.0 % | 1.70 | 2.29 | 6.2 | — |
-| | | | Q-Learning | **103.0** | 100 % | 100.0 % | 0.71 | 0.83 | 57.1 | **20/20** |
-
-**Dónde mejora y dónde no, sin maquillar:**
-
-- **E (rutas alternativas): mejora, y mucho.** −52 % de makespan, −58 % de conflictos por tick,
-  −64 % de espera por tick, y gana **las 20 semillas** sin perder una tarea. Es el único escenario
-  donde el Q-Learning gana limpio.
-- **B (congestión media): mixto, y la media engaña.** Gana 15 de 20 semillas y baja los conflictos
-  por tick un 34 %, pero completa menos corridas (75 % contra 85 %): va mejor casi siempre y se
-  cuelga de vez en cuando.
-- **D (cuello de botella): no aporta.** Empata en makespan y **termina 25 puntos menos de
-  corridas**, a cambio de 620 reroutes contra 23. Donde no hay ruta alternativa, recalcular solo
-  cuesta ticks.
-- **C (alta congestión): empate.** Despacha un 0.8 % más de tareas con 2450 reroutes contra 171.
-- **A (baja congestión): estorba.** Con dos AGVs que no se cruzan, la baseline tarda 50 ticks y el
-  Q-Learning **123**: rerutea aunque no haya nadie delante.
-
-> El patrón es limpio y es el que se buscaba: **el Q-Learning gana exactamente donde el REROUTE
-> tiene a dónde ir (E), empata donde hay congestión pero también sitio (B, C), y pierde donde
-> recalcular no puede ayudar (D) o no hace falta (A).**
-
-Los totales crudos (conflictos, espera) **premian al que muere antes**: una corrida que se atasca
-acumula menos de todo. Por eso van las tasas por tick, y por eso `completas` sale en la tabla.
 
 ---
 
-## 7. Limitaciones y qué haría falta
+## 6. Limitaciones y qué haría falta
 
 Ordenadas por lo que más pesa en los resultados.
 
@@ -637,73 +583,53 @@ puede volver a estorbar.
 > **Qué haría falta:** una zona de aparcamiento fuera de los pasillos, o que el AGV sin tarea
 > libere el nodo. Es cambiar el modelo de ocupación, no el aprendizaje.
 
-### 3. La saturación de C no se mide con el makespan
-
-Por lo anterior, en esas 15 corridas el makespan **es el tope que uno elija**, no una medida de
-nada. `scenarios.scenario_verdict()` decide por tareas despachadas cuando la completitud baja del
-50 %, y C hay que leerlo por trabajo despachado y no por ticks. Es un límite del montaje, no del
-motor: las dos políticas lo sufren igual y el escenario sigue siendo pareado.
-
-### 4. El cara a cara sin hueco libre
+### 3. El cara a cara sin hueco libre
 
 El motor desatasca en tres peldaños (forzar el paso, forzar un reroute con veto, o apartar al que
 estorba a un hueco libre), y con eso **no hay un solo deadlock** en ninguno de los resultados de
 arriba. Pero si no queda **ningún** nodo libre en todo ese lado del mapa, no hay a dónde apartarse
 y la corrida muere. Hace falta llenar un componente entero del grafo para llegar ahí.
 
-### 5. Una Q-table por escenario ayuda, pero no basta
+### 4. Del protocolo
 
-Entrenar en el régimen en que se evalúa (`train --scenario X`) baja el makespan un 10 % de media y
-**recupera la completitud de la baseline** (80 % contra 71 % de la general): C pasa de 25 % a 55 %
-de corridas completas. Pero pierde en B y en E, y por el mismo motivo de siempre: rerutea más.
+- **No se puede pedir el mapa por HTTP.** Hay que exportarlo con `main.py map`. Una ruta
+  `GET /map` sería lo que falta para que Unity se configure entero por red.
+- **No hay pausa ni control de velocidad desde el servidor.** Se para dejando de pedir `POST /step`.
+- **No hay autenticación ni cifrado.** Es HTTP plano, pensado para `127.0.0.1`.
 
-### 6. Del protocolo
-
-- **No hay forma de mirar sin avanzar el mundo**: `GET_STATE` siempre consume un tick, así que dos
-  clientes conectados ven pasos distintos. Un comando `PEEK` lo resolvería, y de paso daría el modo
-  pausa.
-- **No se puede pedir el mapa por el socket.** Hay que exportarlo con `map`. Un `GET_MAP` sería lo
-  que falta para que Unity se configure entero por red.
-- **No hay autenticación ni cifrado.** Está pensado para `127.0.0.1`.
-
-### 7. Del alcance
+### 5. Del alcance
 
 - El mapa **no cambia en marcha**: no hay obstáculos dinámicos ni pasillos que se cierren.
-- Los AGVs no tienen batería, ni carga, ni tamaño: un AGV es un punto que ocupa un nodo.
+- Los AGVs no tienen batería ni tamaño: un AGV es un punto que ocupa un nodo. Carga sí llevan,
+  pero solo una caja y solo con `--deliveries`; sin esa bandera siguen siendo puntos que van
+  de un nodo a otro. El mapa `grid` declara estaciones de carga (`B4`, `C4`) que **nadie usa
+  todavía**: son datos del mapa esperando a que exista un modelo de batería.
 - No hay prioridades entre tareas ni ventanas de tiempo.
 - La comparación es contra una baseline de "gana el id menor". No se ha medido contra un
   planificador centralizado tipo CBS, que sería la referencia fuerte.
 
 ---
 
-## 8. Estructura del repo y tests
+## 7. Estructura del repo
 
 ```
 agentesAGV/
 ├── python/
-│   ├── config.py       constantes (red, ticks, Unity, semilla, umbrales, recompensas)
-│   ├── logs.py         configuracion del logging
-│   ├── protocol.py     el contrato: comandos, serializacion y coordenadas
-│   ├── server.py       servidor TCP, solo transporte
-│   ├── graph.py        el mapa logico: grafo, validacion y carga desde JSON
-│   ├── astar.py        A* con penalizaciones temporales
-│   ├── agent.py        el AGV: ruta, estado y tarea
+│   ├── config.py       constantes y configuracion del logging
+│   ├── graph.py        el mapa: grafo, cajas, validacion, carga desde JSON y A*
+│   ├── agent.py        el AGV: ruta, estado, entrega y puja
+│   ├── missions.py     misiones, bus de mensajes y subasta
 │   ├── conflicts.py    conflictos, ocupacion, acciones, reroute y la politica base
 │   ├── simulation.py   el almacen en marcha: ticks, modos, desatasco y snapshot
 │   ├── qlearning.py    Q-Learning: el entorno y el entrenamiento
-│   ├── metrics.py      metricas pareadas de una corrida, CSV y JSON
-│   ├── scenarios.py    los cinco escenarios reproducibles A-E
-│   ├── demo.py         la demostracion final
+│   ├── server.py       el contrato con Unity: servidor HTTP con JSON
 │   ├── main.py         CLI con argparse
 │   ├── maps/           los mapas en JSON (simple, warehouse, grid)
 │   └── models/         las Q-tables entrenadas
 ├── docs/
-│   ├── PROTOCOL.md     el protocolo TCP solo, para el equipo de Unity
-│   └── DESIGN.md       el diario de las fases: por que el codigo es como es
+│   └── PROTOCOL.md     el protocolo HTTP solo, para el equipo de Unity
 ├── results/            salidas de las corridas (no se versiona)
-├── tests/              529 tests, y el cliente falso de Unity
-├── requirements.txt        vacio a proposito: el proyecto corre sin dependencias
-└── requirements-dev.txt    pytest y matplotlib, solo para desarrollar
+└── requirements.txt    vacio a proposito: el proyecto corre sin dependencias
 ```
 
 `results/` **no se versiona** (está en `.gitignore`): son salidas y se regeneran. Las Q-tables de
@@ -711,56 +637,7 @@ agentesAGV/
 
 El servidor recibe la simulación por **inyección de dependencia**: `serve_forever()` acepta
 cualquier objeto con `get_snapshot()` y `reset()`, y en `server.py` no queda ni una línea de lógica
-del almacén. Es lo que permite que `demo.py` sirva un escenario con cola de tareas sin tocar el
-servidor.
-
-### Tests
-
-```bash
-pytest                                            # los 529
-pytest tests/test_integration.py -v               # solo uno
-pytest -q -k "protocol or simulation"             # por nombre
-python3 -m unittest discover -s tests -t .        # sin instalar nada
-```
-
-Los tests están escritos con `unittest.TestCase` de la librería estándar **a propósito**: pytest
-los ejecuta tal cual, así que los dos comandos valen y quien no quiera instalar nada sigue
-teniendo el runner de siempre.
-
-| Fichero | Qué cubre |
-|---|---|
-| `test_graph.py` | El mapa: validación, carga/guardado y conversión de coordenadas |
-| `test_astar.py` | A\*: optimalidad contra búsqueda exhaustiva, aristas válidas, sin ruta, penalties |
-| `test_agent.py` | El AGV, y que su estado es **suyo**: nadie comparte ruta con nadie |
-| `test_conflicts.py` | `vertex`, `edge`, deadlock y la invariante de un AGV por nodo |
-| `test_qlearning.py` | Forma del estado, actualización de la Q-table, save/load, greedy contra epsilon |
-| `test_simulation.py` | Determinismo por semilla y snapshot válido en cada tick |
-| `test_protocol.py` | Comandos, comando desconocido y **mensajes fragmentados en TCP** |
-| `test_integration.py` | Corrida completa baseline y qlearning de punta a punta, por el socket |
-| `test_server.py` | El servidor TCP contra un socket de verdad |
-| `test_main.py` | El CLI y sus siete subcomandos |
-| `test_training.py` | Bellman, los dos modos, que aprende y que es reproducible |
-| `test_phase8.py` | Los dos modos, la acción en el snapshot, `SET_MODE` y el desatasco |
-| `test_metrics.py` | Escenarios pareados, métricas, CSV/JSON y el reporte |
-| `test_scenarios.py` | Los cinco escenarios, su reproducibilidad y la tabla resumen |
-| `test_config.py`, `test_logs.py` | Las constantes y el logging |
-
-Algunos son más que un test unitario: `test_astar.py` compara A\* contra una **búsqueda exhaustiva**
-sobre los 186 pares ordenados de nodos de los dos mapas; `test_conflicts.py` corre **500 ticks con
-6 AGVs** comprobando en cada tick que no hay dos en el mismo nodo; `test_training.py` **entrena 300
-episodios de verdad** y comprueba que la recompensa sube y los conflictos bajan; `test_phase8.py`
-comprueba que en **10 corridas de 1000 ticks con 6 AGVs no hay un solo deadlock**.
-
-### Cliente falso de Unity
-
-`tests/fake_unity_client.py` hace de Unity mientras Unity no existe: se conecta, pide `GET_STATE` a
-un ritmo fijo, valida que cada respuesta cumpla el contrato y comprueba que `step` va creciendo.
-Sale con código 1 si algo falla, e imprime latencias mín/media/p95/máx.
-
-```bash
-python3 python/main.py serve --port 5055 &
-python3 tests/fake_unity_client.py --port 5055 --seconds 60 --rate 10
-```
+del almacén.
 
 ### Reglas del proyecto
 
@@ -768,6 +645,6 @@ python3 tests/fake_unity_client.py --port 5055 --seconds 60 --rate 10
 - **Sin dependencias para ejecutar**: nada de gym, stable-baselines ni torch. El Q-Learning está
   implementado a mano con diccionarios.
 - El entrenamiento corre **sin servidor y sin Unity**.
-- Nada de lógica de negocio en `server.py`: el servidor solo traduce sockets a llamadas.
+- Nada de lógica de negocio en `server.py`: el servidor solo traduce peticiones HTTP a llamadas.
 - Cada módulo se puede importar y probar por separado.
 - Logging con el módulo `logging`, nunca con `print`.

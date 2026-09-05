@@ -1,5 +1,7 @@
-"""Constantes del proyecto."""
+"""Constantes del proyecto y configuracion del logging."""
 
+import logging
+import sys
 from pathlib import Path
 
 HOST: str = "127.0.0.1"
@@ -10,100 +12,47 @@ CMD_RESET: str = "RESET"
 CMD_PING: str = "PING"
 CMD_SET_MODE: str = "SET_MODE"
 
-TICK_RATE: int = 10
-TICK_DURATION: float = 1.0 / TICK_RATE
-
 UNITY_SCALE: float = 1.0
-AGV_HEIGHT: float = 0.5
-
 RANDOM_SEED: int = 42
 
-# Gestion de conflictos (fase 5). El baseline es una referencia experimental,
-# asi que estos tres numeros se tocan a menudo para comparar corridas.
-CONFLICT_WAIT_THRESHOLD: int = 5   # ticks esperando antes de marcar congestion
-CONGESTION_ZONE_AGENTS: int = 3    # agentes esperando en una zona para que cuente
-DEADLOCK_TICKS: int = 20           # ticks seguidos sin que avance nadie
+DEADLOCK_TICKS: int = 20
 
-# Las dos politicas que la fase 8 puede montar por nombre. Es la UNICA variable
-# experimental: con `baseline` y con `qlearning` corre exactamente el mismo motor.
 POLICY_BASELINE: str = "baseline"
 POLICY_QLEARNING: str = "qlearning"
 POLICIES: tuple[str, ...] = (POLICY_BASELINE, POLICY_QLEARNING)
 DEFAULT_POLICY: str = POLICY_BASELINE
 
-# Desatasco de la fase 8. Salta MUY antes que DEADLOCK_TICKS a proposito: cuando
-# se llega a los 20 la corrida ya esta muerta, y lo que hace falta es que no
-# llegue. Ponerlo a 0 apaga el desatasco y devuelve el motor al de la fase 5.
-DEADLOCK_FORCE_TICKS: int = 8      # ticks sin que avance nadie antes de que el motor mande
-# Cuando el motor manda a un AGV apartarse de un nodo, ese nodo le queda
-# reservado al que esperaba durante estos ticks. Sin la reserva, el que se
-# aparto vuelve, gana el desempate por id menor y el atasco se rehace: apartarse
-# y volver es no apartarse.
-YIELD_TICKS: int = 10
-# Un AGV solo, clavado en el sitio mientras los demas circulan, es el otro
-# atasco: el contador global no lo ve porque el almacen SI se esta moviendo. El
-# umbral va mas alto que el de arriba porque esperar es normal: cruzar un tramo
-# cuesta entre 4 y 8 ticks, asi que ceder el paso dos veces seguidas ya son 16.
-STARVED_TICKS: int = 45
 
-# Epsilon con el que se sirve una Q-table ya entrenada. Greedy puro: al servir no
-# se explora, que lo que se enseña es lo aprendido, no como se aprendio.
-SERVE_EPSILON: float = 0.0
+ENABLE_REROUTE: bool = True
 
-# Q-Learning (fase 6). Aqui se define el entorno; el entrenamiento es la 7.
-# Q-Learning NO sustituye a A*: A* sigue trazando la ruta, y lo que se aprende
-# es solo que hacer AHORA ante un riesgo de conflicto.
-ENABLE_REROUTE: bool = True        # si es False la politica solo elige ADVANCE/WAIT
 
-# Cortes del bucket de distancia, contados en NODOS que faltan de la ruta, nunca
-# en distancia euclidiana: cerca <= NEAR < medio <= MID < lejos.
-DISTANCE_NEAR_NODES: int = 3
-DISTANCE_MID_NODES: int = 8
-
-# Cuanto se encarece el nodo (y el tramo hacia el) que se esta esquivando cuando
-# la politica elige REROUTE. Va a `astar.astar(..., penalties=...)`.
 REROUTE_PENALTY: float = 10.0
 
-# Las penalizaciones del REROUTE CADUCAN (fase 8). Sin caducidad el mapa se
-# degrada para siempre: A* acabaria esquivando pasillos que llevan cien ticks
-# libres solo porque una vez hubo alguien delante.
-PENALTY_TTL: int = 15        # ticks que dura una penalizacion antes de expirar
-PENALTY_MAX: float = 40.0    # tope al acumular: insistir sube el precio, no lo hace infinito
-# El veto del desatasco: caro de verdad, pero FINITO. Con `inf` un nodo de paso
-# obligado dejaria a A* sin ruta que devolver, y sin ruta no hay desatasco.
-PENALTY_BAN: float = 1000.0
-# Recalcular cuesta, asi que no se recalcula en cada tick. Sin esta pausa un AGV
-# bloqueado pide ruta nueva 20 veces seguidas: cada recalculo penaliza el nodo
-# que tiene delante, A* le da la otra salida, al tick siguiente penaliza esa y
-# vuelve a la primera. Un ir y venir que no lleva a ningun sitio y que ademas
-# encarece medio mapa. Con la pausa, un REROUTE seguido de otro se queda en
-# esperar, que es lo que de verdad estaba haciendo.
-REROUTE_COOLDOWN: int = 8
 
-# Recompensas del Q-Learning. Estan aqui para poder ajustarlas sin abrir
-# qlearning.py; quien las lee es `qlearning.reward(event)`, y nadie mas.
-REWARD_TASK_COMPLETE: float = 100.0   # completar la tarea
-REWARD_PROGRESS: float = 2.0          # avanzar hacia el destino (path_index subio)
-REWARD_WAIT: float = -1.0             # esperar un tick
-REWARD_CONFLICT: float = -20.0        # intentar entrar en conflicto
-REWARD_DEADLOCK: float = -50.0        # provocar un deadlock
-REWARD_USELESS_REROUTE: float = -3.0  # recalcular sin ganar nada
+BATTERY_FULL: float = 100.0
+BATTERY_DRAIN: float = 0.8
+BATTERY_THRESHOLD: float = 25.0
+BATTERY_CHARGE_RATE: float = 5.0
+BATTERY_RESERVE: float = 10.0
+BATTERY_DETOUR: float = 1.5
 
-# Entrenamiento del Q-Learning (fase 7). La fase 6 define el entorno; estos son
-# los numeros del bucle que aprende encima de el, y los lee `qlearning.Trainer`.
-ALPHA: float = 0.2          # cuanto pesa lo nuevo frente a lo que ya sabia
-GAMMA: float = 0.95         # cuanto vale el futuro; casi 1 porque el +100 esta al final
-EPSILON_START: float = 1.0  # se empieza explorando del todo
-EPSILON_END: float = 0.05   # y nunca se deja de explorar un poco
-EPSILON_DECAY: float = 0.995  # exponencial: epsilon <- max(END, epsilon * DECAY)
+
+REWARD_TASK_COMPLETE: float = 100.0
+REWARD_PICKED: float = 50.0
+REWARD_PROGRESS: float = 2.0
+REWARD_WAIT: float = -1.0
+REWARD_CONFLICT: float = -20.0
+REWARD_DEADLOCK: float = -50.0
+REWARD_USELESS_REROUTE: float = -3.0
+
+ALPHA: float = 0.2
+GAMMA: float = 0.95
+EPSILON_START: float = 1.0
+EPSILON_END: float = 0.05
+EPSILON_DECAY: float = 0.995
 EPISODES: int = 1000
-# Tope de ticks por episodio. Un tramo del `warehouse` cuesta entre 4 y 8 ticks,
-# asi que una ruta entera son ~30 y 200 deja sitio de sobra para atascarse y aun
-# asi llegar. Sin tope, un episodio del principio (epsilon 1.0) no termina nunca.
 MAX_STEPS_PER_EPISODE: int = 200
 TRAIN_AGENTS: int = 4
-# Cada cuantos episodios se imprime una fila del resumen por consola.
-REPORT_EVERY: int = 100
 
 PROJECT_ROOT: Path = Path(__file__).resolve().parent.parent
 RESULTS_DIR: Path = PROJECT_ROOT / "results"
@@ -111,55 +60,30 @@ MAPS_DIR: Path = PROJECT_ROOT / "python" / "maps"
 MODELS_DIR: Path = PROJECT_ROOT / "python" / "models"
 DEFAULT_MAP: str = "warehouse"
 
-# Lo que produce y consume la fase 7.
 Q_TABLE_FILE: Path = MODELS_DIR / "q_table.json"
 TRAINING_LOG_FILE: Path = RESULTS_DIR / "training_log.csv"
-LEARNING_CURVE_FILE: Path = RESULTS_DIR / "learning_curve.png"
 
-# Benchmark de la fase 9. Comparar dos politicas exige que UNA sola cosa cambie
-# entre las dos corridas, asi que estos numeros definen el escenario y se
-# aplican identicos a las dos: mismo mapa, mismos AGVs, mismas tareas y misma
-# semilla. Lo unico distinto es `policy`.
-BENCHMARK_RUNS: int = 20            # semillas por escenario; el minimo para que la media diga algo
-BENCHMARK_TASKS_PER_AGENT: int = 4  # tareas totales = agentes x esto
-# Tope de ticks por corrida. Una tarea del `warehouse` son ~30 ticks y con 4 por
-# AGV salen ~120; 800 deja sitio de sobra para atascarse y aun asi terminar, que
-# es lo que hay que poder distinguir de un deadlock.
-BENCHMARK_MAX_STEPS: int = 800
+_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+_DATE_FORMAT = "%H:%M:%S"
+_HANDLER_NAME = "agv_console"
 
-# Lo que produce la fase 9.
-BASELINE_CSV: Path = RESULTS_DIR / "baseline.csv"
-QLEARNING_CSV: Path = RESULTS_DIR / "qlearning.csv"
-COMPARISON_JSON: Path = RESULTS_DIR / "comparison.json"
-COMPARISON_PLOT: Path = RESULTS_DIR / "comparison.png"
+def setup_logging(verbose: bool = False) -> None:
+    """Deja el logging escribiendo a stderr. Con verbose usa DEBUG."""
+    level = logging.DEBUG if verbose else logging.INFO
+    root = logging.getLogger()
+    root.setLevel(level)
 
-# Cuantas veces tiene que haberse probado una celda (estado, accion) para que la
-# politica se fie de ella al servir. Es el arreglo del "cero optimista": casi
-# toda la recompensa del almacen es negativa, asi que una celda que nadie probo
-# vale 0.0 y le gana a TODO lo aprendido. Sin este filtro la politica acaba
-# eligiendo justo la accion de la que no sabe nada. Con 0 se apaga el filtro.
-SERVE_MIN_VISITS: int = 30
+    for handler in root.handlers:
+        if handler.get_name() == _HANDLER_NAME:
+            handler.setLevel(level)
+            return
 
-# Escenarios de la fase 10. Cinco escenarios reproducibles que barren el rango
-# de congestion, cada uno con sus posiciones de salida escritas a mano. Lo que
-# la semilla sortea es solo QUE destinos tocan; la estructura del escenario
-# (mapa, AGVs, donde arranca cada uno) es fija, o las N corridas serian la misma
-# corrida N veces y la desviacion tipica saldria 0.
-SCENARIO_SEED: int = 100          # semilla base; las corridas son SEED, SEED+1, ...
-SCENARIO_RUNS: int = BENCHMARK_RUNS  # corridas por escenario y politica
-SCENARIO_MAX_STEPS: int = BENCHMARK_MAX_STEPS
+    handler = logging.StreamHandler(sys.stderr)
+    handler.set_name(_HANDLER_NAME)
+    handler.setLevel(level)
+    handler.setFormatter(logging.Formatter(_FORMAT, datefmt=_DATE_FORMAT))
+    root.addHandler(handler)
 
-# Lo que produce la fase 10. El CSV por escenario y politica lleva la letra y el
-# nombre de la politica en el nombre; la tabla resumen es una sola, con una fila
-# por (escenario, politica), y es la que se pega en el reporte.
-SUMMARY_TABLE_FILE: Path = RESULTS_DIR / "summary_table.csv"
-
-
-def scenario_csv(letter: str, policy: str) -> Path:
-    """Donde va el CSV de un escenario corrido con una politica."""
-    return RESULTS_DIR / f"scenario_{letter.upper()}_{policy}.csv"
-
-
-def scenario_model(letter: str) -> Path:
-    """La Q-table entrenada para UN escenario, frente a la general."""
-    return MODELS_DIR / f"q_table_{letter.upper()}.json"
+def get_logger(name: str) -> logging.Logger:
+    """Devuelve el logger con ese nombre."""
+    return logging.getLogger(name)

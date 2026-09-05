@@ -1,0 +1,57 @@
+{
+  "name": "ejemplo",
+  "directed": false,
+  "coordinate_system": {
+    "units": "meters",
+    "spacing": 5.0,
+    "origin": "A1",
+    "columns": ["A", "B", "C"],
+    "rows": [1, 2],
+    "node_id": "<column><row>",
+    "cell_to_position": "x = col_index * spacing, y = row_index * spacing",
+    "levels": [1, 2],
+    "level_height": 1.0,
+    "level_to_height": "height = (level - 1) * level_height",
+    "unity": "x -> x, y -> z, height -> y, escala en config.UNITY_SCALE",
+    "unity_root": "Warehouse",
+    "unity_root_world_position": [10.0, 0.0, -6.0]
+  },
+  "roles": {
+    "storage": "estanteria: aqui hay cajas que recoger o dejar",
+    "transit": "cruce de pasillo: solo se pasa por el",
+    "dock": "muelle de camion: entra y sale mercancia del almacen",
+    "charging": "estacion de carga: el AGV se enchufa aqui"
+  },
+  "nodes": {
+    "A1": {"cell": [0, 0], "role": "storage"},
+    "A2": {"cell": [0, 1], "role": "storage"},
+    "B1": {"cell": [1, 0], "role": "dock", "capacity": 1},
+    "B2": {"cell": [1, 1], "role": "charging", "capacity": 1},
+    "C1": {"cell": [2, 0], "role": "storage"},
+    "C2": {"cell": [2, 1], "role": "storage"}
+  },
+  "boxes": [
+    {"id": "A1-L1", "node": "A1", "level": 1},
+    {"id": "A1-L2", "node": "A1", "level": 2},
+    {"id": "A2-L1", "node": "A2", "level": 1},
+    {"id": "C1-L1", "node": "C1", "level": 1},
+    {"id": "C2-L1", "node": "C2", "level": 1},
+    {"id": "C2-L2", "node": "C2", "level": 2}
+  ],
+  "positions": {
+    "A1": [0.0, 0.0],
+    "A2": [0.0, 5.0],
+    "B1": [5.0, 0.0],
+    "B2": [5.0, 5.0],
+    "C1": [10.0, 0.0],
+    "C2": [10.0, 5.0]
+  },
+  "adjacency": {
+    "A1": {"A2": 5.0, "B1": 5.0},
+    "A2": {"A1": 5.0, "B2": 5.0},
+    "B1": {"A1": 5.0, "B2": 5.0, "C1": 5.0},
+    "B2": {"A2": 5.0, "B1": 5.0, "C2": 5.0},
+    "C1": {"B1": 5.0, "C2": 5.0},
+    "C2": {"B2": 5.0, "C1": 5.0}
+  }
+}

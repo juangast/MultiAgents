@@ -1,53 +1,11 @@
-"""La simulacion de verdad: AGVs recorriendo el grafo del almacen.
+"""El almacen en marcha: ticks, conflictos, desatasco y snapshot.
 
-Sustituye a la `FakeSimulation` de la fase 1 y cumple el mismo contrato,
-`protocol.Simulation` (`get_snapshot()` + `reset()`), asi que el servidor la
-acepta sin cambiar una linea de transporte.
+Cada tick va en dos fases dentro del mismo paso: primero cada AGV parado declara
+a que nodo quiere entrar, y despues se detectan los conflictos, la politica
+decide quien cede y solo entonces se mueve a alguien.
 
-El movimiento es continuo: un agente tarda `cost(a, b)` ticks en cruzar un tramo
-y su `progress` avanza `1/cost` por tick, asi que el snapshot lleva la posicion
-ya interpolada entre los dos nodos y Unity no ve teletransportes.
-
-Desde la fase 5 el tick va **en dos fases**, las dos dentro del mismo paso:
-
-    FASE A  cada agente parado en un nodo declara a cual quiere entrar
-    FASE B  se detectan los conflictos, la politica decide quien cede,
-            y solo entonces se mueve a nadie
-
-Que las dos fases quepan en un tick no es un detalle: declarar la intencion no
-puede costar un paso extra, o un AGV solo tardaria el doble en cruzar el almacen
-y las medidas de la fase 3 dejarian de valer.
-
-La politica es **intercambiable** (`conflicts.Policy`). Por defecto entra
-`BaselinePolicy`, que es la referencia experimental; el Q-Learning entra por el
-mismo hueco, y desde la fase 8 basta con nombrarlo:
-
-    Simulation(grafo, 4, policy="qlearning", model="python/models/q_table.json")
-
---- Fase 8: A* dice POR DONDE, Q-Learning dice QUE HACER AHORA ---
-
-El bucle de cada AGV en cada tick, entero:
-
-    1. recibe la tarea origen -> destino          Simulation._planea_rutas / routes
-    2. A* traza el path                           Agent.assign_task -> astar.astar
-    3. consulta el siguiente nodo del path        FASE A, _fase_a_intenciones
-    4. construye el estado local (5 enteros)      qlearning.get_local_state
-    5. la politica elige ADVANCE/WAIT/REROUTE     policy.decide   <- lo unico que cambia de modo
-    6. ADVANCE y es seguro  -> se mueve           _puede_entrar + _empieza_travesia
-    7. WAIT                 -> espera y acumula   _cede_el_paso
-    8. REROUTE              -> penaliza y A* otra vez   _recalcula
-    9. repetir hasta completar la tarea
-
-**Ninguna accion elige un nodo.** La ruta la traza A*; lo que se aprende es solo
-que conviene hacer ahora con la ruta que ya se tiene. Y una accion es una
-INTENCION, no una garantia: el motor sigue siendo la autoridad y el gate fisico
-puede negarla, con lo que el AGV se queda donde estaba y (al entrenar) cobra el
--20 de haberlo intentado.
-
-**`policy` es la unica variable experimental.** Con `baseline` y con `qlearning`
-corre exactamente el mismo motor: mismo mapa, mismas rutas, misma semilla, misma
-deteccion de conflictos, mismo desatasco y misma caducidad de penalizaciones. Si
-cambiara algo mas, comparar las dos corridas no mediria la politica.
+A* dice POR DONDE y la politica dice QUE HACER AHORA: ninguna accion elige un
+nodo. `policy` es la unica variable experimental.
 """
 
 import math
@@ -55,38 +13,52 @@ import random
 import threading
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import astar
 import config
 import conflicts
-import protocol
-from agent import STATE_DONE, STATE_IDLE, STATE_MOVING, STATE_WAITING, Agent
-from graph import WarehouseGraph
-from logs import get_logger
+import missions
+import server
+from agent import Agent, Leg, State
+from graph import (
+    ROLE_CHARGING,
+    ROLE_DOCK,
+    Penalties,
+    TemporaryPenalties,
+    WarehouseGraph,
+    astar,
+    path_cost,
+    to_unity,
+)
+from config import get_logger
 
 log = get_logger("simulation")
 
-# Razon por la que una corrida se da por terminada antes de tiempo.
 FINISHED_DEADLOCK: str = "deadlock"
 
-# Ruta de demostracion de cada mapa. En `warehouse` cruza el cuello de botella G
-# a proposito: es el tramo por el que pasan todos los escenarios de congestion.
 DEFAULT_ROUTES: dict[str, tuple[str, str]] = {
     "simple": ("A", "F"),
     "warehouse": ("S1", "N6"),
 }
 
 
-def default_route(graph: WarehouseGraph) -> tuple[str, str]:
-    """Origen y destino por defecto del mapa.
+DEADLOCK_FORCE_TICKS: int = 8
+YIELD_TICKS: int = 10
+STARVED_TICKS: int = 45
+REROUTE_COOLDOWN: int = 8
+SERVE_EPSILON: float = 0.0
+SERVE_MIN_VISITS: int = 30
 
-    Si el mapa no esta en la tabla (o la pareja ya no existe en el), tira del
-    primer y el ultimo nodo, que `nodes()` devuelve ordenados y por tanto son
-    siempre los mismos.
-    """
+
+def _recta(graph: WarehouseGraph, a: str, b: str) -> float:
+    """Distancia en linea recta entre dos nodos. 0.0 si falta una posicion."""
+    p, q = graph.positions.get(a), graph.positions.get(b)
+    return 0.0 if p is None or q is None else math.dist(p, q)
+
+
+def default_route(graph: WarehouseGraph) -> tuple[str, str]:
+    """Origen y destino por defecto del mapa."""
     ruta = DEFAULT_ROUTES.get(graph.name)
     if ruta is not None and all(nodo in graph.adjacency for nodo in ruta):
         return ruta
@@ -97,25 +69,22 @@ def default_route(graph: WarehouseGraph) -> tuple[str, str]:
     return nodos[0], nodos[-1]
 
 
-@dataclass(frozen=True, slots=True)
 class ActionRecord:
-    """Que decidio un AGV en un tick, y que le concedio el motor.
+    """Que decidio un AGV en un tick, y que le concedio el motor."""
 
-    Los dos lados van juntos a proposito: `action` es lo que la politica QUISO y
-    `blocked` es lo que el motor CONTESTO. Esa diferencia es la fase 8 entera, y
-    es lo que sale al snapshot para que Unity la pueda pintar y lo que el
-    entrenamiento cobra a -20.
-
-    `forced` marca al que el desatasco obligo a hacer algo distinto de lo que
-    eligio. `reroute` lleva la (ruta vieja, ruta nueva) si este tick hubo
-    recalculo, que es lo que `qlearning.is_useless_reroute()` necesita.
-    """
-
-    action: str
-    step: int
-    blocked: bool = False
-    forced: bool = False
-    reroute: tuple[tuple[str, ...], tuple[str, ...]] | None = None
+    def __init__(
+        self,
+        action: str,
+        step: int,
+        blocked: bool = False,
+        forced: bool = False,
+        reroute: tuple[tuple[str, ...], tuple[str, ...]] | None = None,
+    ) -> None:
+        self.action = action
+        self.step = step
+        self.blocked = blocked
+        self.forced = forced
+        self.reroute = reroute
 
 
 def make_policy(
@@ -124,28 +93,14 @@ def make_policy(
     model: str | Path | None = None,
     seed: int = config.RANDOM_SEED,
 ) -> conflicts.Policy:
-    """Monta una politica por su nombre: `"baseline"` o `"qlearning"`.
-
-    Es lo que permite que el modo sea un parametro y no un import: `main.py serve
-    --policy qlearning` y el comando `SET_MODE` pasan por aqui, y ninguno de los
-    dos sabe nada de Q-tables.
-
-    El import de `qlearning` es **perezoso** y no puede ser de otra forma:
-    `qlearning` importa este modulo arriba del todo, asi que al reves solo cabe
-    diferido. Cuando esta funcion corre, `qlearning` ya esta cargado o se carga
-    sin ciclo, porque `simulation` ya termino de importarse.
-
-    Sin modelo legible lanza `ValueError` en vez de servir una Q-table vacia: una
-    tabla a ceros siempre avanza, o sea que pareceria funcionar sin haber
-    aprendido nada, y eso es peor que un error.
-    """
+    """Monta una politica por su nombre: `"baseline"` o `"qlearning"`."""
     nombre = str(name).strip().lower()
 
     if nombre == config.POLICY_BASELINE:
         return conflicts.BaselinePolicy()
 
     if nombre == config.POLICY_QLEARNING:
-        import qlearning  # perezoso: ver el docstring
+        import qlearning
 
         ruta = Path(model) if model is not None else config.Q_TABLE_FILE
         if not ruta.is_file():
@@ -153,11 +108,6 @@ def make_policy(
                 f"no existe la Q-table {ruta}; entrenala antes con: "
                 f"python3 python/main.py train --map {config.DEFAULT_MAP}"
             )
-        # La politica se sirve con el action set con el que se ENTRENO, no con
-        # el que diga `config.ENABLE_REROUTE`. Servir un modelo fuera de su
-        # action set no da error: da una politica que elige a ciegas la columna
-        # que nunca aprendio, porque esa sigue a ceros y el cero le gana a todo
-        # lo aprendido (la recompensa del almacen es casi toda negativa).
         entrenada_con_reroute = qlearning.trained_enable_reroute(ruta)
         if entrenada_con_reroute is False and config.ENABLE_REROUTE:
             log.info(
@@ -166,7 +116,7 @@ def make_policy(
             )
 
         visitas = qlearning.load_action_visits(ruta)
-        if not visitas and config.SERVE_MIN_VISITS > 0:
+        if not visitas and SERVE_MIN_VISITS > 0:
             log.warning(
                 "%s no guarda las visitas por celda: sin ellas no se puede "
                 "filtrar lo que la tabla no llego a aprender (reentrenala)",
@@ -174,12 +124,12 @@ def make_policy(
             )
 
         return qlearning.QLearningPolicy(
-            qlearning.QTable.load(ruta),
-            epsilon=config.SERVE_EPSILON,
+            qlearning.load_qtable(ruta),
+            epsilon=SERVE_EPSILON,
             seed=seed,
             enable_reroute=entrenada_con_reroute,
             visits=visitas,
-            min_visits=config.SERVE_MIN_VISITS,
+            min_visits=SERVE_MIN_VISITS,
         )
 
     raise ValueError(
@@ -189,17 +139,7 @@ def make_policy(
 
 
 class Simulation:
-    """El almacen en marcha: un grafo, sus agentes y el contador de pasos.
-
-    Es segura entre hilos porque el servidor comparte una sola instancia entre
-    todos los clientes. El cerrojo es un `RLock` y no un `Lock` porque
-    `get_snapshot()` re-entra en `tick()`.
-
-    La invariante del almacen: **un nodo no tiene nunca dos agentes**. La
-    sostiene `occupancy`, que es `nodo -> agent_id`. Lo contrario si vale: un
-    agente a media travesia retiene los dos extremos del tramo y suelta el de
-    salida solo cuando llega (reserva doble, explicada en `conflicts`).
-    """
+    """El almacen en marcha: un grafo, sus agentes y el contador de pasos."""
 
     def __init__(
         self,
@@ -212,13 +152,9 @@ class Simulation:
         policy: conflicts.Policy | str | None = None,
         model: str | Path | None = None,
         routes: Sequence[tuple[str, str]] | None = None,
+        deliveries: bool = False,
     ) -> None:
-        """`policy` acepta el nombre del modo (`"baseline"` / `"qlearning"`) o un
-        objeto que cumpla `conflicts.Policy`. Con un nombre lo monta
-        `make_policy()` y la simulacion se lo ata con `bind()`, para que el
-        estado local salga exacto; con un objeto se usa tal cual y atarlo es
-        cosa de quien lo construyo (asi sigue valiendo lo de la fase 6/7).
-        """
+        """`policy` acepta el nombre del modo (`"baseline"` / `"qlearning"`) o un"""
         if routes is not None:
             n_agents = len(routes)
         if n_agents < 1:
@@ -226,8 +162,6 @@ class Simulation:
 
         nodos = graph.nodes()
         if n_agents > len(nodos):
-            # No es un capricho: dos AGVs no pueden arrancar en el mismo nodo, y
-            # sin nodos de sobra no hay reparto posible que respete la invariante.
             raise ValueError(
                 f"no caben {n_agents} agentes en un mapa de {len(nodos)} nodo(s): "
                 f"cada AGV necesita un nodo de salida para el solo"
@@ -238,8 +172,6 @@ class Simulation:
         self.seed: int = seed
         self._model: str | Path | None = model
         self.policy: conflicts.Policy = conflicts.BaselinePolicy()
-        # `mode` es el nombre de la politica activa, y es lo que sale al
-        # snapshot: la UNICA variable experimental de la fase 8.
         self.mode: str = self.policy.name
         self._lock = threading.RLock()
 
@@ -252,13 +184,22 @@ class Simulation:
             else self._planea_rutas(n_agents)
         )
 
+        self.deliveries: bool = bool(deliveries)
+        self.bus: missions.MessageBus = missions.MessageBus()
+        self.manager: missions.MissionManager | None = (
+            missions.MissionManager(self.bus, graph) if self.deliveries else None
+        )
+        self.inventory: dict[str, missions.BoxState] = (
+            missions.build_inventory(graph) if self.deliveries else {}
+        )
+        self.delivered: int = 0
+        self.picked: int = 0
+
         self.agents: list[Agent] = [
             Agent(numero, graph, origen)
             for numero, (origen, _) in enumerate(self._rutas, start=1)
         ]
 
-        # Estado de la fase 5. `deadlocks` es el unico que sobrevive al reset:
-        # cuenta los atascos de la sesion entera, no los de la corrida.
         self.occupancy: dict[str, int] = {}
         self.conflicts: conflicts.ConflictLog = conflicts.ConflictLog()
         self.run: int = 0
@@ -267,25 +208,15 @@ class Simulation:
         self._ticks_sin_avance: int = 0
         self._zonas: frozenset[str] = frozenset()
 
-        # Estado de la fase 8. Las penalizaciones son UNA tabla compartida por
-        # todo el almacen: que G este congestionado es un hecho del mapa, no una
-        # opinion de un AGV. Y caducan, o el mapa se degradaria para siempre.
-        self.penalties: astar.TemporaryPenalties = astar.TemporaryPenalties()
+        self.penalties: TemporaryPenalties = TemporaryPenalties()
         self._acciones: dict[int, ActionRecord] = {}
-        # nodo -> (a quien se le reservo, en que paso caduca). Ver `_puede_entrar`.
         self._reservas: dict[str, tuple[int, int]] = {}
-        # Ticks seguidos que lleva cada AGV sin moverse ni un poco. Es lo que
-        # dispara el desatasco, y va por agente y no por almacen: un AGV puede
-        # morirse de hambre en un rincon mientras los demas dan vueltas, y un
-        # contador global de "no se movio nadie" no lo veria nunca.
         self._parado: dict[int, int] = {}
-        # En que paso podra volver a recalcular cada AGV. Ver `_recalcula`.
         self._proximo_reroute: dict[int, int] = {}
-        self._recuento: dict[str, int] = dict.fromkeys(conflicts.INTENTS, 0)
+        self._recuento: dict[str, int] = dict.fromkeys(conflicts.Intent, 0)
         self._forzados: int = 0
         self._por_id: dict[int, Agent] = {a.id: a for a in self.agents}
 
-        # Lo ultimo: `bind()` tiene que recibir una simulacion ya montada.
         if policy is not None:
             self._monta_politica(policy)
 
@@ -295,9 +226,6 @@ class Simulation:
         """Deja lista la politica, venga por nombre o ya construida."""
         if isinstance(policy, str):
             self.policy = make_policy(policy, model=self._model, seed=self.seed)
-            # Solo se ata la que monta la simulacion: una politica que le llega
-            # ya construida es de quien la construyo, y atarla por detras le
-            # cambiaria el estado que ve sin habermelo pedido.
             atar = getattr(self.policy, "bind", None)
             if atar is not None:
                 atar(self)
@@ -311,26 +239,31 @@ class Simulation:
             f"step={self.step}, mode={self.mode!r})"
         )
 
-    @property
     def done(self) -> bool:
         """True cuando ya ningun agente tiene nada que hacer, o hay deadlock."""
         with self._lock:
             if self.finished_reason is not None:
                 return True
-            return all(
-                agente.state in (STATE_DONE, STATE_IDLE) for agente in self.agents
+            parados = all(
+                agente.state in (State.DONE, State.IDLE, State.CHARGING)
+                for agente in self.agents
             )
+            if self.manager is None:
+                return parados
+            entregadas = all(
+                caja.status is missions.BoxStatus.DELIVERED
+                for caja in self.inventory.values()
+            )
+            return parados and entregadas
 
     def tick(self) -> int:
-        """Avanza la simulacion un paso y devuelve el numero de paso.
-
-        El contador sube siempre, aunque todos los agentes hayan llegado: el
-        cliente de Unity comprueba que `step` crece de una peticion a la
-        siguiente y no debe verlo estancarse nunca.
-        """
+        """Avanza la simulacion un paso y devuelve el numero de paso."""
         with self._lock:
             self.step += 1
+            self._fase_bateria()
+            self._fase_subasta()
             self._cierra_los_que_llegaron()
+            self._fase_maniobras()
 
             huella = self._huella()
             por_agente = self._huella_por_agente()
@@ -341,18 +274,19 @@ class Simulation:
 
             return self.step
 
-    def get_snapshot(self) -> protocol.Snapshot:
-        """Avanza un paso y devuelve el estado completo en coordenadas de Unity.
+    def snapshot(self) -> server.Snapshot:
+        """El estado ahora mismo, en coordenadas de Unity. **No avanza el reloj.**"""
+        with self._lock:
+            return {
+                "step": self.step,
+                "agents": [self._describe(agente) for agente in self.agents],
+                "stats": self.stats(),
+                "boxes": [caja.as_dict() for caja in self.inventory.values()],
+                "mode": self.mode,
+            }
 
-        Que la peticion sea la que mueve el mundo es el contrato de la fase 1:
-        Python no empuja nada por su cuenta, y dos clientes a la vez ven pasos
-        distintos porque cada `GET_STATE` consume su propio tick.
-
-        Si la corrida anterior murio atascada se arranca otra aqui. El snapshot
-        del atasco ya se entrego una vez, con `stats.finished_reason` puesto, asi
-        que Unity llego a verlo; dejarlo congelado para siempre solo serviria
-        para que pareciera que el servidor se ha colgado.
-        """
+    def get_snapshot(self) -> server.Snapshot:
+        """Avanza un paso y devuelve el estado. Es lo que pide `POST /step`."""
         with self._lock:
             if self.finished_reason == FINISHED_DEADLOCK:
                 log.warning(
@@ -363,16 +297,7 @@ class Simulation:
                 self.reset()
 
             self.tick()
-            return {
-                "step": self.step,
-                "agents": [self._describe(agente) for agente in self.agents],
-                # Lo que agrega la fase 5, por encima del formato congelado.
-                "stats": self.stats(),
-                # Lo que agrega la fase 8: que politica esta corriendo. Es lo
-                # mismo que `stats.policy`, pero arriba del todo, que es donde
-                # Unity lo quiere para pintarlo en pantalla sin bucear.
-                "mode": self.mode,
-            }
+            return self.snapshot()
 
     def stats(self) -> dict[str, Any]:
         """Los numeros de la corrida, que son con los que se compara el baseline.
@@ -384,40 +309,37 @@ class Simulation:
             return {
                 "run": self.run,
                 "policy": self.policy.name,
-                "conflicts": self.conflicts.total,
-                "conflicts_by_type": self.conflicts.by_type,
+                "conflicts": self.conflicts.total(),
+                "conflicts_by_type": self.conflicts.by_type(),
                 "deadlocks": self.deadlocks,
                 "waiting": sum(
-                    1 for agente in self.agents if agente.state == STATE_WAITING
+                    1 for agente in self.agents if agente.state == State.WAITING
                 ),
                 "total_wait_time": sum(agente.wait_time for agente in self.agents),
                 "finished_reason": self.finished_reason,
-                # Lo que agrega la fase 8.
                 "actions": dict(self._recuento),
                 "forced": self._forzados,
                 "penalties": len(self.penalties),
+                "deliveries": self.deliveries,
+                "picked": self.picked,
+                "delivered": self.delivered,
+                "missions_pending": (
+                    len(self.manager.pool()) if self.manager is not None else 0
+                ),
+                "missions_total": (
+                    len(self.manager.missions) if self.manager is not None else 0
+                ),
+                "boxes_delivered": sum(
+                    1 for c in self.inventory.values()
+                    if c.status is missions.BoxStatus.DELIVERED
+                ),
+                "messages": len(self.bus),
+                "battery": [round(a.battery, 1) for a in self.agents],
+                "charges": sum(a.charges for a in self.agents),
             }
 
-    def conflict_records(self) -> list[dict[str, Any]]:
-        """Los conflictos de la corrida en JSON: paso, tipo y agentes de cada uno."""
-        with self._lock:
-            return self.conflicts.records()
-
     def set_mode(self, mode: str, *, model: str | Path | None = None) -> str:
-        """Cambia de politica **en caliente** y arranca una corrida limpia.
-
-        Es lo que hay detras del comando `SET_MODE` del protocolo: en mitad de
-        una demo se pasa de `baseline` a `qlearning` sin reiniciar el servidor ni
-        que Unity se entere de nada mas que de un `run` nuevo.
-
-        **Siempre resetea**, incluso si el modo pedido es el que ya estaba: media
-        corrida con una politica y media con otra no es una corrida de ninguna de
-        las dos, y no habria forma de leer sus numeros. Lo unico que sobrevive es
-        `deadlocks`, que cuenta los de la sesion.
-
-        Lanza `ValueError` si el modo no existe o si falta la Q-table, y en ese
-        caso **no toca nada**: la corrida que estaba en marcha sigue como estaba.
-        """
+        """Cambia de politica **en caliente** y arranca una corrida limpia."""
         with self._lock:
             if model is not None:
                 self._model = model
@@ -439,12 +361,7 @@ class Simulation:
             return self._acciones.get(agent_id)
 
     def reset(self) -> None:
-        """Vuelve al paso cero y reparte otra vez las mismas tareas.
-
-        Determinista: con la misma semilla y el mismo mapa, dos simulaciones
-        recien reiniciadas producen exactamente la misma secuencia de snapshots.
-        Lo unico que no se borra es `deadlocks`, que cuenta atascos de la sesion.
-        """
+        """Vuelve al paso cero y reparte otra vez las mismas tareas."""
         with self._lock:
             self.step = 0
             self.run += 1
@@ -454,19 +371,28 @@ class Simulation:
             self.conflicts.clear()
             self.occupancy = {}
 
-            # Lo de la fase 8. Las penalizaciones no se heredan de una corrida a
-            # otra: el atasco que las provoco ya no existe.
             self.penalties.clear()
             self._acciones.clear()
             self._reservas.clear()
             self._parado.clear()
             self._proximo_reroute.clear()
-            self._recuento = dict.fromkeys(conflicts.INTENTS, 0)
+            self._recuento = dict.fromkeys(conflicts.Intent, 0)
             self._forzados = 0
+
+            self.delivered = 0
+            self.picked = 0
+            self.bus.clear()
+            if self.manager is not None:
+                self.manager = missions.MissionManager(self.bus, self.graph)
+                self.inventory = missions.build_inventory(self.graph)
 
             for agente, (origen, destino) in zip(self.agents, self._rutas):
                 agente.reset()
-                agente.assign_task(origen, destino, task=agente.id)
+                if self.deliveries:
+                    agente.current_node = origen
+                    agente.state = State.IDLE
+                else:
+                    agente.assign_task(origen, destino, task=agente.id)
                 self.occupancy[agente.current_node] = agente.id
 
             log.info(
@@ -480,14 +406,7 @@ class Simulation:
     def _comprueba_rutas(
         self, routes: Sequence[tuple[str, str]]
     ) -> list[tuple[str, str]]:
-        """Acepta un reparto de tareas escrito a mano, si es que se sostiene.
-
-        Es el gancho para montar escenarios: un cruce de frente, un embudo, lo
-        que haga falta demostrar, sin depender de lo que saque la semilla. Los
-        origenes tienen que ser distintos por la misma razon que en
-        `_planea_rutas()`: dos AGVs en el mismo nodo rompen la invariante antes
-        de que la simulacion llegue a mover nada.
-        """
+        """Acepta un reparto de tareas escrito a mano, si es que se sostiene."""
         rutas = [(str(origen), str(destino)) for origen, destino in routes]
 
         desconocidos = sorted(
@@ -507,21 +426,10 @@ class Simulation:
         return rutas
 
     def _planea_rutas(self, n_agents: int) -> list[tuple[str, str]]:
-        """Reparte origen y destino, siempre igual para la misma semilla.
-
-        El primer agente hace la ruta fija del mapa, que es la que se demuestra.
-        Los demas salen del generador sembrado con `seed`.
-
-        Origenes **sin repetir**, que es lo que cambia en la fase 5: si dos AGVs
-        arrancan en el mismo nodo la invariante nace rota, antes de mover nada.
-        Los destinos tampoco se repiten: un AGV aparcado encima del destino de
-        otro lo bloquea para siempre, y eso seria un deadlock del reparto, no del
-        trafico, que es lo que aqui interesa medir.
-        """
+        """Reparte origen y destino, siempre igual para la misma semilla."""
         rutas = [(self._origen, self._destino)]
         nodos = self.graph.nodes()
         if len(nodos) < 2:
-            # Un mapa de un solo nodo: no hay de donde sacar pares distintos.
             return rutas * n_agents
         if n_agents == 1:
             return rutas
@@ -532,26 +440,283 @@ class Simulation:
         rutas.extend(zip(origenes, destinos))
         return rutas
 
-    # --- El tick, en dos fases ----------------------------------------------
 
     def _cierra_los_que_llegaron(self) -> None:
         """Pasa a `done` al que ya no tiene siguiente nodo. Antes de declarar nada."""
         for agente in self.agents:
-            if agente.state == STATE_MOVING and agente.next_node() is None:
-                agente.state = STATE_DONE
+            if agente.state == State.MOVING and agente.next_node() is None:
                 agente.progress = 0.0
+                if not self._empieza_maniobra(agente):
+                    agente.state = State.DONE
+
+    def _suelta_mision(self, agente: Agent) -> None:
+        """Devuelve a la bolsa la mision de un AGV que no la puede terminar.
+
+        Sin esto, un AGV varado se queda la mision cogida para siempre: la caja
+        no vuelve a publicarse, nadie mas puede ir a por ella y la corrida no
+        termina nunca. La caja se queda donde este, y desde ahi se vuelve a
+        pedir su trabajo.
+        """
+        if self.manager is None or agente.mission is None:
+            return
+
+        mision = self.manager.missions.pop(agente.mission, None)
+        caja = self.inventory.get(mision.box) if mision is not None else None
+        if caja is not None:
+            caja.mission = None
+            caja.node = agente.current_node if agente.carrying else caja.node
+            caja.status = (
+                missions.BoxStatus.DELIVERED
+                if self.graph.role_of(caja.node) == ROLE_DOCK
+                else missions.BoxStatus.STORED
+            )
+        agente.mission = None
+        agente.carrying = None
+        agente.leg = Leg.NONE
+
+    def _aterriza_caja(self, mission, nodo: str) -> None:
+        """Deja la caja en el nodo donde el AGV la solto y le pone su estado.
+
+        En un muelle la caja termina su viaje; en una estanteria queda guardada,
+        y al soltar su mision el manager le abrira la de salida en el paso
+        siguiente. Ese es el encadenado de los dos flujos.
+        """
+        caja = self.inventory.get(mission.box)
+        if caja is None:
+            return
+        caja.node = nodo
+        caja.mission = None
+        if self.graph.role_of(nodo) == ROLE_DOCK:
+            caja.status = missions.BoxStatus.DELIVERED
+        else:
+            caja.status = missions.BoxStatus.STORED
+
+    def _fase_bateria(self) -> None:
+        """Los enchufados cargan; el que se quedo a cero se queda tirado."""
+        for agente in self.agents:
+            if agente.state == State.CHARGING:
+                if agente.charge():
+                    agente.charges += 1
+                    agente.state = State.IDLE
+                    log.debug("paso %3d | AGV %s | cargado al 100%%, vuelve a pujar",
+                              self.step, agente.id)
+            elif (
+                agente.mission is not None
+                and agente.leg is not Leg.TO_CHARGER
+                and not agente.can_reach_charger(
+                    self.graph.nodes_with_role(ROLE_CHARGING)
+                )
+            ):
+                log.warning(
+                    "AGV %s abandona %s al %.0f%%: no llegaria a un cargador",
+                    agente.id, agente.mission, agente.battery,
+                )
+                self._suelta_mision(agente)
+                self._al_cargador(agente)
+
+            elif agente.is_dead():
+                if agente.mission is not None:
+                    log.warning("AGV %s se quedo sin bateria en %s con %s a medias",
+                                agente.id, agente.current_node, agente.mission)
+                    self._suelta_mision(agente)
+                agente.state = State.IDLE
+
+    def _al_cargador(self, agente: Agent) -> bool:
+        """Le traza ruta al cargador mas cercano. False si no hay ninguno."""
+        cargadores = self.graph.nodes_with_role(ROLE_CHARGING)
+        if not cargadores:
+            return False
+
+        candidatos = sorted(
+            (d, nodo)
+            for nodo in cargadores
+            if (d := agente.distance_to(nodo)) is not None
+        )
+        for _, nodo in candidatos:
+            if agente.assign_task(
+                agente.current_node, nodo, task=agente.task, penalties=self.penalties
+            ):
+                agente.leg = Leg.TO_CHARGER
+                if len(agente.path) == 1:
+                    agente.leg = Leg.NONE
+                    agente.state = State.CHARGING
+                self.bus.publish(missions.Message(
+                    self.step, f"AGV-{agente.id}", "MANAGER",
+                    missions.MessageType.CHARGING,
+                    {"agv": agente.id, "estacion": nodo,
+                     "bateria": round(agente.battery, 1)},
+                ))
+                log.debug("paso %3d | AGV %s | al %.0f%% se va a cargar a %s",
+                          self.step, agente.id, agente.battery, nodo)
+                return True
+        return False
+
+    def _fase_subasta(self) -> None:
+        """El manager publica, cada AGV puja por su cuenta y se reparte lo ganado.
+
+        Es todo el reparto de trabajo del almacen: aqui nadie asigna nada, el
+        motor solo traslada al AGV lo que su propia puja le gano.
+        """
+        if self.manager is None:
+            return
+
+        nuevas = self.manager.open_work(self.inventory)
+        for mision in nuevas:
+            log.debug("paso %3d | MANAGER | abre %s (%s) caja %s en %s -> %s",
+                      self.step, mision.id, mision.flow, mision.box,
+                      mision.node, mision.destination)
+
+        pendientes = self.manager.publish(self.step)
+        if not pendientes:
+            return
+
+        cargadores = self.graph.nodes_with_role(ROLE_CHARGING)
+        for agente in self.agents:
+            agente.bid(self.bus, self.step, pendientes, cargadores)
+
+        for agente, mision, utilidad in missions.resolve_auctions(
+            self.bus, self.step, self.manager, self.agents
+        ):
+            caja = self.inventory.get(mision.box)
+            if caja is None:
+                log.error("la caja %r de %s ya no esta en el mapa", mision.box, mision.id)
+                continue
+            if agente.assign_delivery(
+                agente.current_node, caja, mision.destination,
+                task=agente.id, penalties=self.penalties,
+            ):
+                agente.mission = mision.id
+                caja_viva = self.inventory.get(mision.box)
+                if caja_viva is not None:
+                    caja_viva.status = missions.BoxStatus.RESERVED
+                if agente.has_arrived() and not self._empieza_maniobra(agente):
+                    agente.state = State.DONE
+                log.debug(
+                    "paso %3d | AGV %s | GANA %s (caja %s en %s nivel %d -> %s) con %.1f",
+                    self.step, agente.id, mision.id, caja.id, caja.node,
+                    caja.level, mision.destination, utilidad,
+                )
+            else:
+                mision.status = missions.MissionStatus.PENDING
+                mision.agv_id = None
+                log.warning(
+                    "AGV %s gano %s pero no hay ruta a %s; vuelve a la bolsa",
+                    agente.id, mision.id, caja.node,
+                )
+
+        for agente in self.agents:
+            if (
+                agente.mission is None
+                and agente.state in (State.IDLE, State.DONE)
+                and agente.needs_charge(pendientes, cargadores)
+            ):
+                self._al_cargador(agente)
+
+    def _empieza_maniobra(self, agente: Agent) -> bool:
+        """Pone a recoger o a dejar al que acaba de llegar. False si no tocaba."""
+        if agente.leg == Leg.TO_PICK:
+            caja = self.inventory.get(agente.box) if agente.box else None
+            if caja is None:
+                log.error(
+                    "AGV %s: llego a por la caja %r, que ya no esta en el mapa",
+                    agente.id,
+                    agente.box,
+                )
+                return False
+            agente.start_pick(caja.level)
+            log.debug(
+                "paso %3d | AGV %s | PICK %s en %s nivel %d | %d tick(s)",
+                self.step,
+                agente.id,
+                caja.id,
+                caja.node,
+                caja.level,
+                agente.busy,
+            )
+            return True
+
+        if agente.leg == Leg.TO_CHARGER:
+            agente.leg = Leg.NONE
+            agente.state = State.CHARGING
+            log.debug("paso %3d | AGV %s | enchufado en %s al %.0f%%",
+                      self.step, agente.id, agente.current_node, agente.battery)
+            return True
+
+        if agente.leg == Leg.TO_DROP:
+            agente.start_drop()
+            log.debug(
+                "paso %3d | AGV %s | DROP %s en %s | %d tick(s)",
+                self.step,
+                agente.id,
+                agente.carrying,
+                agente.current_node,
+                agente.busy,
+            )
+            return True
+
+        return False
+
+    def _fase_maniobras(self) -> None:
+        """Gasta un tick de cada recogida y de cada entrega en curso."""
+        for agente in self.agents:
+            if agente.state == State.PICKING:
+                if agente.work():
+                    agente.finish_pick()
+                    self.picked += 1
+                    if self.manager is not None and agente.mission:
+                        mision = self.manager.missions.get(agente.mission)
+                        if mision is not None:
+                            self.manager.picked_up(self.step, mision, agente.id)
+                            caja_viva = self.inventory.get(mision.box)
+                            if caja_viva is not None:
+                                caja_viva.status = missions.BoxStatus.IN_TRANSIT
+                                caja_viva.node = agente.current_node
+                    if agente.route_to_destination(self.penalties):
+                        if len(agente.path) == 1:
+                            agente.start_drop()
+                        else:
+                            agente.state = State.MOVING
+                        log.debug(
+                            "paso %3d | AGV %s | recogio %s, al muelle %s por %s",
+                            self.step,
+                            agente.id,
+                            agente.carrying,
+                            agente.destination,
+                            " -> ".join(agente.path),
+                        )
+                    else:
+                        agente.state = State.IDLE
+                        log.warning(
+                            "AGV %s: recogio %s pero no hay ruta al muelle %s",
+                            agente.id,
+                            agente.carrying,
+                            agente.destination,
+                        )
+
+            elif agente.state == State.DROPPING and agente.work():
+                entregada = agente.carrying
+                agente.finish_drop()
+                self.delivered += 1
+                if self.manager is not None and agente.mission:
+                    mision = self.manager.missions.get(agente.mission)
+                    if mision is not None:
+                        self.manager.finished(self.step, mision, agente.id)
+                        self._aterriza_caja(mision, agente.current_node)
+                    agente.completed += 1
+                    agente.mission = None
+                log.debug(
+                    "paso %3d | AGV %s | entrego %s en %s",
+                    self.step,
+                    agente.id,
+                    entregada,
+                    agente.current_node,
+                )
 
     def _fase_a_intenciones(self) -> dict[int, str]:
-        """FASE A: cada agente parado dice a que nodo quiere entrar este tick.
-
-        Solo declaran los que estan **parados en un nodo** (`progress == 0`). El
-        que va a media travesia ya tiene su reserva concedida de un tick anterior
-        y no vuelve a pedirla; el que espera si declara, porque sigue queriendo
-        pasar y en cuanto le dejen, pasa.
-        """
+        """FASE A: cada agente parado dice a que nodo quiere entrar este tick."""
         intenciones: dict[int, str] = {}
         for agente in self.agents:
-            if agente.state not in (STATE_MOVING, STATE_WAITING):
+            if agente.state not in (State.MOVING, State.WAITING):
                 continue
             if agente.progress > 0.0:
                 continue
@@ -561,15 +726,13 @@ class Simulation:
                 continue
 
             if not self.graph.has_edge(agente.current_node, siguiente):
-                # A* nunca produce esto; solo puede pasar si alguien manipulo el
-                # `path` a mano. Se para el agente en vez de reventar la simulacion.
                 log.error(
                     "AGV %s: su ruta pasa por %s -> %s, que no es una arista del mapa",
                     agente.id,
                     agente.current_node,
                     siguiente,
                 )
-                agente.state = STATE_IDLE
+                agente.state = State.IDLE
                 agente.progress = 0.0
                 continue
 
@@ -577,23 +740,7 @@ class Simulation:
         return intenciones
 
     def _fase_b_resuelve_y_aplica(self, intenciones: dict[int, str]) -> None:
-        """FASE B: detectar -> decidir -> desatascar -> aplicar. En ese orden.
-
-        El conflicto se ve **antes** de mover a nadie: la deteccion trabaja sobre
-        las intenciones y sobre la ocupacion tal y como estaban al empezar el
-        tick, asi que el perdedor de un choque termina el tick exactamente donde
-        empezo.
-
-        Los cuatro tramos, y quien manda en cada uno:
-
-            deteccion      el motor, igual que en la fase 5
-            decision       LA POLITICA: advance / wait / reroute   <- lo unico que cambia de modo
-            desatasco      el motor, que puede pisar la decision
-            aplicacion     el motor, con el gate fisico por delante
-
-        Que la decision este en medio y no al final es la fase 8 entera: la
-        politica propone y el motor dispone.
-        """
+        """FASE B: detectar -> decidir -> desatascar -> aplicar. En ese orden."""
         detectados = conflicts.detect_conflicts(
             intenciones,
             self.graph,
@@ -605,15 +752,8 @@ class Simulation:
         self._registra(detectados)
         bloqueado_por, suyos = self._arbitra(detectados)
 
-        # Los que ya iban a media travesia se apuntan ahora, antes de tocar la
-        # ocupacion: se mueven al final del tick para que las decisiones de los
-        # que estan parados se tomen todas contra la misma foto del almacen. Si
-        # se movieran primero, el que llega soltaria su nodo de salida a mitad de
-        # tick y otro podria colarse detras: eso es el following, y no se permite.
         en_travesia = [agente for agente in self.agents if agente.progress > 0.0]
 
-        # PASOS 4 y 5: cada AGV parado construye su estado local y elige. Es una
-        # INTENCION: aqui no se mueve nadie todavia.
         acciones: dict[int, str] = {}
         for agente in self.agents:
             destino = intenciones.get(agente.id)
@@ -625,10 +765,8 @@ class Simulation:
                 )
             )
 
-        # El motor manda: si lleva K ticks sin avanzar nadie, pisa la intencion.
         forzados = self._desatasca(intenciones, acciones)
 
-        # PASOS 6, 7 y 8: el motor aplica lo que se pueda aplicar.
         for agente in self.agents:
             destino = intenciones.get(agente.id)
             if destino is None:
@@ -637,24 +775,17 @@ class Simulation:
             accion = acciones[agente.id]
             self._recuento[accion] += 1
 
-            # PASO 8: el REROUTE lo ejecuta el MOTOR, no la politica. No mueve al
-            # AGV en este tick (la intencion ya se fijo en la fase A), asi que la
-            # ruta nueva empieza a valer en el siguiente y este cuesta una espera.
             recalculo = (
                 self._recalcula(agente)
-                if accion == conflicts.INTENT_REROUTE
+                if accion == conflicts.Intent.REROUTE
                 else None
             )
 
-            # PASO 6: el gate fisico. Diga lo que diga la politica, en un nodo
-            # ocupado no se entra. Es lo que hace la invariante inviolable venga
-            # la politica que venga, y lo que convierte ADVANCE en una intencion.
-            quiere_pasar = accion == conflicts.INTENT_ADVANCE
+            quiere_pasar = accion == conflicts.Intent.ADVANCE
             pasa = quiere_pasar and self._puede_entrar(agente, destino)
             if pasa:
                 self._empieza_travesia(agente, destino)
             else:
-                # PASO 7: se queda, y el reloj de la espera corre.
                 self._cede_el_paso(agente)
 
             self._anota(
@@ -668,11 +799,6 @@ class Simulation:
         for agente in en_travesia:
             self._avanza(agente)
 
-        # El que no decidio nada tambien sale al snapshot: el que venia cruzando
-        # un tramo esta EJECUTANDO un avance —tambien el que lo termina en este
-        # tick, que si no aparecería esperando justo al llegar—, y el que llego o
-        # no tiene ruta no esta haciendo nada, que en el vocabulario de las
-        # acciones es esperar.
         cruzando = {agente.id for agente in en_travesia}
         for agente in self.agents:
             registro = self._acciones.get(agente.id)
@@ -680,14 +806,11 @@ class Simulation:
                 continue
             self._anota(
                 agente,
-                conflicts.INTENT_ADVANCE
+                conflicts.Intent.ADVANCE
                 if agente.id in cruzando or agente.progress > 0.0
-                else conflicts.INTENT_WAIT,
+                else conflicts.Intent.WAIT,
             )
 
-        # Las penalizaciones del REROUTE caducan. Sin esto el mapa se degrada
-        # para siempre y A* acaba esquivando pasillos que llevan cien ticks
-        # libres solo porque una vez hubo alguien delante.
         self.penalties.expire(self.step)
         self._reservas = {
             nodo: reserva
@@ -766,20 +889,9 @@ class Simulation:
                 donde,
             )
 
-    # --- Movimiento ----------------------------------------------------------
 
     def _puede_entrar(self, agente: Agent, destino: str) -> bool:
-        """Dice si el nodo esta libre **para este agente**. Sin excepciones.
-
-        Dos motivos para que no lo este: que lo ocupe otro, que es la invariante
-        de siempre, o que el motor se lo tenga reservado a otro. La reserva la
-        pone el desatasco: cuando manda apartarse a un AGV, le guarda el hueco al
-        que estaba esperando durante `config.YIELD_TICKS` ticks.
-
-        Sin la reserva el desatasco no serviria de nada en el caso mas comun: el
-        que se aparta vuelve al tick siguiente, gana el desempate por id menor y
-        el atasco se rehace igual. Apartarse y volver es no apartarse.
-        """
+        """Dice si el nodo esta libre **para este agente**. Sin excepciones."""
         ocupante = self.occupancy.get(destino)
         if ocupante is not None and ocupante != agente.id:
             return False
@@ -795,9 +907,10 @@ class Simulation:
         """
         costo = self.graph.cost(agente.current_node, destino)
         self.occupancy[destino] = agente.id
-        agente.state = STATE_MOVING
-        # Un tramo de costo cero se cruza en el mismo tick, sin dividir por cero.
+        agente.state = State.MOVING
         agente.progress = 1.0 if costo <= 0.0 else 1.0 / costo
+        if self.deliveries:
+            agente.drain()
         self._llega_si_toca(agente, destino)
 
     def _avanza(self, agente: Agent) -> None:
@@ -807,7 +920,17 @@ class Simulation:
             return
         costo = self.graph.cost(agente.current_node, destino)
         agente.progress = 1.0 if costo <= 0.0 else agente.progress + 1.0 / costo
+        if self.deliveries:
+            agente.drain()
         self._llega_si_toca(agente, destino)
+
+    def _mueve_la_carga(self, agente: Agent) -> None:
+        """La caja que lleva encima va donde va el AGV, como el pallet de M3."""
+        if not agente.carrying:
+            return
+        caja = self.inventory.get(agente.carrying)
+        if caja is not None:
+            caja.node = agente.current_node
 
     def _llega_si_toca(self, agente: Agent, destino: str) -> None:
         """Si el progreso paso de 1.0, planta al agente en el nodo y suelta el otro."""
@@ -820,8 +943,9 @@ class Simulation:
         agente.current_node = destino
         agente.path_index += 1
         agente.progress = 0.0
-        if agente.has_arrived():
-            agente.state = STATE_DONE
+        self._mueve_la_carga(agente)
+        if agente.has_arrived() and not self._empieza_maniobra(agente):
+            agente.state = State.DONE
 
     def _cede_el_paso(self, agente: Agent) -> None:
         """Le toca esperar: no se mueve y suma un tick al reloj de la espera.
@@ -829,31 +953,14 @@ class Simulation:
         `wait_time` **acumula**, no descuenta. Es el tiempo perdido de todo el
         AGV en la corrida, que es la medida con la que se comparan las politicas.
         """
-        agente.state = STATE_WAITING
+        agente.state = State.WAITING
         agente.wait_time += 1
 
-    # --- El REROUTE, ejecutado por el motor ----------------------------------
 
     def _recalcula(
         self, agente: Agent
     ) -> tuple[tuple[str, ...], tuple[str, ...]] | None:
-        """Encarece lo que el AGV tiene delante y le pide a A* otra ruta.
-
-        Devuelve (ruta vieja, ruta nueva), o None si no habia por donde o si el
-        agente iba a media travesia. Aqui esta el reparto de trabajo de la fase 8
-        en dos lineas: **la penalizacion dice que evitar y A* dice por donde**;
-        el Q-Learning no elige ni un nodo.
-
-        La penalizacion va a la tabla compartida de la simulacion, no a un dict
-        de usar y tirar: asi dura `config.PENALTY_TTL` ticks y el AGV no se vuelve
-        a meter en el mismo atasco en el tick siguiente. Y caduca, que es la otra
-        mitad de la idea.
-        """
-        # Si el nodo que tengo delante ES mi destino, no hay ruta que lo
-        # esquive: todas acaban ahi. Recalcular solo daria una vuelta larga para
-        # volver al mismo sitio, y con dos AGVs sentados en el destino del otro
-        # eso es una persecucion en circulo que no termina nunca. Se cobra el
-        # tick de espera igual, que elegir REROUTE aqui fue un error.
+        """Encarece lo que el AGV tiene delante y le pide a A* otra ruta."""
         if agente.next_node() == agente.target_node:
             log.debug(
                 "AGV %s: no hay reroute que esquive %s, que es su destino",
@@ -862,13 +969,9 @@ class Simulation:
             )
             return None
 
-        # Recalcular cuesta, y dos recalculos seguidos no llevan a ningun sitio:
-        # el primero penaliza el nodo de delante y A* da la otra salida, el
-        # segundo penaliza esa y devuelve la primera. Un ir y venir que ademas
-        # encarece medio mapa. Durante la pausa, un REROUTE es esperar.
         if self.step < self._proximo_reroute.get(agente.id, 0):
             return None
-        self._proximo_reroute[agente.id] = self.step + config.REROUTE_COOLDOWN
+        self._proximo_reroute[agente.id] = self.step + REROUTE_COOLDOWN
 
         vieja = tuple(agente.path)
         for clave, cuanto in conflicts.reroute_penalties(agente).items():
@@ -888,7 +991,6 @@ class Simulation:
         )
         return vieja, tuple(nueva)
 
-    # --- Desatasco: el motor no deja que el almacen se pare -------------------
 
     def _fuerza(
         self,
@@ -899,78 +1001,26 @@ class Simulation:
         *,
         ceder: bool,
     ) -> None:
-        """Saca a un AGV del reparto normal del tick: el motor ya decidio por el.
-
-        Hay que sacarlo, no solo cambiarle la accion: al desatascar se le reescribe
-        la ruta, y la intencion que declaro en la FASE A apuntaba a la ruta vieja.
-        Dejarsela puesta le haria entrar en un nodo que ya no es el suyo, y ahi se
-        rompe la invariante del almacen.
-        """
+        """Saca a un AGV del reparto normal del tick: el motor ya decidio por el."""
         intenciones.pop(agente.id, None)
         acciones.pop(agente.id, None)
         self._recuento[accion] += 1
         self._forzados += 1
         if ceder:
-            # El que queria pasar y acaba recalculando pierde el tick igual.
             self._cede_el_paso(agente)
         self._anota(agente, accion, forced=True)
 
     def _desatasca(
         self, intenciones: dict[int, str], acciones: dict[int, str]
     ) -> set[int]:
-        """Cuando alguien lleva demasiado sin poder moverse, el motor manda.
-
-        Mide "no se ha movido" en vez de "eligio WAIT", que cubre lo mismo y
-        ademas el caso que la otra lectura se deja fuera: todos eligiendo ADVANCE
-        contra un bloqueo mutuo. Son **dos atascos distintos y dos umbrales**:
-
-        - El almacen entero parado, `DEADLOCK_FORCE_TICKS` (8) ticks sin que se
-          mueva nadie. Salta muy antes de los `DEADLOCK_TICKS` (20) con los que
-          la corrida se da por muerta: llegados a 20 ya no hay nada que salvar, y
-          de lo que se trata es de no llegar.
-        - Un AGV solo, clavado `STARVED_TICKS` (45) ticks mientras los demas
-          circulan. El contador global no lo ve nunca, porque el almacen SI se
-          esta moviendo, y ese se muere de hambre en silencio.
-
-        Con `DEADLOCK_FORCE_TICKS` a 0 el desatasco se apaga entero y el motor
-        vuelve a ser el de la fase 5.
-
-        La escalada tiene tres peldaños, y se prueban en orden hasta que uno
-        cambia algo:
-
-            1. pasa el de id menor que tenga el nodo libre    (el desempate por prioridad)
-            2. veto temporal y REROUTE al de id mayor         (si de verdad hay otra ruta)
-            3. el que estorba se aparta a un hueco libre      (aunque ya haya terminado)
-
-        El peldaño 3 no es un primitivo de movimiento nuevo: es una ruta de un
-        tramo que pasa por el gate como cualquier otra, asi que la invariante
-        "un nodo, un AGV" sigue intacta.
-
-        Devuelve los ids a los que el motor forzo algo en el bucle de aplicacion
-        (el peldaño 1); los otros dos se apuntan ellos mismos con `_fuerza`. Todos
-        quedan marcados `forced` para que el entrenamiento les cobre el -20: la
-        leccion es que quedarse parado esperando a que pase algo sale caro.
-
-        Lo que **no** resuelve: si no queda un solo nodo libre en todo ese lado
-        del mapa no hay a donde apartarse, y la corrida acaba muriendo como en la
-        fase 5. Hace falta llenar un componente entero para llegar ahi.
-        """
-        if config.DEADLOCK_FORCE_TICKS <= 0:
+        """Cuando alguien lleva demasiado sin poder moverse, el motor manda."""
+        if DEADLOCK_FORCE_TICKS <= 0:
             return set()
 
-        # Dos atascos distintos, dos umbrales:
-        #
-        #   - El almacen entero parado: nadie se movio en DEADLOCK_FORCE_TICKS.
-        #     Es el atasco clasico y hay que deshacerlo ya.
-        #   - Un AGV solo, clavado mientras los demas circulan: el contador
-        #     global no lo ve, porque el almacen SI se mueve. Ese se muere de
-        #     hambre en silencio, y por eso hay tambien un contador por AGV, con
-        #     el umbral mas alto: esperar un rato es normal, esperar treinta
-        #     ticks es que nadie te va a dejar pasar nunca.
         umbral = (
-            config.DEADLOCK_FORCE_TICKS
-            if self._ticks_sin_avance >= config.DEADLOCK_FORCE_TICKS
-            else config.STARVED_TICKS
+            DEADLOCK_FORCE_TICKS
+            if self._ticks_sin_avance >= DEADLOCK_FORCE_TICKS
+            else STARVED_TICKS
         )
         parados = {
             agent_id
@@ -985,25 +1035,20 @@ class Simulation:
             for agent_id in parados
         }
 
-        # Si el atascado ya va a poder pasar por su cuenta, aqui no hay nada que
-        # hacer: meter mano seria pisarle la ruta al que ya iba bien. Pasa en el
-        # tick siguiente a un desatasco, con el AGV apartado saliendo al hueco.
         if any(
-            acciones[agent_id] == conflicts.INTENT_ADVANCE and esta_libre
+            acciones[agent_id] == conflicts.Intent.ADVANCE and esta_libre
             for agent_id, esta_libre in libre.items()
         ):
             return set()
 
-        # 1. El desempate por prioridad: gana el id menor, igual que en la
-        #    baseline. Basta con uno moviendose para que el almacen se descongele.
         for agent_id in sorted(parados):
-            if acciones[agent_id] == conflicts.INTENT_ADVANCE:
-                continue  # ya lo estaba intentando; forzarselo no cambiaria nada
+            if acciones[agent_id] == conflicts.Intent.ADVANCE:
+                continue
             if not libre[agent_id]:
                 continue
-            acciones[agent_id] = conflicts.INTENT_ADVANCE
+            acciones[agent_id] = conflicts.Intent.ADVANCE
             self._forzados += 1
-            log.warning(  # el resto del tick lo aplica el bucle de siempre
+            log.warning(
                 "paso %3d | DESATASCO | el AGV %s lleva %d ticks sin poder moverse, "
                 "le fuerzo el paso a %s",
                 self.step,
@@ -1013,24 +1058,12 @@ class Simulation:
             )
             return {agent_id}
 
-        # De aqui en adelante, solo los que estan bloqueados de verdad: al que
-        # tiene el nodo libre delante no hay que recalcularle nada.
         atascados = sorted(
             agent_id for agent_id, esta_libre in libre.items() if not esta_libre
         )
         if not atascados:
             return set()
 
-        # 2. Nadie puede pasar: que el de menos prioridad busque otra ruta, con
-        #    veto sobre lo que tiene delante para que A* no se la devuelva igual.
-        #
-        #    Sirve solo si la ruta nueva **esquiva el nodo en disputa del todo**
-        #    y ademas sale por uno libre. Que la ruta cambie no basta: en un mapa
-        #    con un cuello de botella A* devuelve encantado otro camino que
-        #    vuelve a pasar por el mismo sitio ocupado, y con eso los dos AGVs se
-        #    pasan el dia dando vueltas alrededor del que estorba en vez de
-        #    desatascarse. Cuando el nodo en disputa es el destino del AGV no hay
-        #    ruta que lo esquive, y ahi el unico arreglo es el peldaño 3.
         for agent_id in reversed(atascados):
             agente = self._por_id[agent_id]
             destino = intenciones[agent_id]
@@ -1054,26 +1087,14 @@ class Simulation:
                     " -> ".join(agente.path),
                 )
                 self._fuerza(
-                    agente, conflicts.INTENT_REROUTE, intenciones, acciones, ceder=True
+                    agente, conflicts.Intent.REROUTE, intenciones, acciones, ceder=True
                 )
                 return set()
 
-            # No habia salida: se deshace todo. La ruta vuelve a ser la que era y
-            # el veto se retira en vez de dejarlo caducar, o encareceria el mapa
-            # para los demas durante PENALTY_TTL ticks a cambio de nada.
             agente.path, agente.path_index = vieja, indice
             self.penalties.discard(destino)
             self.penalties.discard(tramo)
 
-        # 3. Ultimo recurso: que se aparte el que estorba, aunque ya haya
-        #    terminado su tarea. Un AGV aparcado encima de G bloquea el almacen
-        #    entero, y por ahi no hay ruta alternativa que valga.
-        #
-        #    Casi nunca puede apartarse el mismo: en un atasco de verdad tiene
-        #    los vecinos ocupados tambien. Por eso se busca el hueco libre mas
-        #    cercano y se empuja al ULTIMO de la fila, que es el unico que cabe
-        #    en el. La fila se acorta en un AGV por cada desatasco, y a la
-        #    segunda o la tercera le toca al que estorbaba.
         for agent_id in atascados:
             estorbo = self.occupancy.get(intenciones[agent_id])
             if estorbo is None or estorbo == agent_id:
@@ -1088,11 +1109,9 @@ class Simulation:
             if not self._aparta(apartado, hacia=hueco):
                 continue
 
-            # El hueco que deja se le guarda al que esperaba: si no, el que se
-            # aparta vuelve, gana por id menor y todo esto no habra servido.
             self._reservas[apartado.current_node] = (
                 agent_id,
-                self.step + config.YIELD_TICKS,
+                self.step + YIELD_TICKS,
             )
             log.warning(
                 "paso %3d | DESATASCO | el AGV %s se aparta a %s (le deja %s al "
@@ -1104,9 +1123,8 @@ class Simulation:
                 agent_id,
                 self._por_id[estorbo].current_node,
             )
-            # Sin `ceder`: no estaba esperando a nadie, le han mandado moverse.
             self._fuerza(
-                apartado, conflicts.INTENT_REROUTE, intenciones, acciones, ceder=False
+                apartado, conflicts.Intent.REROUTE, intenciones, acciones, ceder=False
             )
             return set()
 
@@ -1117,17 +1135,7 @@ class Simulation:
         return set()
 
     def _hueco_mas_cercano(self, desde: str) -> tuple[int, str] | None:
-        """El nodo libre mas cercano, y el AGV que tiene que meterse en el.
-
-        Un BFS por el mapa desde `desde`, atravesando **solo nodos ocupados**:
-        es literalmente recorrer la fila de AGVs atascados hasta encontrar donde
-        se acaba. Devuelve `(id del ultimo de la fila, nodo libre)`, que es el
-        unico par que puede moverse ahora mismo; los de mas atras no caben en
-        ningun sitio hasta que este se quite.
-
-        None si el componente entero esta lleno, que es el atasco que ya no tiene
-        arreglo: sin un hueco no hay a donde apartarse.
-        """
+        """El nodo libre mas cercano, y el AGV que tiene que meterse en el."""
         vistos = {desde}
         cola: deque[str] = deque([desde])
         while cola:
@@ -1140,7 +1148,6 @@ class Simulation:
                     cola.append(vecino)
                     continue
 
-                # `nodo` es el ultimo ocupado de la fila y `vecino` el hueco.
                 ocupante = self.occupancy.get(nodo)
                 if ocupante is None:
                     continue
@@ -1148,55 +1155,31 @@ class Simulation:
         return None
 
     def _aparta(self, agente: Agent, *, hacia: str) -> bool:
-        """Le da al que estorba una ruta de un tramo hasta el hueco de al lado.
-
-        Es la "marcha atras" que el proyecto no tenia, y esta escrita como lo que
-        es: **una ruta**, no un movimiento especial. El AGV la recorre en el tick
-        siguiente pasando por el gate como cualquier otro, asi que la invariante
-        "un nodo, un AGV" no se toca y nadie se teletransporta.
-
-        Al que sigue en marcha se le pega el resto de su ruta detras, recalculada
-        desde el hueco, para que no pierda la tarea. Al que ya habia terminado se
-        le mueve el destino con el: se aparca en el hueco y ahi se queda, que es
-        exactamente lo que hace un AGV real cuando le piden el pasillo.
-
-        Devuelve False si iba a media travesia (ya se esta quitando de en medio),
-        si el hueco no es vecino suyo o si desde alli no hay forma de llegar a su
-        destino.
-        """
+        """Le da al que estorba una ruta de un tramo hasta el hueco de al lado."""
         if agente.progress > 0.0 or not self.graph.has_edge(agente.current_node, hacia):
             return False
 
-        # Si ya tiene por donde salir, no hace falta mandarle nada: se va solo en
-        # cuanto le toque. Repetirle la orden cada tick seria peor que no darla,
-        # porque cada vez se le saca del reparto del tick y no llega a moverse
-        # nunca: se quedaria apartandose eternamente sin apartarse.
         siguiente = agente.next_node()
         if siguiente is not None and self._puede_entrar(agente, siguiente):
             return False
 
-        if agente.state == STATE_DONE or agente.target_node is None:
-            # Ya habia terminado: se aparca en el hueco y ahi se queda.
+        if agente.state == State.DONE or agente.target_node is None:
             agente.path = [agente.current_node, hacia]
             agente.target_node = hacia
         else:
-            # Se penaliza el nodo que deja **antes** de trazar la vuelta, o A*
-            # le devolveria la misma ruta y volveria derecho al atasco del que
-            # acaba de sacarsele: apartarse y volver es no apartarse.
             self.penalties.add(
                 agente.current_node, config.REROUTE_PENALTY, step=self.step
             )
-            resto = astar.astar(self.graph, hacia, agente.target_node, self.penalties)
+            resto = astar(self.graph, hacia, agente.target_node, self.penalties)
             if resto is None:
                 return False
             agente.path = [agente.current_node, *resto]
 
         agente.path_index = 0
         agente.progress = 0.0
-        agente.state = STATE_MOVING
+        agente.state = State.MOVING
         return True
 
-    # --- Deadlock ------------------------------------------------------------
 
     def _huella_por_agente(self) -> dict[int, tuple[str, float]]:
         """Donde esta cada AGV, uno a uno. Para saber quien no se ha movido."""
@@ -1207,12 +1190,14 @@ class Simulation:
     def _cuenta_los_parados(self, antes: dict[int, tuple[str, float]]) -> None:
         """Suma un tick al que no se movio nada, y pone a cero al que si.
 
-        El que ya llego o no tiene ruta no cuenta como parado: no esta atascado,
-        es que no tiene nada que hacer. Al que se aparta se le perdona tambien el
-        contador, que bastante tiene con la vuelta que le han mandado dar.
+        El que llego, el que no tiene ruta y el que esta recogiendo o dejando una
+            caja no cuentan como parados: quedarse quieto es justo lo que toca.
         """
         for agente in self.agents:
-            if agente.state in (STATE_DONE, STATE_IDLE):
+            if agente.state in (
+                State.DONE, State.IDLE, State.PICKING,
+                State.DROPPING, State.CHARGING,
+            ):
                 self._parado[agente.id] = 0
                 continue
             if antes.get(agente.id) != (agente.current_node, agente.progress):
@@ -1225,27 +1210,11 @@ class Simulation:
         return tuple(
             (agente.id, agente.current_node, agente.progress)
             for agente in self.agents
-            if agente.state in (STATE_MOVING, STATE_WAITING)
+            if agente.state in (State.MOVING, State.WAITING)
         )
 
     def _vigila_el_deadlock(self, huella_antes: tuple[tuple[int, str, float], ...]) -> None:
-        """Corta la corrida si nadie avanza durante `config.DEADLOCK_TICKS` ticks.
-
-        Este contador tiene **dos umbrales** desde la fase 8, y el que importa es
-        el primero: a los `DEADLOCK_FORCE_TICKS` (8) el motor desatasca a la
-        fuerza (`_desatasca`), y solo si aun asi no se mueve nadie se llega a los
-        `DEADLOCK_TICKS` (20) y la corrida se da por muerta. O sea que llegar
-        aqui deberia ser raro, y cuando pasa es que ni un AGV tenia un vecino
-        libre al que apartarse.
-
-        Sin agentes activos no hay deadlock: que hayan llegado todos no es un
-        atasco, es el final feliz. Y una simulacion colgada para siempre no es un
-        resultado experimental, es un bug de la corrida.
-
-        Una corrida ya declarada muerta no se vuelve a declarar: si no, seguir
-        tickeando sobre un atasco sumaria un deadlock cada `DEADLOCK_TICKS` y el
-        contador de la sesion dejaria de contar atascos para contar ticks.
-        """
+        """Corta la corrida si nadie avanza durante `config.DEADLOCK_TICKS` ticks."""
         if self.finished_reason is not None:
             return
 
@@ -1271,47 +1240,43 @@ class Simulation:
             ", ".join(
                 f"AGV {agente.id} en {agente.current_node}"
                 for agente in self.agents
-                if agente.state in (STATE_MOVING, STATE_WAITING)
+                if agente.state in (State.MOVING, State.WAITING)
             ),
         )
 
-    # --- Como lo ve Unity ----------------------------------------------------
 
     def _describe(self, agente: Agent) -> dict[str, object]:
         """Un agente tal y como lo ve Unity."""
         registro = self._acciones.get(
-            agente.id, ActionRecord(conflicts.INTENT_WAIT, self.step)
+            agente.id, ActionRecord(conflicts.Intent.WAIT, self.step)
         )
         px, py = self._posicion(agente)
-        x, y, z = protocol.to_unity(px, py)
+        x, y, z = to_unity(px, py)
         return {
-            # Los seis campos congelados en la fase 1: ni nombre ni tipo cambian.
             "id": agente.id,
             "x": x,
             "y": y,
             "z": z,
             "rotation": self._rotacion(agente),
             "state": agente.state,
-            # Lo que agrega la fase 3, por encima del formato congelado.
             "node": agente.current_node,
             "next_node": agente.next_node(),
             "path": list(agente.path),
             "task": agente.task,
-            # Lo que agrega la fase 5.
             "wait_time": agente.wait_time,
-            # Lo que agrega la fase 8: lo que QUISO hacer y lo que el motor le
-            # concedio. Que las dos cosas puedan no coincidir es el punto.
             "action": registro.action,
             "blocked": registro.blocked,
+            "leg": agente.leg,
+            "mission": agente.mission,
+            "box": agente.box,
+            "destination": agente.destination,
+            "carrying": agente.carrying,
+            "busy": agente.busy,
+            "battery": round(agente.battery, 1),
         }
 
     def _posicion(self, agente: Agent) -> tuple[float, float]:
-        """Posicion logica, interpolada entre el nodo actual y el siguiente.
-
-        Se interpola en coordenadas logicas y la conversion a Unity la hace
-        `protocol.to_unity()` una sola vez, en `_describe()`: esa conversion no se
-        duplica en ningun sitio del proyecto.
-        """
+        """Posicion logica, interpolada entre el nodo actual y el siguiente."""
         actual = self.graph.positions.get(agente.current_node)
         if actual is None:
             return 0.0, 0.0
@@ -1331,13 +1296,7 @@ class Simulation:
         )
 
     def _rotacion(self, agente: Agent) -> float:
-        """Rumbo del agente en grados sobre el eje vertical de Unity.
-
-        En Unity 0 grados es mirar a +Z y se gira en sentido horario; como la `y`
-        logica es la `z` de Unity, el angulo es `atan2(dx, dy)` sobre las
-        coordenadas logicas. Un agente que ya llego mira hacia donde venia, en vez
-        de girar a cero de golpe.
-        """
+        """Rumbo del agente en grados sobre el eje vertical de Unity."""
         desde: str | None = agente.current_node
         hasta = agente.next_node()
         if hasta is None:

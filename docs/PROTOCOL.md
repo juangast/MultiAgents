@@ -1,10 +1,10 @@
-# Protocolo TCP del servidor de AGVs
+# Protocolo HTTP del servidor de AGVs
 
 Especificación completa del contrato entre el servidor Python y el cliente de Unity. **Este
 fichero se basta solo**: no hace falta leer el código ni el README para escribir el cliente.
 
-Versión del contrato: **fase 11**. Todo el JSON de este documento está copiado tal cual de una
-corrida real (`serve --map warehouse --agents 3 --policy qlearning`), no está escrito a mano.
+Transporte: **HTTP con JSON**. Todo el JSON de este documento está copiado tal cual de una corrida
+real, no está escrito a mano.
 
 ---
 
@@ -12,165 +12,105 @@ corrida real (`serve --map warehouse --agents 3 --policy qlearning`), no está e
 
 | | |
 |---|---|
-| Protocolo | TCP |
-| Dirección por defecto | `127.0.0.1:5000` (configurable con `--host` / `--port`) |
+| Protocolo | **HTTP/1.1** |
+| Dirección por defecto | `http://127.0.0.1:5000` (configurable con `--host` / `--port`) |
+| Formato | JSON en la petición y en la respuesta (`Content-Type: application/json`) |
 | Codificación | `utf-8` |
-| Delimitador | `\n` (salto de línea). Se admite `\r\n` en lo que envía el cliente |
-| Concurrencia | Un hilo por cliente. Varios clientes a la vez están permitidos |
+| Concurrencia | Un hilo por petición. Varios clientes a la vez están permitidos |
 
-### La regla que lo gobierna todo
-
-> **Una línea entra, una línea sale.** Siempre, sin excepción: también cuando el comando es
-> desconocido, cuando viene mal escrito o cuando la línea llega vacía.
-
-Nunca hay respuestas de más ni de menos, así que el cliente puede emparejar cada petición con su
-respuesta por orden de llegada, sin identificadores ni números de secuencia.
-
-La respuesta es **una sola línea**: el JSON no lleva saltos de línea dentro. Un `\n` en el flujo es
-siempre un final de mensaje.
-
-### Cómo leer del socket (importante)
-
-TCP entrega un **flujo de bytes**, no mensajes. Un `send()` del servidor puede llegar partido en
-tres `recv()`, y tres respuestas pueden llegar pegadas en uno solo. Un cliente que dé por hecho
-que cada `Receive()` trae exactamente una respuesta **funciona en localhost y se rompe en cuanto
-hay red de por medio**.
-
-Lo correcto es acumular en un buffer y cortar por `\n`:
-
-```csharp
-// C#, orientativo
-private readonly StringBuilder _buffer = new StringBuilder();
-
-string LeerLinea(NetworkStream stream) {
-    while (true) {
-        int corte = _buffer.ToString().IndexOf('\n');
-        if (corte >= 0) {
-            string linea = _buffer.ToString(0, corte);
-            _buffer.Remove(0, corte + 1);   // OJO: +1, para tragarse el \n
-            return linea;
-        }
-        var trozo = new byte[4096];
-        int leidos = stream.Read(trozo, 0, trozo.Length);
-        if (leidos == 0) throw new IOException("el servidor cerro");
-        _buffer.Append(Encoding.UTF8.GetString(trozo, 0, leidos));
-    }
-}
-```
-
-Hay tres tests que comprueban exactamente esto contra un socket de verdad, en
-`tests/test_protocol.py::TestFragmentacionTCP`: un comando partido en cuatro envíos, tres comandos
-pegados en uno, y cien peticiones seguidas sin que se pierda el emparejado.
+No hay que trocear nada ni buscar delimitadores: HTTP ya trae el `Content-Length` y `UnityWebRequest`
+entrega el cuerpo entero.
 
 ### El modelo PULL: Unity pide, Python responde
 
-Python **nunca** envía nada por su cuenta. No hay push, ni streaming, ni suscripciones. Y hay una
-consecuencia que conviene entender antes de escribir el cliente:
+Python **nunca** envía nada por su cuenta. No hay push, ni streaming, ni suscripciones.
 
-> **`GET_STATE` avanza la simulación un paso.** El mundo se mueve porque alguien pregunta.
+> **`POST /step` avanza la simulación un paso. `GET /state` no.**
 
-Es decir: el ritmo de la simulación lo marca el cliente. Pidiendo 10 veces por segundo
-(`config.TICK_RATE`), el almacén corre a 10 ticks por segundo. Si el cliente se para, el almacén se
-para; si pide el doble, va al doble de rápido.
+El ritmo lo marca el cliente: llamando a `POST /step` diez veces por segundo, el almacén corre a 10
+ticks por segundo. Si el cliente se para, el almacén se para.
 
-Si **dos** clientes están conectados, cada `GET_STATE` de cada uno consume su propio tick, así que
-verán pasos distintos. Es el comportamiento esperado, no un fallo: para mirar sin mover el mundo
-todavía no hay comando (ver [Limitaciones](#7-limitaciones-conocidas-del-protocolo)).
+Que **mirar** y **avanzar** sean dos rutas distintas es a propósito: en HTTP un `GET` no puede tener
+efectos, y así dos clientes conectados a la vez ya no se roban los ticks el uno al otro. Uno puede
+llevar el reloj con `POST /step` y otro pintar con `GET /state` sin alterar nada.
 
 ---
 
-## 2. Comandos
+## 2. Rutas
 
-Cuatro, y ninguno distingue mayúsculas de minúsculas. Los espacios sobrantes se ignoran.
+Cinco, y ninguna necesita cabeceras especiales.
 
-| Comando | Argumento | Qué hace | Avanza el tick |
+| Ruta | Cuerpo | Qué hace | Avanza el tick |
 |---|---|---|:--:|
-| `GET_STATE` | — | Devuelve el estado completo de la simulación | **sí** |
-| `RESET` | — | Reinicia la corrida: `step` vuelve a 1 y `run` sube | no |
-| `PING` | — | Comprueba que el servidor vive | no |
-| `SET_MODE` | `baseline` \| `qlearning` | Cambia de política **en caliente** y reinicia la corrida | no |
+| `GET /state` | — | El estado completo del almacén | no |
+| `GET /health` | — | Comprueba que el servidor vive | no |
+| `POST /step` | — (o `{}`) | Avanza un paso y devuelve el estado | **sí** |
+| `POST /reset` | — (o `{}`) | Reinicia la corrida: `step` vuelve a 0 y `run` sube | no |
+| `POST /mode` | `{"mode": "..."}` | Cambia de política **en caliente** y reinicia la corrida | no |
 
-### `PING`
+### Probarlo sin Unity
 
-```
--> PING
-<- {"ok":true}
-```
-
-### `GET_STATE`
-
-Avanza un paso y devuelve el estado entero. El formato completo está en la
-[sección 3](#3-el-snapshot).
-
-```
--> GET_STATE
-<- {"step":1,"agents":[...],"stats":{...},"mode":"qlearning"}
+```bash
+curl localhost:5000/health
+curl localhost:5000/state
+curl -X POST localhost:5000/step
+curl -X POST -d '{"mode":"qlearning"}' localhost:5000/mode
+curl -X POST localhost:5000/reset
 ```
 
-### `RESET`
+### Desde Unity
 
-Vuelve al paso cero de forma determinista: mismas rutas, mismas tareas, misma semilla. Lo único que
-**no** se borra es `stats.deadlocks`, que cuenta los de la sesión entera.
-
-```
--> RESET
-<- {"ok":true}
-```
-
-Después de un `RESET`, el siguiente `GET_STATE` devuelve `step: 1` y `stats.run` una unidad más
-alto. **Así se distingue un reinicio de un `step` estancado.**
-
-### `SET_MODE`
-
-El único comando con argumento. Cambia la política que decide qué hace cada AGV y **arranca una
-corrida limpia con el mismo escenario**: media corrida con una política y media con otra no son
-una corrida de ninguna de las dos.
-
-```
--> SET_MODE baseline
-<- {"ok":true,"mode":"baseline","run":2}
+```csharp
+// C#, orientativo
+IEnumerator Paso() {
+    using var req = UnityWebRequest.Post("http://127.0.0.1:5000/step", "", "application/json");
+    yield return req.SendWebRequest();
+    if (req.result != UnityWebRequest.Result.Success) { Debug.LogError(req.error); yield break; }
+    var snapshot = JsonUtility.FromJson<Snapshot>(req.downloadHandler.text);
+    Pintar(snapshot);
+}
 ```
 
-| Campo | Tipo | Qué es |
+### `POST /mode`
+
+La única ruta con cuerpo. Arranca **una corrida limpia**: media corrida con una política y media con
+otra no son una corrida de ninguna de las dos.
+
+```
+-> POST /mode  {"mode": "baseline"}
+<- 200  {"ok":true,"mode":"baseline","run":2}
+```
+
+Sus errores, cada uno con su código HTTP:
+
+| Código | `error` | Cuándo pasa |
 |---|---|---|
-| `ok` | bool | Siempre `true` cuando el cambio salió bien |
-| `mode` | str | La política que queda activa |
-| `run` | int | El número de corrida nuevo |
-
-Sus tres errores, y ninguno cierra la conexión:
+| 400 | `bad_mode` | El modo no existe, o no venía ninguno. `modes` trae los que sí valen |
+| 409 | `set_mode_failed` | El modo existe pero no se pudo montar. Lleva `detail` (lo típico: se pidió `qlearning` y no hay Q-table entrenada) |
+| 501 | `mode_not_supported` | Esta simulación no sabe cambiar de política |
 
 ```
--> SET_MODE turbo
-<- {"error":"bad_mode","command":"SET_MODE","mode":"turbo","modes":["baseline","qlearning"]}
-
--> SET_MODE
-<- {"error":"bad_mode","command":"SET_MODE","mode":"","modes":["baseline","qlearning"]}
+-> POST /mode  {"mode": "turbo"}
+<- 400  {"error":"bad_mode","mode":"turbo","modes":["baseline","qlearning"]}
 ```
 
-| `error` | Cuándo pasa |
-|---|---|
-| `bad_mode` | El modo no existe, o no venía ninguno. `modes` trae los que sí valen |
-| `set_mode_failed` | El modo existe pero no se pudo montar. Lleva `detail` con el motivo (lo típico: se pidió `qlearning` y no hay Q-table entrenada en el disco) |
-| `mode_not_supported` | Esta simulación no sabe cambiar de política |
-
-### Comando desconocido
-
-No cierra la conexión: responde y sigue. El `command` que devuelve va **en mayúsculas** y sin los
-argumentos.
+### Errores de forma
 
 ```
--> BASURA algo
-<- {"error":"unknown_command","command":"BASURA"}
+-> POST /mode  {no es json
+<- 400  {"error":"bad_json","detail":"Expecting property name enclosed in double quotes: ..."}
 
-->
-<- {"error":"unknown_command","command":""}
+-> GET /loquesea
+<- 404  {"error":"unknown_route","path":"/loquesea","routes":["GET /health","GET /state","POST /mode","POST /reset","POST /step"]}
 ```
+
+Una ruta desconocida **no** cierra nada: contesta 404 con la lista de las que hay y sigue.
 
 ---
 
 ## 3. El snapshot
 
-Lo que devuelve `GET_STATE`. Aquí va **entero y de una corrida real**, partido en varias líneas
+Lo que devuelven `GET /state` y `POST /step`. Aquí va **entero y de una corrida real**, partido en varias líneas
 para que se lea; en el cable va en una sola:
 
 ```json
@@ -205,6 +145,7 @@ para que se lea; en el cable va en una sola:
 | `step` | int | fase 1 | Número de paso, empieza en 1 y **siempre crece** dentro de una corrida |
 | `agents` | list | fase 1 | Un objeto por AGV, siempre todos y siempre en el mismo orden |
 | `stats` | object | fase 5 | Los números de la corrida |
+| `boxes` | list | entregas | Una entrada por caja del almacen, con donde esta **ahora** |
 | `mode` | str | fase 8 | La política activa: `baseline` o `qlearning` |
 
 ### `agents[]`
@@ -214,7 +155,7 @@ para que se lea; en el cable va en una sola:
 | `id` | int | fase 1 | Identificador del AGV. Estable durante toda la sesión |
 | `x`, `y`, `z` | float | fase 1 | Posición **ya en coordenadas de Unity** (ver sección 4) |
 | `rotation` | float | fase 1 | Giro en grados sobre el eje vertical, 0-360 |
-| `state` | str | fase 1 | `idle`, `moving`, `waiting` o `done` |
+| `state` | str | fase 1 | `idle`, `moving`, `waiting`, `picking`, `dropping` o `done` |
 | `node` | str | fase 3 | Nodo en el que está, o del que acaba de salir |
 | `next_node` | str \| null | fase 3 | Hacia dónde va; `null` si ya llegó |
 | `path` | list[str] | fase 3 | La ruta entera, de origen a destino. Para pintarla |
@@ -222,15 +163,40 @@ para que se lea; en el cable va en una sola:
 | `wait_time` | int | fase 5 | Ticks **acumulados** cediendo el paso en toda la corrida |
 | `action` | str | fase 8 | Lo que **eligió** hacer: `advance`, `wait` o `reroute` |
 | `blocked` | bool | fase 8 | Eligió `advance` y el motor **no le dejó** pasar |
+| `leg` | str | entregas | `none`, `to_pick` (va a por la caja) o `to_drop` (la lleva al muelle) |
+| `mission` | str \| null | entregas | Id de la mision que **gano pujando**, o `null` si va libre |
+| `box` | str \| null | entregas | Id de la caja que tiene que recoger |
+| `destination` | str \| null | entregas | Donde tiene que dejarla: un **rack** o un **muelle**, segun el flujo |
+| `carrying` | str \| null | entregas | Id de la caja que lleva **encima ahora mismo** |
+| `busy` | int | entregas | Ticks que le quedan de la recogida o de la entrega |
 
-**Los cuatro estados:**
+Hay **dos flujos**: `produccion -> rack` guarda lo que sale de la linea, y
+`rack -> muelle` saca del almacen lo guardado. Y se **encadenan**: en cuanto una
+caja queda guardada en un rack, el almacen le abre su mision de salida, asi que
+`missions_total` sube durante la corrida.
+
+Un AGV lleva **como mucho una mision a la vez**: `mission` pasa de `null` a un id cuando gana la
+subasta, y vuelve a `null` en cuanto deja la caja en el muelle. Entonces vuelve a pujar.
+
+**Los seis estados:**
 
 | `state` | Qué significa | Qué hace el prefab |
 |---|---|---|
 | `idle` | Sin ruta que seguir (no hay camino a su destino) | Quieto |
 | `moving` | Cruzando un tramo, o parado en un nodo a punto de salir | Se mueve hacia `x,y,z` |
 | `waiting` | Cediendo el paso: no se movió en este tick | Quieto, y se le puede poner un icono |
-| `done` | Llegó a su destino | Aparcado |
+| `picking` | Recogiendo la caja: ocupa su nodo y no se mueve | Animación de horquilla subiendo |
+| `dropping` | Dejando la caja en el muelle | Animación de horquilla bajando |
+| `done` | Llegó a su destino, o entregó su caja | Aparcado |
+
+**Dibujar la caja que lleva un AGV:** con `carrying` basta — vale `null` mientras va a por ella y
+trae el id en cuanto la recoge, así que el prefab la dibuja encima del AGV exactamente cuando
+`carrying != null`. Para las demás cajas está `boxes[]`, que dice dónde está cada una y en qué
+estado ([abajo](#boxes)).
+
+Con `deliveries` desactivado —que es el modo por defecto— `leg` vale siempre `none`, los otros
+campos de entrega valen `null`/`0`, `boxes[]` viene vacía y los estados `picking`, `dropping` y
+`charging` no aparecen nunca.
 
 **`action` y `blocked` van juntos**, y es lo más útil para enseñar qué está pasando: `action` es lo
 que el AGV **quiso** hacer y `blocked` es lo que el motor **le concedió**. Un AGV con
@@ -243,11 +209,32 @@ posición de la mitad del tramo, no la del nodo de destino. Así el prefab se pu
 directamente, sin teletransportes ni interpolación por parte de Unity. Un tramo tarda entre 4 y 8
 ticks en cruzarse, según su coste.
 
+### `boxes[]`
+
+Las cajas se mueven durante la corrida: `graph.boxes` del mapa es solo el
+inventario **inicial**, y esta lista dice donde esta cada una en este momento.
+
+| Campo | Tipo | Qué es |
+|---|---|---|
+| `id` | str | Identificador de la caja, estable toda la corrida |
+| `node` | str | Nodo donde esta **ahora**. Mientras la lleva un AGV, es el nodo del AGV |
+| `level` | int | Nivel de la estanteria del que salio |
+| `status` | str | Uno de los cinco de abajo |
+| `mission` | str \| null | La mision que la esta moviendo, o `null` |
+
+| `status` | Qué significa | Qué hace el prefab |
+|---|---|---|
+| `WAITING_PICKUP` | Recien fabricada, esperando en una linea de produccion | Caja en el suelo |
+| `STORED` | Guardada en una estanteria | Caja en el rack, a su `level` |
+| `RESERVED` | Un AGV gano su mision y viene a por ella | Caja marcada, aun sin mover |
+| `IN_TRANSIT` | Va encima de un AGV | Caja sobre el AGV, sigue su posicion |
+| `DELIVERED` | Ya salio por un muelle | Caja en el muelle |
+
 ### `stats`
 
 | Campo | Tipo | Desde | Qué es |
 |---|---|---|---|
-| `run` | int | fase 5 | Número de corrida. Sube en cada `RESET` y en cada `SET_MODE` |
+| `run` | int | fase 5 | Número de corrida. Sube en cada `POST /reset` y en cada `POST /mode` |
 | `policy` | str | fase 5 | La política activa (lo mismo que `mode`, en la raíz) |
 | `conflicts` | int | fase 5 | Conflictos detectados en esta corrida |
 | `conflicts_by_type` | object | fase 5 | Desglose: `vertex`, `edge`, `following`, `congestion` |
@@ -258,6 +245,13 @@ ticks en cruzarse, según su coste.
 | `actions` | object | fase 8 | Decisiones de la corrida por tipo: `advance` / `wait` / `reroute` |
 | `forced` | int | fase 8 | Veces que el motor tuvo que desatascar a la fuerza |
 | `penalties` | int | fase 8 | Penalizaciones de ruta vivas ahora mismo |
+| `deliveries` | bool | entregas | Si esta corrida va con entregas o solo con destinos |
+| `picked` | int | entregas | Cajas recogidas en esta corrida |
+| `delivered` | int | entregas | Cajas ya dejadas en un muelle |
+| `missions_pending` | int | entregas | Misiones que siguen en la bolsa, sin dueño |
+| `missions_total` | int | entregas | Misiones abiertas en total; **crece durante la corrida** |
+| `boxes_delivered` | int | entregas | Cajas que ya salieron por un muelle |
+| `messages` | int | entregas | Mensajes que lleva el bus de negociacion |
 
 **Los cuatro tipos de conflicto:**
 
@@ -286,13 +280,13 @@ el segundo eje del plano va a **Z**:
 `UNITY_SCALE` vale **`1.0`** y una unidad lógica es **un metro**, así que hoy los números coinciden.
 Está en `python/config.py`, y cambiarlo cambia **todas** las coordenadas exportadas de golpe: las
 del snapshot y las del mapa. La conversión vive en una sola función del proyecto
-(`protocol.to_unity()`) y no hay ninguna copia ya convertida guardada en ningún sitio.
+(`graph.to_unity()`) y no hay ninguna copia ya convertida guardada en ningún sitio.
 
 **Unity no tiene que convertir nada**: `x`, `y` y `z` llegan listos para asignar a un `Vector3`.
 
 ### El mapa
 
-Para montar la escena hace falta el grafo. **No se puede pedir por el socket** (ver
+Para montar la escena hace falta el grafo. **No se puede pedir por HTTP** (ver
 [Limitaciones](#7-limitaciones-conocidas-del-protocolo)); hay dos formas de sacarlo:
 
 **1. Verlo por consola**, con las coordenadas lógicas y las de Unity una al lado de la otra:
@@ -341,33 +335,28 @@ El mapa **no cambia durante una sesión**: se pide una vez al arrancar y se cach
 ## 5. Ciclo de vida del cliente
 
 ```
-1. conectar a 127.0.0.1:5000
-2. (opcional) PING para comprobar que responde
-3. bucle a ~10 Hz:
-      enviar GET_STATE
-      leer una linea
+1. (opcional) GET /health para comprobar que responde
+2. bucle a ~10 Hz:
+      POST /step
       parsear el JSON
       mover los prefabs a (x, y, z) y girarlos a rotation
-4. cerrar el socket
 ```
 
-Un cliente de referencia en Python, con validación de la forma del contrato y medición de
-latencias, está en `tests/fake_unity_client.py`:
+No hay conexión que abrir ni que cerrar: cada petición se basta sola. Para probarlo a mano antes de
+tener el cliente montado:
 
 ```bash
 python3 python/main.py serve --port 5055 &
-python3 tests/fake_unity_client.py --port 5055 --seconds 30 --rate 10
+curl -X POST localhost:5055/step
 ```
 
 ### Reconexión y errores
 
-- Si el servidor se cae, el `recv()` devuelve 0 bytes. Hay que reconectar; al reconectar se sigue
-  la **misma** simulación, no una nueva.
-- Un JSON que no parsea no debería ocurrir nunca. Si ocurre, lo más probable es que el cliente esté
-  cortando mal por `\n` (ver sección 1).
-- El servidor no cierra la conexión por un comando malo. Si se cierra, es que se cayó.
-- Una línea sin `\n` de más de 64 KB sí cierra la conexión: es la protección contra un cliente que
-  se quedó colgado a mitad de envío.
+- Si el servidor se cae, la petición falla con un error de red. Se reintenta y ya está: al volver se
+  sigue la **misma** simulación, no una nueva.
+- Un cuerpo mayor de 64 KB se rechaza con 413. Ninguna ruta de este contrato manda tanto.
+- Los errores llevan **código HTTP y JSON**: 400 si el cuerpo viene mal, 404 si la ruta no existe,
+  409 si la política no se pudo montar, 501 si la simulación no cambia de modo.
 
 ---
 
@@ -381,7 +370,7 @@ El formato está **congelado en cuanto a lo que ya existe**:
   sigue funcionando hoy sin tocarle una línea.
 
 Lo que sí puede cambiar de una corrida a otra: el número de AGVs (`--agents`), el mapa (`--map`) y
-la política (`--policy` o `SET_MODE`). Nada de eso cambia la **forma** del JSON.
+la política (`--policy` o `POST /mode`). Nada de eso cambia la **forma** del JSON.
 
 ---
 
@@ -389,14 +378,12 @@ la política (`--policy` o `SET_MODE`). Nada de eso cambia la **forma** del JSON
 
 Lo que hoy no se puede hacer, por si el cliente lo necesita:
 
-- **No hay forma de mirar sin avanzar el mundo.** `GET_STATE` siempre consume un tick. Con dos
-  clientes conectados, cada uno avanza la simulación por su cuenta y ven pasos distintos. Un
-  comando `PEEK` que devolviera el estado sin tickear resolvería tanto esto como el modo pausa.
-- **No hay pausa ni control de velocidad desde el socket.** El ritmo lo marca el cliente pidiendo
-  más rápido o más despacio, que para lo que hace falta basta, pero no permite congelar la escena.
-- **No se puede pedir el mapa por el socket.** Hay que sacarlo con `main.py map` y meterlo en la
-  escena, o leer el JSON de `python/maps/`. Un comando `GET_MAP` sería la pieza que falta para que
-  Unity se configure entero por red.
+- **No hay pausa ni control de velocidad desde el servidor.** El ritmo lo marca el cliente llamando
+  a `POST /step` más rápido o más despacio. Para congelar la escena basta con dejar de pedirlo, y
+  `GET /state` sigue devolviendo el estado sin moverlo.
+- **No se puede pedir el mapa por HTTP.** Hay que sacarlo con `main.py map` y meterlo en la escena,
+  o leer el JSON de `python/maps/`. Una ruta `GET /map` sería la pieza que falta para que Unity se
+  configure entero por red.
 - **No se pueden crear tareas desde el cliente.** El reparto lo decide Python.
-- **No hay autenticación ni cifrado.** Está pensado para `127.0.0.1`. No lo expongas a una red que
-  no controles.
+- **No hay autenticación ni cifrado.** Es HTTP plano pensado para `127.0.0.1`. No lo expongas a una
+  red que no controles.

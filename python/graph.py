@@ -1,41 +1,61 @@
-"""Mapa logico del almacen: el grafo que comparten Python y Unity.
+"""El mapa del almacen y el ruteo sobre el.
 
-Un nodo es un punto donde un AGV puede estar y una arista es un tramo por el que
-puede pasar, con su costo. La simulacion piensa en coordenadas logicas (px, py);
-la exportacion a Unity sale de `protocol.to_unity()`, que es la unica conversion
-del proyecto y no se copia aqui.
-
-Modulo puro: no abre sockets ni guarda estado global, se puede importar y probar
-sin levantar el servidor.
+Un nodo es un punto donde un AGV puede estar y una arista un tramo con su costo.
+El JSON de `maps/` es la unica fuente, y `to_unity()` la unica conversion de
+coordenadas del proyecto.
 """
 
+import heapq
 import json
 import math
-import re
 from collections import deque
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
 import config
-import protocol
 
 Adjacency = dict[str, dict[str, float]]
 Positions = dict[str, tuple[float, float]]
+Cells = dict[str, tuple[int, int]]
+NodeRoles = dict[str, str]
+
+ROLE_PRODUCTION: str = "production"
+ROLE_STORAGE: str = "storage"
+ROLE_TRANSIT: str = "transit"
+ROLE_DOCK: str = "dock"
+ROLE_CHARGING: str = "charging"
+
+DEFAULT_ROLE: str = ROLE_TRANSIT
+
+ORIGENES_DE_CAJA: frozenset[str] = frozenset({ROLE_PRODUCTION, ROLE_STORAGE})
+
+UNITY_Y: float = 0.0
+
+
+def to_unity(px: float, py: float) -> tuple[float, float, float]:
+    """Pasa una posicion (px, py) del plano de la simulacion a coordenadas de Unity.
+
+    Es la unica conversion del proyecto: no la repitas en otro sitio.
+    """
+    return (px * config.UNITY_SCALE, UNITY_Y, py * config.UNITY_SCALE)
 
 
 class GraphError(ValueError):
     """Un grafo, o el fichero que lo describe, no sirve como mapa."""
 
 
-class WarehouseGraph:
-    """Grafo del almacen: nodos con posicion y aristas con costo.
+class Box:
+    """Una caja del almacen: donde esta y a que altura."""
 
-    Por defecto es no dirigido, que es lo normal en un almacen: `validate()`
-    exige entonces que cada tramo exista en los dos sentidos y valga lo mismo.
-    Con `directed=True` la asimetria es legitima y sirve para pasillos de un solo
-    sentido, asi que solo se comprueba que se pueda ir y volver.
-    """
+    def __init__(self, id: str, node: str, level: int) -> None:
+        self.id = id
+        self.node = node
+        self.level = level
+
+
+class WarehouseGraph:
+    """Grafo del almacen: nodos con posicion y aristas con costo."""
 
     def __init__(
         self,
@@ -44,9 +64,12 @@ class WarehouseGraph:
         *,
         name: str = "",
         directed: bool = False,
+        cells: Mapping[str, tuple[int, int]] | None = None,
+        node_roles: Mapping[str, str] | None = None,
+        roles: Mapping[str, str] | None = None,
+        boxes: Sequence[Box] | None = None,
+        coordinate_system: Mapping[str, Any] | None = None,
     ) -> None:
-        # Copia propia de los dos diccionarios: si el grafo se quedara con los
-        # que le pasaron, cualquiera podria cambiarle el mapa por detras.
         self.adjacency: Adjacency = {
             str(nodo): {str(vecino): float(costo) for vecino, costo in vecinos.items()}
             for nodo, vecinos in adjacency.items()
@@ -58,20 +81,23 @@ class WarehouseGraph:
         self.name: str = name
         self.directed: bool = directed
 
+        self.cells: Cells = {
+            str(nodo): (int(celda[0]), int(celda[1]))
+            for nodo, celda in (cells or {}).items()
+        }
+        self.node_roles: NodeRoles = {
+            str(nodo): str(rol) for nodo, rol in (node_roles or {}).items()
+        }
+        self.roles: dict[str, str] = {
+            str(rol): str(texto) for rol, texto in (roles or {}).items()
+        }
+        self.boxes: list[Box] = list(boxes or ())
+        self.coordinate_system: dict[str, Any] = dict(coordinate_system or {})
+
     def __repr__(self) -> str:
         return (
             f"WarehouseGraph(name={self.name!r}, nodes={len(self.adjacency)}, "
             f"edges={len(self.edges())}, directed={self.directed})"
-        )
-
-    def __eq__(self, otro: object) -> bool:
-        if not isinstance(otro, WarehouseGraph):
-            return NotImplemented
-        return (
-            self.name == otro.name
-            and self.directed == otro.directed
-            and self.adjacency == otro.adjacency
-            and self.positions == otro.positions
         )
 
     def nodes(self) -> list[str]:
@@ -114,9 +140,6 @@ class WarehouseGraph:
                     aristas.append((origen, destino, costo))
                     continue
 
-                # El par ordenado identifica el tramo, venga del sentido que
-                # venga: asi un mapa asimetrico por error tampoco pierde aristas
-                # al listarlo, y `validate()` puede explicar que le pasa.
                 clave = (origen, destino) if origen <= destino else (destino, origen)
                 if clave in vistas:
                     continue
@@ -126,21 +149,34 @@ class WarehouseGraph:
         aristas.sort(key=lambda arista: (arista[0], arista[1]))
         return aristas
 
+    def role_of(self, node: str) -> str:
+        """El rol de ese nodo. Un nodo sin rol declarado es de paso."""
+        return self.node_roles.get(node, DEFAULT_ROLE)
+
+    def nodes_with_role(self, role: str) -> list[str]:
+        """Los nodos que tienen ese rol, en orden alfabetico."""
+        return sorted(nodo for nodo in self.nodes() if self.role_of(nodo) == role)
+
+    def boxes_at(self, node: str) -> list[Box]:
+        """Las cajas que hay en ese nodo, de abajo arriba."""
+        return sorted(
+            (caja for caja in self.boxes if caja.node == node),
+            key=lambda caja: caja.level,
+        )
+
+    def box(self, box_id: str) -> Box | None:
+        """La caja con ese id, o None si el mapa no la tiene."""
+        for caja in self.boxes:
+            if caja.id == box_id:
+                return caja
+        return None
+
     def to_unity_dict(self) -> dict[str, Any]:
-        """Exporta nodos y aristas con las coordenadas ya en el sistema de Unity.
-
-        La conversion sale de `protocol.to_unity()`, no de una copia local, y se
-        hace en cada llamada sin cachear: cambiar `config.UNITY_SCALE` cambia
-        todas las coordenadas exportadas. Los campos x/y/z llevan los mismos
-        nombres que el snapshot, para que Unity lea siempre lo mismo.
-
-        Solo tiene sentido en un grafo que pasa `validate()`: un nodo sin
-        posicion lanza KeyError aqui.
-        """
+        """Exporta nodos y aristas con las coordenadas ya en el sistema de Unity."""
         nodos: list[dict[str, Any]] = []
         for nodo in self.nodes():
             px, py = self.positions[nodo]
-            unity_x, unity_y, unity_z = protocol.to_unity(px, py)
+            unity_x, unity_y, unity_z = to_unity(px, py)
             nodos.append({"id": nodo, "x": unity_x, "y": unity_y, "z": unity_z})
 
         return {
@@ -186,6 +222,86 @@ class WarehouseGraph:
 
         problemas.extend(self._problemas_de_aristas(conocidos))
         problemas.extend(self._problemas_de_conectividad(conocidos))
+        problemas.extend(self._problemas_de_almacen(conocidos))
+        return problemas
+
+    def _problemas_de_almacen(self, conocidos: set[str]) -> list[str]:
+        """Roles, celdas y cajas: lo que el mapa dice del almacen, no del grafo.
+
+        Un mapa sin ninguno de los tres bloques no da ningun problema: son
+        opcionales y los mapas viejos siguen siendo validos.
+        """
+        problemas: list[str] = []
+
+        for nodo in sorted(set(self.cells) - conocidos):
+            problemas.append(f"hay una celda para {nodo!r}, que no es un nodo del grafo")
+
+        for nodo in sorted(set(self.node_roles) - conocidos):
+            problemas.append(f"hay un rol para {nodo!r}, que no es un nodo del grafo")
+
+        if self.roles:
+            for nodo in self.nodes():
+                rol = self.node_roles.get(nodo)
+                if rol is not None and rol not in self.roles:
+                    problemas.append(
+                        f"el nodo {nodo!r} tiene el rol {rol!r}, que no esta en 'roles'"
+                    )
+
+        for nodo, (columna, fila) in sorted(self.cells.items()):
+            punto = self.positions.get(nodo)
+            paso = self.coordinate_system.get("spacing")
+            if punto is None or not isinstance(paso, (int, float)):
+                continue
+            esperado = (columna * float(paso), fila * float(paso))
+            if not all(
+                math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
+                for a, b in zip(punto, esperado)
+            ):
+                problemas.append(
+                    f"la celda de {nodo!r} es {[columna, fila]}, que con spacing "
+                    f"{paso} daria {list(esperado)}, pero su posicion es {list(punto)}"
+                )
+
+        problemas.extend(self._problemas_de_cajas(conocidos))
+        return problemas
+
+    def _problemas_de_cajas(self, conocidos: set[str]) -> list[str]:
+        """Cajas colgantes, ids repetidos, huecos ocupados dos veces y niveles malos."""
+        problemas: list[str] = []
+        niveles = self.coordinate_system.get("levels")
+        vistos: dict[str, str] = {}
+        huecos: dict[tuple[str, int], str] = {}
+
+        for caja in self.boxes:
+            if caja.id in vistos:
+                problemas.append(f"hay dos cajas con el id {caja.id!r}")
+            vistos[caja.id] = caja.node
+
+            if caja.node not in conocidos:
+                problemas.append(
+                    f"la caja {caja.id!r} esta en {caja.node!r}, que no es un nodo del grafo"
+                )
+            elif self.node_roles and self.role_of(caja.node) not in ORIGENES_DE_CAJA:
+                problemas.append(
+                    f"la caja {caja.id!r} esta en {caja.node!r}, que es "
+                    f"{self.role_of(caja.node)!r}; una caja solo nace en "
+                    f"{_lista(sorted(ORIGENES_DE_CAJA))}"
+                )
+
+            hueco = (caja.node, caja.level)
+            if hueco in huecos:
+                problemas.append(
+                    f"las cajas {huecos[hueco]!r} y {caja.id!r} ocupan el mismo "
+                    f"hueco: {caja.node} nivel {caja.level}"
+                )
+            huecos[hueco] = caja.id
+
+            if isinstance(niveles, list) and niveles and caja.level not in niveles:
+                problemas.append(
+                    f"la caja {caja.id!r} esta en el nivel {caja.level}, que no "
+                    f"esta en {niveles}"
+                )
+
         return problemas
 
     def _problemas_de_aristas(self, conocidos: set[str]) -> list[str]:
@@ -213,9 +329,6 @@ class WarehouseGraph:
                 if self.directed:
                     continue
 
-                # No dirigido: una asimetria aqui casi siempre es un despiste al
-                # editar el mapa, no una decision. La comprobacion del costo se
-                # hace en un solo sentido para no repetir el mismo aviso.
                 inverso = self.adjacency.get(destino, {}).get(origen)
                 if inverso is None:
                     problemas.append(
@@ -245,7 +358,6 @@ class WarehouseGraph:
         if not self.directed:
             return []
 
-        # Dirigido: llegar no basta, un AGV tambien tiene que poder volver.
         sin_vuelta = sorted(conocidos - _alcanzables(raiz, self._invertida()))
         if sin_vuelta:
             return [
@@ -281,235 +393,13 @@ def _lista(nombres: Iterable[str]) -> str:
     return ", ".join(repr(nombre) for nombre in nombres)
 
 
-def _adyacencia_desde_tramos(
-    tramos: Iterable[tuple[str, str, float]],
-    nodos: Iterable[str],
-) -> Adjacency:
-    """Arma la adyacencia no dirigida a partir de la lista de tramos.
-
-    Cada tramo se escribe una sola vez y se duplica aqui en los dos sentidos,
-    que es la forma de que no se cuele la asimetria que `validate()` persigue.
-    """
-    adyacencia: Adjacency = {nodo: {} for nodo in nodos}
-    for a, b, costo in tramos:
-        adyacencia.setdefault(a, {})[b] = costo
-        adyacencia.setdefault(b, {})[a] = costo
-    return adyacencia
-
-
-# --- Mapa "simple": el grafo de 6 nodos de la guia, para pruebas rapidas ------
-#
-# Ojo: los costos no son la distancia entre las posiciones. A(0,0) -> D(0,3)
-# cuesta 4 y no 3. Es a proposito: un pasillo puede ser lento sin ser largo, y
-# por eso `validate()` no compara costo con geometria.
-
-SIMPLE_ADJACENCY: Adjacency = {
-    "A": {"B": 2.0, "D": 4.0},
-    "B": {"A": 2.0, "C": 2.0, "E": 3.0},
-    "C": {"B": 2.0, "F": 4.0},
-    "D": {"A": 4.0, "E": 2.0},
-    "E": {"D": 2.0, "B": 3.0, "F": 2.0},
-    "F": {"E": 2.0, "C": 4.0},
-}
-
-SIMPLE_POSITIONS: Positions = {
-    "A": (0.0, 0.0),
-    "B": (2.0, 0.0),
-    "C": (4.0, 0.0),
-    "D": (0.0, 3.0),
-    "E": (2.0, 3.0),
-    "F": (4.0, 3.0),
-}
-
-
-# --- Mapa "warehouse": 13 nodos con forma de pasillos ------------------------
-#
-# Dos corredores horizontales (S al sur, N al norte), cuatro conexiones
-# verticales y un cuello de botella en G:
-#
-#   N1--N2--N3            N4--N5--N6      y = 8
-#    |       | \          / |       |
-#    |       |   >  G  <    |       |     y = 4
-#    |       | /          \ |       |
-#   S1--S2--S3            S4--S5--S6      y = 0
-#    x=0     4   8   12   16  20  24
-#
-# G es un nodo de articulacion: es la unica union entre la zona izquierda y la
-# derecha, asi que toda ruta que cruce el almacen pasa por el a la fuerza. De
-# ahi salen los escenarios de congestion de las fases siguientes.
-
-BOTTLENECK: str = "G"
-
-WAREHOUSE_POSITIONS: Positions = {
-    "S1": (0.0, 0.0),
-    "S2": (4.0, 0.0),
-    "S3": (8.0, 0.0),
-    "S4": (16.0, 0.0),
-    "S5": (20.0, 0.0),
-    "S6": (24.0, 0.0),
-    "N1": (0.0, 8.0),
-    "N2": (4.0, 8.0),
-    "N3": (8.0, 8.0),
-    "N4": (16.0, 8.0),
-    "N5": (20.0, 8.0),
-    "N6": (24.0, 8.0),
-    "G": (12.0, 4.0),
-}
-
-# Cada tramo una sola vez, como (a, b, costo). El costo es la distancia entre
-# las dos posiciones redondeada a un decimal.
-WAREHOUSE_EDGES: tuple[tuple[str, str, float], ...] = (
-    ("S1", "S2", 4.0),
-    ("S2", "S3", 4.0),
-    ("S4", "S5", 4.0),
-    ("S5", "S6", 4.0),
-    ("N1", "N2", 4.0),
-    ("N2", "N3", 4.0),
-    ("N4", "N5", 4.0),
-    ("N5", "N6", 4.0),
-    ("S1", "N1", 8.0),
-    ("S3", "N3", 8.0),
-    ("S4", "N4", 8.0),
-    ("S6", "N6", 8.0),
-    ("S3", "G", 5.7),
-    ("N3", "G", 5.7),
-    ("G", "S4", 5.7),
-    ("G", "N4", 5.7),
-)
-
-
-# --- Mapa "grid": la rejilla 4x4 con caminos redundantes ---------------------
-#
-# Cuatro columnas (A-D, de oeste a este) por cuatro filas (1-4, de sur a norte),
-# todos los tramos del mismo costo:
-#
-#   A4--B4--C4--D4      y = 12
-#    |   |   |   |
-#   A3--B3--C3--D3      y = 8
-#    |   |   |   |
-#   A2--B2--C2--D2      y = 4
-#    |   |   |   |
-#   A1--B1--C1--D1      y = 0
-#   x=0  4   8   12
-#
-# Es el contrario exacto del `warehouse`: aqui **no hay ningun nodo de
-# articulacion**, y entre dos nodos cualesquiera hay varias rutas del MISMO
-# costo (todas las de Manhattan que no se desvian). Esa es la condicion para que
-# REROUTE pueda aportar algo: en el almacen, penalizar G no da una ruta
-# alternativa, da una ruta peor o ninguna; aqui da otra igual de buena.
-
-GRID_COLUMNS: tuple[str, ...] = ("A", "B", "C", "D")
-GRID_ROWS: tuple[int, ...] = (1, 2, 3, 4)
-GRID_SPACING: float = 4.0
-
-GRID_POSITIONS: Positions = {
-    f"{columna}{fila}": (GRID_SPACING * x, GRID_SPACING * y)
-    for x, columna in enumerate(GRID_COLUMNS)
-    for y, fila in enumerate(GRID_ROWS)
-}
-
-# Cada tramo una sola vez, como (a, b, costo): primero los horizontales de cada
-# fila y despues los verticales de cada columna. `_adyacencia_desde_tramos()` los
-# duplica en los dos sentidos.
-GRID_EDGES: tuple[tuple[str, str, float], ...] = tuple(
-    [
-        (f"{GRID_COLUMNS[i]}{fila}", f"{GRID_COLUMNS[i + 1]}{fila}", GRID_SPACING)
-        for fila in GRID_ROWS
-        for i in range(len(GRID_COLUMNS) - 1)
-    ]
-    + [
-        (f"{columna}{GRID_ROWS[j]}", f"{columna}{GRID_ROWS[j + 1]}", GRID_SPACING)
-        for columna in GRID_COLUMNS
-        for j in range(len(GRID_ROWS) - 1)
-    ]
-)
-
-
-def simple_graph() -> WarehouseGraph:
-    """El grafo de 6 nodos de la guia."""
-    return WarehouseGraph(SIMPLE_ADJACENCY, SIMPLE_POSITIONS, name="simple")
-
-
-def warehouse_graph() -> WarehouseGraph:
-    """El almacen de 13 nodos con el cuello de botella en G."""
-    return WarehouseGraph(
-        _adyacencia_desde_tramos(WAREHOUSE_EDGES, WAREHOUSE_POSITIONS),
-        WAREHOUSE_POSITIONS,
-        name="warehouse",
-    )
-
-
-def grid_graph() -> WarehouseGraph:
-    """La rejilla 4x4 de 16 nodos, sin cuellos de botella y con rutas redundantes."""
-    return WarehouseGraph(
-        _adyacencia_desde_tramos(GRID_EDGES, GRID_POSITIONS),
-        GRID_POSITIONS,
-        name="grid",
-    )
-
-
-BUILTIN_MAPS: dict[str, Callable[[], WarehouseGraph]] = {
-    "simple": simple_graph,
-    "warehouse": warehouse_graph,
-    "grid": grid_graph,
-}
-
-
-# --- Ficheros ----------------------------------------------------------------
-
-
 def map_path(name: str) -> Path:
     """Ruta del fichero JSON del mapa que se llama asi."""
     return config.MAPS_DIR / f"{name}.json"
 
 
-def save_graph(graph: WarehouseGraph, path: str | Path) -> None:
-    """Guarda el grafo como JSON legible, para editar mapas sin tocar codigo.
-
-    Solo van las coordenadas logicas. Las de Unity son derivadas y dependen de
-    `config.UNITY_SCALE`, asi que congelarlas en el fichero seria guardar una
-    copia condenada a quedarse vieja. El JSON va indentado y ordenado porque
-    esto se edita a mano, al reves que las lineas del socket.
-    """
-    destino = Path(path)
-    destino.parent.mkdir(parents=True, exist_ok=True)
-
-    payload: dict[str, Any] = {
-        "name": graph.name,
-        "directed": graph.directed,
-        "positions": {
-            nodo: [px, py] for nodo, (px, py) in sorted(graph.positions.items())
-        },
-        "adjacency": {
-            nodo: dict(sorted(graph.adjacency[nodo].items())) for nodo in graph.nodes()
-        },
-    }
-    # Sin sort_keys: las claves ya van en el orden en el que se leen bien
-    # (que mapa es, luego donde estan los nodos, luego como se conectan), y
-    # dentro de cada una los nodos van ordenados a mano.
-    texto = json.dumps(payload, indent=2, ensure_ascii=True)
-    destino.write_text(_compacta_puntos(texto) + "\n", encoding=config.ENCODING)
-
-
-_PUNTO_PARTIDO = re.compile(r"\[\s+(-?[\d.eE+-]+),\s+(-?[\d.eE+-]+)\s+\]")
-
-
-def _compacta_puntos(texto: str) -> str:
-    """Deja cada posicion [x, y] en una sola linea.
-
-    `json.dumps` con indent tambien parte las listas de dos numeros, y un mapa
-    que se edita a mano se lee mucho mejor con la posicion entera de un vistazo.
-    """
-    return _PUNTO_PARTIDO.sub(r"[\1, \2]", texto)
-
-
 def load_graph(path: str | Path) -> WarehouseGraph:
-    """Carga un grafo desde su fichero JSON.
-
-    Comprueba la forma del fichero, pero a proposito no llama a `validate()`:
-    hay que poder cargar un mapa roto justo para que `validate()` explique que
-    le pasa.
-    """
+    """Carga un grafo desde su fichero JSON."""
     origen = Path(path)
     try:
         crudo = json.loads(origen.read_text(encoding=config.ENCODING))
@@ -521,11 +411,17 @@ def load_graph(path: str | Path) -> WarehouseGraph:
     if not isinstance(crudo, dict):
         raise GraphError(f"el mapa {origen} tendria que ser un objeto JSON")
 
+    celdas, roles_por_nodo = _lee_nodos(crudo.get("nodes"), origen)
     return WarehouseGraph(
         _lee_adyacencia(crudo.get("adjacency"), origen),
         _lee_posiciones(crudo.get("positions"), origen),
         name=str(crudo.get("name") or origen.stem),
         directed=bool(crudo.get("directed", False)),
+        cells=celdas,
+        node_roles=roles_por_nodo,
+        roles=_lee_roles(crudo.get("roles"), origen),
+        boxes=_lee_cajas(crudo.get("boxes"), origen),
+        coordinate_system=_lee_sistema(crudo.get("coordinate_system"), origen),
     )
 
 
@@ -574,3 +470,274 @@ def _lee_posiciones(crudo: Any, origen: Path) -> Positions:
             )
         posiciones[str(nodo)] = (float(punto[0]), float(punto[1]))
     return posiciones
+
+
+def _lee_sistema(crudo: Any, origen: Path) -> dict[str, Any]:
+    """El bloque `coordinate_system`, que es opcional."""
+    if crudo is None:
+        return {}
+    if not isinstance(crudo, dict):
+        raise GraphError(f"en {origen}, 'coordinate_system' tendria que ser un objeto")
+    return dict(crudo)
+
+
+def _lee_roles(crudo: Any, origen: Path) -> dict[str, str]:
+    """La leyenda de roles, que es opcional."""
+    if crudo is None:
+        return {}
+    if not isinstance(crudo, dict):
+        raise GraphError(f"en {origen}, 'roles' tendria que ser un objeto")
+    return {str(rol): str(texto) for rol, texto in crudo.items()}
+
+
+def _lee_nodos(crudo: Any, origen: Path) -> tuple[Cells, NodeRoles]:
+    """Saca celdas y roles del bloque `nodes`, que es opcional.
+
+    Cada entrada puede traer `cell`, `role` o las dos: un nodo que solo declara
+    su rol no necesita celda, y al reves.
+    """
+    if crudo is None:
+        return {}, {}
+    if not isinstance(crudo, dict):
+        raise GraphError(f"al mapa {origen} le falta 'nodes' como objeto")
+
+    celdas: Cells = {}
+    roles: NodeRoles = {}
+    for nodo, datos in crudo.items():
+        if not isinstance(datos, dict):
+            raise GraphError(
+                f"en {origen}, los datos del nodo {nodo!r} tendrian que ser un objeto"
+            )
+
+        celda = datos.get("cell")
+        if celda is not None:
+            if not isinstance(celda, (list, tuple)) or len(celda) != 2:
+                raise GraphError(
+                    f"en {origen}, la celda de {nodo!r} tendria que ser [columna, fila]"
+                )
+            if not all(isinstance(v, int) and not isinstance(v, bool) for v in celda):
+                raise GraphError(
+                    f"en {origen}, la celda de {nodo!r} no son dos enteros: {celda!r}"
+                )
+            celdas[str(nodo)] = (int(celda[0]), int(celda[1]))
+
+        rol = datos.get("role")
+        if rol is not None:
+            roles[str(nodo)] = str(rol)
+
+    return celdas, roles
+
+
+def _lee_cajas(crudo: Any, origen: Path) -> list[Box]:
+    """El inventario del bloque `boxes`, que es opcional."""
+    if crudo is None:
+        return []
+    if not isinstance(crudo, list):
+        raise GraphError(f"en {origen}, 'boxes' tendria que ser una lista")
+
+    cajas: list[Box] = []
+    for numero, datos in enumerate(crudo, start=1):
+        if not isinstance(datos, dict):
+            raise GraphError(f"en {origen}, la caja {numero} tendria que ser un objeto")
+
+        faltan = sorted({"id", "node", "level"} - set(datos))
+        if faltan:
+            raise GraphError(
+                f"en {origen}, a la caja {numero} le falta {_lista(faltan)}"
+            )
+        nivel = datos["level"]
+        if not isinstance(nivel, int) or isinstance(nivel, bool) or nivel < 1:
+            raise GraphError(
+                f"en {origen}, el nivel de la caja {datos['id']!r} tendria que ser "
+                f"un entero desde 1, no {nivel!r}"
+            )
+        cajas.append(Box(id=str(datos["id"]), node=str(datos["node"]), level=nivel))
+
+    return cajas
+
+
+PenaltyKey = str | tuple[str, str]
+Penalties = Mapping[PenaltyKey, float]
+
+
+PENALTY_TTL: int = 15
+PENALTY_MAX: float = 40.0
+PENALTY_BAN: float = 1000.0
+
+
+class TemporaryPenalties(Mapping):
+    """Penalizaciones de ruta que caducan solas.
+
+    Sin caducidad el mapa se degrada para siempre: A* acabaria esquivando
+    pasillos que llevan cien ticks libres.
+    """
+
+    def __init__(
+        self,
+        *,
+        ttl: int = PENALTY_TTL,
+        cap: float = PENALTY_MAX,
+    ) -> None:
+        self.ttl: int = int(ttl)
+        self.cap: float = float(cap)
+        self._items: dict[PenaltyKey, tuple[float, int]] = {}
+
+    def __repr__(self) -> str:
+        return f"TemporaryPenalties(activas={len(self._items)}, ttl={self.ttl})"
+
+    def __getitem__(self, key: PenaltyKey) -> float:
+        return self._items[key][0]
+
+    def __iter__(self) -> Iterator[PenaltyKey]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def add(self, key: PenaltyKey, amount: float, *, step: int) -> float:
+        """Encarece `key` y (re)arranca su reloj. Devuelve cuanto vale ahora."""
+        extra = float(amount)
+        if extra <= 0.0:
+            return self._items.get(key, (0.0, 0))[0]
+        acumulado = min(self._items.get(key, (0.0, 0))[0] + extra, self.cap)
+        self._items[key] = (acumulado, int(step) + self.ttl)
+        return acumulado
+
+    def ban(self, key: PenaltyKey, *, step: int) -> float:
+        """Veta `key` con un precio caro pero finito, o A* se queda sin ruta."""
+        self._items[key] = (PENALTY_BAN, int(step) + self.ttl)
+        return PENALTY_BAN
+
+    def discard(self, key: PenaltyKey) -> None:
+        """Quita la penalizacion de `key`, si la tenia."""
+        self._items.pop(key, None)
+
+    def expire(self, step: int) -> int:
+        """Borra las que ya caducaron. Devuelve cuantas se fueron."""
+        vencidas = [
+            clave for clave, (_, caduca) in self._items.items() if caduca <= int(step)
+        ]
+        for clave in vencidas:
+            del self._items[clave]
+        return len(vencidas)
+
+    def clear(self) -> None:
+        """Deja la tabla vacia."""
+        self._items.clear()
+
+
+def heuristic_factor(graph: WarehouseGraph) -> float:
+    """Cuanto hay que encoger la distancia euclidiana para que no sobreestime."""
+    factor = 1.0
+    for origen, destino, costo in graph.edges():
+        largo = _distancia(graph, origen, destino)
+        if largo <= 0.0:
+            continue
+        factor = min(factor, costo / largo)
+    return max(factor, 0.0)
+
+
+def astar(
+    graph: WarehouseGraph,
+    start: str,
+    goal: str,
+    penalties: Penalties | None = None,
+) -> list[str] | None:
+    """La ruta mas barata de `start` a `goal`, o None si no hay. Nunca lanza."""
+    if start not in graph.adjacency or goal not in graph.adjacency:
+        return None
+    if start == goal:
+        return [start]
+
+    factor = heuristic_factor(graph)
+
+    def h(nodo: str) -> float:
+        return factor * _distancia(graph, nodo, goal)
+
+    procedencia: dict[str, str] = {}
+    mejor: dict[str, float] = {start: 0.0}
+    cerrados: set[str] = set()
+    pendientes: list[tuple[float, str]] = [(h(start), start)]
+
+    while pendientes:
+        _, actual = heapq.heappop(pendientes)
+        if actual in cerrados:
+            continue
+        cerrados.add(actual)
+
+        if actual == goal:
+            return _reconstruye(procedencia, start, goal)
+
+        for vecino in graph.neighbors(actual):
+            if vecino in cerrados or vecino not in graph.adjacency:
+                continue
+
+            candidato = (
+                mejor[actual]
+                + graph.cost(actual, vecino)
+                + _penalizacion_arista(graph, penalties, actual, vecino)
+                + _penalizacion_nodo(penalties, vecino)
+            )
+            if candidato < mejor.get(vecino, math.inf):
+                mejor[vecino] = candidato
+                procedencia[vecino] = actual
+                heapq.heappush(pendientes, (candidato + h(vecino), vecino))
+
+    return None
+
+
+def path_cost(
+    graph: WarehouseGraph,
+    path: Sequence[str],
+    penalties: Penalties | None = None,
+) -> float:
+    """Costo de una ruta ya trazada. Lanza KeyError si dos nodos no son vecinos."""
+    total = 0.0
+    for anterior, siguiente in zip(path, path[1:]):
+        total += (
+            graph.cost(anterior, siguiente)
+            + _penalizacion_arista(graph, penalties, anterior, siguiente)
+            + _penalizacion_nodo(penalties, siguiente)
+        )
+    return total
+
+
+def _distancia(graph: WarehouseGraph, a: str, b: str) -> float:
+    """Distancia euclidiana entre dos nodos. Sin posicion devuelve 0.0."""
+    origen = graph.positions.get(a)
+    destino = graph.positions.get(b)
+    if origen is None or destino is None:
+        return 0.0
+    return math.dist(origen, destino)
+
+
+def _penalizacion_nodo(penalties: Penalties | None, node: str) -> float:
+    """Extra por entrar en `node`."""
+    if not penalties:
+        return 0.0
+    extra = penalties.get(node)
+    return 0.0 if extra is None else float(extra)
+
+
+def _penalizacion_arista(
+    graph: WarehouseGraph,
+    penalties: Penalties | None,
+    a: str,
+    b: str,
+) -> float:
+    """Extra por cruzar a -> b. En no dirigido, (a,b) y (b,a) son el mismo tramo."""
+    if not penalties:
+        return 0.0
+    extra = penalties.get((a, b))
+    if extra is None and not graph.directed:
+        extra = penalties.get((b, a))
+    return 0.0 if extra is None else float(extra)
+
+
+def _reconstruye(procedencia: Mapping[str, str], start: str, goal: str) -> list[str]:
+    """Camina hacia atras por los padres hasta `start`."""
+    ruta = [goal]
+    while ruta[-1] != start:
+        ruta.append(procedencia[ruta[-1]])
+    ruta.reverse()
+    return ruta

@@ -1,103 +1,200 @@
-"""Servidor TCP que atiende las peticiones PULL de Unity.
+"""El enlace con Unity: servidor HTTP con JSON.
 
-Solo transporte: acepta conexiones, arma las lineas que llegan partidas y
-delega en `protocol.handle_line`. La simulacion entra por inyeccion de
-dependencia: aqui no vive ni una linea de logica del almacen.
+Cuatro rutas y nada mas. `GET /state` mira sin tocar el reloj y `POST /step`
+avanza un paso: en HTTP el GET no puede tener efectos, y de paso eso arregla que
+dos clientes ya no se roben los ticks el uno al otro.
+
+La simulacion entra por inyeccion de dependencia: aqui no hay ni una linea de
+logica del almacen.
 """
 
+import json
 import signal
-import socket
-import socketserver
-from typing import Any
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Protocol
 
 import config
-import protocol
-from logs import get_logger
+from config import get_logger
 
 log = get_logger("server")
 
-RECV_SIZE: int = 4096
-MAX_LINE_BYTES: int = 64 * 1024
+MAX_BODY_BYTES: int = 64 * 1024
+
+Snapshot = dict[str, Any]
 
 
-class AGVRequestHandler(socketserver.BaseRequestHandler):
-    """Atiende una conexion: lee lineas con buffer propio y contesta una por una."""
+class Simulation(Protocol):
+    """Lo que el servidor necesita de una simulacion para poder atenderla.
+
+    `set_mode` no va aqui a proposito: es opcional, y una simulacion que no sepa
+    cambiar de politica tiene que poder servirse igual.
+    """
+
+    def snapshot(self) -> Snapshot:
+        ...
+
+    def get_snapshot(self) -> Snapshot:
+        ...
+
+    def reset(self) -> None:
+        ...
+
+
+class AGVRequestHandler(BaseHTTPRequestHandler):
+    """Atiende una peticion. Todas las respuestas son JSON."""
 
     server: "AGVServer"
+    protocol_version = "HTTP/1.1"
 
-    def setup(self) -> None:
-        """Ajusta el socket para un ida y vuelta corto y frecuente."""
+    def do_GET(self) -> None:
+        """`GET /state` mira el almacen; `GET /health` comprueba que vive."""
+        ruta = self.path.split("?")[0].rstrip("/") or "/"
+
+        if ruta == "/state":
+            self._responder(200, self.server.simulation.snapshot())
+        elif ruta in ("/health", "/ping"):
+            self._responder(200, {"ok": True})
+        else:
+            self._responder(404, self._desconocida(ruta))
+
+    def do_POST(self) -> None:
+        """`POST /step` avanza un paso, `/reset` reinicia y `/mode` cambia de politica."""
+        ruta = self.path.split("?")[0].rstrip("/") or "/"
+        cuerpo = self._lee_cuerpo()
+        if cuerpo is None:
+            return
+
+        if ruta == "/step":
+            self._responder(200, self.server.simulation.get_snapshot())
+        elif ruta == "/reset":
+            self.server.simulation.reset()
+            self._responder(200, {"ok": True})
+        elif ruta == "/mode":
+            codigo, payload = set_mode_payload(self.server.simulation, cuerpo)
+            self._responder(codigo, payload)
+        else:
+            self._responder(404, self._desconocida(ruta))
+
+    def _lee_cuerpo(self) -> dict[str, Any] | None:
+        """El JSON del cuerpo, o `{}` si venia vacio. None si ya se contesto un error."""
         try:
-            # Sin esto, Nagle junta paquetes y le mete decenas de ms a un
-            # protocolo de peticion/respuesta como este.
-            self.request.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            self.request.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        except OSError as exc:
-            log.debug("no se pudieron ajustar las opciones del socket: %s", exc)
+            largo = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self._responder(400, {"error": "bad_content_length"})
+            return None
 
-    def handle(self) -> None:
-        """Bucle de lectura de la conexion. Nunca deja escapar un error de socket."""
-        cliente = _formatea(self.client_address)
-        log.info("cliente conectado: %s", cliente)
-        buffer = bytearray()
+        if largo <= 0:
+            return {}
+        if largo > MAX_BODY_BYTES:
+            self._responder(413, {"error": "body_too_large", "max_bytes": MAX_BODY_BYTES})
+            return None
 
+        crudo = self.rfile.read(largo)
         try:
-            while True:
-                trozo = self.request.recv(RECV_SIZE)
-                if not trozo:
-                    break  # el cliente cerro por su lado
+            cuerpo = json.loads(crudo.decode(config.ENCODING))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._responder(400, {"error": "bad_json", "detail": str(exc)})
+            return None
 
-                buffer.extend(trozo)
+        if not isinstance(cuerpo, dict):
+            self._responder(400, {"error": "body_must_be_object"})
+            return None
+        return cuerpo
 
-                if b"\n" not in buffer and len(buffer) > MAX_LINE_BYTES:
-                    log.warning(
-                        "linea sin terminar de %s (%d bytes), cierro la conexion",
-                        cliente,
-                        len(buffer),
-                    )
-                    break
+    def _responder(self, codigo: int, payload: dict[str, Any]) -> None:
+        """Una respuesta JSON, con su Content-Length para que valga keep-alive."""
+        cuerpo = json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode(
+            config.ENCODING
+        )
+        self.send_response(codigo)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        self.wfile.write(cuerpo)
 
-                # Un recv puede traer media linea, una, o varias pegadas.
-                while True:
-                    corte = buffer.find(b"\n")
-                    if corte < 0:
-                        break
-                    linea = bytes(buffer[:corte])
-                    del buffer[: corte + 1]
-                    self._responder(linea)
-        except (ConnectionResetError, BrokenPipeError, TimeoutError) as exc:
-            log.info("conexion con %s cortada: %s", cliente, exc)
-        except OSError as exc:
-            log.warning("error de socket con %s: %s", cliente, exc)
-        finally:
-            log.info("cliente desconectado: %s", cliente)
+    def _desconocida(self, ruta: str) -> dict[str, Any]:
+        """Respuesta para una ruta que no existe, con la lista de las que si."""
+        return {"error": "unknown_route", "path": ruta, "routes": sorted(ROUTES)}
 
-    def _responder(self, linea: bytes) -> None:
-        """Contesta una linea completa. Los bytes invalidos acaban en unknown_command."""
-        texto = linea.decode(config.ENCODING, errors="replace")
-        respuesta = protocol.handle_line(texto, self.server.simulation)
-        log.debug("%s -> %s", texto.strip(), respuesta.strip())
-        self.request.sendall(respuesta.encode(config.ENCODING))
+    def log_message(self, formato: str, *args: Any) -> None:
+        """Manda el log de acceso al logging del proyecto, no a stderr en crudo."""
+        log.debug("%s - %s", self.address_string(), formato % args)
 
 
-class AGVServer(socketserver.ThreadingTCPServer):
-    """Servidor TCP con un hilo por cliente y la simulacion inyectada."""
+ROUTES: dict[str, str] = {
+    "GET /state": "El estado del almacen, sin avanzar el reloj",
+    "GET /health": "Comprueba que el servidor vive",
+    "POST /step": "Avanza un paso y devuelve el estado",
+    "POST /reset": "Reinicia la corrida",
+    "POST /mode": "Cambia de politica: {\"mode\": \"baseline\"|\"qlearning\"}",
+}
+
+ERROR_BAD_MODE: str = "bad_mode"
+ERROR_MODE_NOT_SUPPORTED: str = "mode_not_supported"
+ERROR_SET_MODE_FAILED: str = "set_mode_failed"
+
+
+def set_mode_payload(
+    simulation: Simulation, body: dict[str, Any]
+) -> tuple[int, dict[str, Any]]:
+    """Cambia la politica en caliente. Devuelve (codigo HTTP, payload).
+
+    Arranca una corrida limpia: media corrida con una politica y media con otra
+    no es una corrida de ninguna de las dos.
+    """
+    modo = str(body.get("mode", "")).strip().lower()
+    if modo not in config.POLICIES:
+        return 400, {
+            "error": ERROR_BAD_MODE,
+            "mode": modo,
+            "modes": list(config.POLICIES),
+        }
+
+    cambiar = getattr(simulation, "set_mode", None)
+    if not callable(cambiar):
+        return 501, {"error": ERROR_MODE_NOT_SUPPORTED}
+
+    try:
+        activo = cambiar(modo)
+    except ValueError as exc:
+        return 409, {"error": ERROR_SET_MODE_FAILED, "mode": modo, "detail": str(exc)}
+
+    respuesta: dict[str, Any] = {"ok": True, "mode": activo or modo}
+    corrida = getattr(simulation, "run", None)
+    if isinstance(corrida, int):
+        respuesta["run"] = corrida
+    return 200, respuesta
+
+
+class AGVServer(ThreadingHTTPServer):
+    """Servidor HTTP con un hilo por peticion y la simulacion inyectada."""
 
     allow_reuse_address = True
-    daemon_threads = True  # sin esto Ctrl+C se queda esperando a los clientes vivos
+    daemon_threads = True
 
     def __init__(
         self,
         server_address: tuple[str, int],
-        simulation: protocol.Simulation,
+        simulation: Simulation,
         bind_and_activate: bool = True,
     ) -> None:
         self.simulation = simulation
         super().__init__(server_address, AGVRequestHandler, bind_and_activate)
 
+    def server_bind(self) -> None:
+        """Abre el socket sin resolver el nombre de la maquina.
+
+        `HTTPServer.server_bind()` llama a `getfqdn()`, que se va a DNS y puede
+        tardar segundos en arrancar. El nombre solo lo usa la cabecera `Server`,
+        asi que no vale lo que cuesta.
+        """
+        super(type(self).__mro__[1], self).server_bind()
+        self.server_name = self.server_address[0]
+        self.server_port = self.server_address[1]
+
     def handle_error(self, request: Any, client_address: Any) -> None:
-        """Registra el fallo de un cliente en vez de escupir el traceback a stdout."""
-        log.exception("fallo atendiendo a %s", _formatea(client_address))
+        """Registra el fallo de un cliente en vez de escupir el traceback."""
+        log.exception("fallo atendiendo a %s", client_address)
 
 
 class _Parada(Exception):
@@ -105,12 +202,7 @@ class _Parada(Exception):
 
 
 def _instalar_parada_por_senal() -> None:
-    """Hace que SIGTERM cierre tan limpio como Ctrl+C.
-
-    SIGINT ya levanta KeyboardInterrupt por su cuenta, pero SIGTERM (un `kill`
-    normal, o el que manda un gestor de servicios) mataria el proceso de golpe,
-    sin cerrar el socket ni dejar rastro en el log.
-    """
+    """Hace que SIGTERM cierre tan limpio como Ctrl+C."""
 
     def parar(signum: int, _frame: Any) -> None:
         raise _Parada(signal.Signals(signum).name)
@@ -118,19 +210,11 @@ def _instalar_parada_por_senal() -> None:
     try:
         signal.signal(signal.SIGTERM, parar)
     except ValueError:
-        # signal.signal solo se puede usar desde el hilo principal.
         log.debug("no se pudo instalar el manejador de SIGTERM")
 
 
-def _formatea(client_address: Any) -> str:
-    """Deja la direccion del cliente como host:puerto."""
-    if isinstance(client_address, tuple) and len(client_address) >= 2:
-        return f"{client_address[0]}:{client_address[1]}"
-    return str(client_address)
-
-
 def serve_forever(
-    simulation: protocol.Simulation,
+    simulation: Simulation,
     host: str = config.HOST,
     port: int = config.PORT,
 ) -> int:
@@ -141,16 +225,10 @@ def serve_forever(
         log.error("no se pudo abrir %s:%d -> %s", host, port, exc)
         return 1
 
-    escucha = _formatea(servidor.server_address)
-    log.info("servidor escuchando en %s", escucha)
-    log.info(
-        "comandos: %s, %s, %s, %s %s",
-        config.CMD_GET_STATE,
-        config.CMD_RESET,
-        config.CMD_PING,
-        config.CMD_SET_MODE,
-        "|".join(config.POLICIES),
-    )
+    direccion = f"http://{host}:{servidor.server_address[1]}"
+    log.info("servidor escuchando en %s", direccion)
+    for ruta, que_hace in ROUTES.items():
+        log.info("  %-13s %s", ruta, que_hace)
 
     _instalar_parada_por_senal()
 
