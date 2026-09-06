@@ -126,7 +126,7 @@ ROUTES: dict[str, str] = {
     "GET /health": "Comprueba que el servidor vive",
     "POST /step": "Avanza un paso y devuelve el estado",
     "POST /reset": "Reinicia la corrida",
-    "POST /mode": "Cambia de politica: {\"mode\": \"baseline\"|\"qlearning\"}",
+    "POST /mode": "Cambia de politica: {\"mode\": \"qlearning\"}",
 }
 
 ERROR_BAD_MODE: str = "bad_mode"

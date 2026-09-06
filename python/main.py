@@ -149,7 +149,7 @@ def cmd_simulate(args: argparse.Namespace) -> int:
 def _corre_simulacion(simulacion: simulation.Simulation, pasos: int) -> int:
     """Tickea hasta `pasos`, o hasta que lleguen todos, contandolo por el log.
 
-    Devuelve 0 aunque la corrida muera en deadlock: un baseline que se atasca es
+    Devuelve 0 aunque la corrida muera en deadlock: una corrida que se atasca es
     un resultado valido, no un fallo. Solo es error que un AGV no tenga ni ruta.
     """
     grafo = simulacion.graph
@@ -273,8 +273,7 @@ def _razon_del_final(simulacion: simulation.Simulation) -> str:
     """Por que se paro la corrida, en una linea para el resumen."""
     if simulacion.finished_reason == simulation.FINISHED_DEADLOCK:
         return (
-            f"deadlock, nadie avanzo en {config.DEADLOCK_TICKS} ticks seguidos "
-            f"(el baseline no sabe deshacerlo: para eso esta el Q-Learning)"
+            f"deadlock, nadie avanzo en {config.DEADLOCK_TICKS} ticks seguidos"
         )
     if simulacion.done():
         return "llegaron todos"
@@ -306,8 +305,8 @@ def cmd_train(args: argparse.Namespace) -> int:
 def cmd_evaluate(args: argparse.Namespace) -> int:
     """Modo EVALUATE: carga la Q-table del disco y juega greedy puro.
 
-    `epsilon = 0` y la tabla no se toca. Corre ademas la baseline sobre los
-    mismos escenarios, que es contra lo que hay que comparar.
+    `epsilon = 0` y la tabla no se toca: mide como juega lo aprendido, sin
+    seguir aprendiendo.
     """
     grafo, _origen, codigo = _abre_mapa(args.map)
     if grafo is None:
@@ -325,7 +324,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        aprendida, referencia = qlearning.evaluate(
+        aprendida, _historia = qlearning.evaluate(
             grafo, _ajustes(args, grafo), model_path=modelo, episodes=args.episodes
         )
     except ValueError as exc:
@@ -333,7 +332,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         return 1
 
     _informa_modelo(modelo, qlearning.load_metadata(modelo))
-    for linea in qlearning.compare_lines(aprendida.history, referencia):
+    for linea in qlearning.summary_lines(aprendida.history, aprendida.cfg.report_every):
         log.info("%s", linea)
     if args.log:
         qlearning.write_training_log(aprendida.history, args.log)
@@ -395,8 +394,8 @@ HANDLERS = {
 def _argumentos_de_politica(sub: argparse.ArgumentParser) -> None:
     """`--policy` y `--model`, que comparten `serve` y `simulate`.
 
-    `--policy` es la unica variable experimental: lo demas es identico en los dos
-    modos, y si no lo fuera, comparar las dos corridas no mediria la politica.
+    Hoy `--policy` solo admite un valor; sigue existiendo para que anadir otra
+    politica no obligue a rehacer la linea de comandos.
     """
     sub.add_argument(
         "--policy",
@@ -404,7 +403,7 @@ def _argumentos_de_politica(sub: argparse.ArgumentParser) -> None:
         default=config.DEFAULT_POLICY,
         help=(
             f"Politica con la que correr (por defecto {config.DEFAULT_POLICY}); "
-            f"con {config.POLICY_QLEARNING} hace falta un modelo entrenado"
+            f"hace falta un modelo entrenado"
         ),
     )
     sub.add_argument(

@@ -66,12 +66,20 @@ class GraphError(ValueError):
 
 
 class Box:
-    """Una caja del almacen: donde esta y a que altura."""
+    """Una caja del almacen: donde esta y a que altura.
 
-    def __init__(self, id: str, node: str, level: int) -> None:
+    `unity_object` es el nombre del GameObject que la representa en la escena,
+    tal y como lo apunto quien midio el almacen. Es opcional: un mapa sin el
+    sigue valiendo, y el cliente tendra que crear las cajas por su cuenta.
+    """
+
+    def __init__(
+        self, id: str, node: str, level: int, unity_object: str | None = None
+    ) -> None:
         self.id = id
         self.node = node
         self.level = level
+        self.unity_object = unity_object
 
 
 class WarehouseGraph:
@@ -89,6 +97,7 @@ class WarehouseGraph:
         roles: Mapping[str, str] | None = None,
         boxes: Sequence[Box] | None = None,
         coordinate_system: Mapping[str, Any] | None = None,
+        agv_starts: Sequence[str] | None = None,
     ) -> None:
         self.adjacency: Adjacency = {
             str(nodo): {str(vecino): float(costo) for vecino, costo in vecinos.items()}
@@ -113,6 +122,9 @@ class WarehouseGraph:
         }
         self.boxes: list[Box] = list(boxes or ())
         self.coordinate_system: dict[str, Any] = dict(coordinate_system or {})
+        self.agv_starts: list[str] = [
+            str(nodo) for nodo in (agv_starts or ()) if str(nodo) in self.adjacency
+        ]
         self._rutas: dict[tuple[str, str], int | None] = {}
 
     def __repr__(self) -> str:
@@ -464,7 +476,33 @@ def load_graph(path: str | Path) -> WarehouseGraph:
         roles=_lee_roles(crudo.get("roles"), origen),
         boxes=_lee_cajas(crudo.get("boxes"), origen),
         coordinate_system=_lee_sistema(crudo.get("coordinate_system"), origen),
+        agv_starts=_lee_agvs(crudo.get("agvs"), origen),
     )
+
+
+def _lee_agvs(crudo: Any, origen: Path) -> list[str]:
+    """Nodos de salida de los AGV, sacados del bloque `agvs` del mapa.
+
+    Ese bloque lo escribe quien mide la escena de Unity: dice donde esta cada
+    AGV y de que nodo esta mas cerca. Sin esto la simulacion arranca en un nodo
+    cualquiera y el AGV se teletransporta en el primer paso.
+
+    Es opcional: un mapa sin `agvs` sigue cargando igual.
+    """
+    if crudo is None:
+        return []
+    if not isinstance(crudo, list):
+        raise GraphError(f"'agvs' del mapa {origen} tendria que ser una lista")
+
+    salidas: list[str] = []
+    for i, entrada in enumerate(crudo):
+        if not isinstance(entrada, dict):
+            raise GraphError(f"agvs[{i}] del mapa {origen} tendria que ser un objeto")
+        nodo = entrada.get("nodo_mas_cercano")
+        if nodo is None:
+            continue
+        salidas.append(str(nodo))
+    return salidas
 
 
 def _es_numero(valor: Any) -> bool:
@@ -593,7 +631,15 @@ def _lee_cajas(crudo: Any, origen: Path) -> list[Box]:
                 f"en {origen}, el nivel de la caja {datos['id']!r} tendria que ser "
                 f"un entero desde 1, no {nivel!r}"
             )
-        cajas.append(Box(id=str(datos["id"]), node=str(datos["node"]), level=nivel))
+        objeto = datos.get("unity_object")
+        cajas.append(
+            Box(
+                id=str(datos["id"]),
+                node=str(datos["node"]),
+                level=nivel,
+                unity_object=None if objeto is None else str(objeto),
+            )
+        )
 
     return cajas
 

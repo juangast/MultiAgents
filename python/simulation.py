@@ -24,6 +24,7 @@ from agent import Agent, Leg, State
 from graph import (
     ROLE_CHARGING,
     ROLE_DOCK,
+    ROLE_STORAGE,
     Penalties,
     TemporaryPenalties,
     WarehouseGraph,
@@ -43,9 +44,35 @@ DEFAULT_ROUTES: dict[str, tuple[str, str]] = {
 }
 
 
+# Altura a la que viaja una caja montada en la horquilla. Solo para pintar.
+CARRY_HEIGHT: float = 0.5
+
+# Los nodos de estanteria y de banda estan medidos *sobre* el pallet o sobre la
+# maquina: son el sitio de la caja, no un hueco donde quepa un AGV. Pintarlo
+# encima lo mete dentro del modelo, asi que al dibujarlo se le deja este hueco.
+# Es solo cosmetico: la logica sigue trabajando en nodos enteros.
+#
+# Los cargadores y los muelles se quedan fuera: son plazas donde el AGV aparca,
+# y dejarlo a medio metro se ve como si no acabara de llegar.
+# 1.15 m sale de medir el AGV: 0.90 m del centro al morro y las horquillas
+# asomando hasta 0.87 m, asi que a esta distancia las puntas quedan justo en el
+# pallet y el cuerpo fuera. Con menos, el morro se mete dentro de la estanteria.
+APPROACH_GAP: float = 1.15
+
+# Pero sin dejar el AGV pegado al nodo del que sale: en los ramales cortos manda
+# esto, no el hueco, para que siempre se le vea recorrer algo.
+APPROACH_MIN_TRAVEL: float = 0.15
+ROLES_CON_RETRANQUEO: frozenset[str] = frozenset({"storage", "conveyor"})
+
 DEADLOCK_FORCE_TICKS: int = 8
 YIELD_TICKS: int = 10
-STARVED_TICKS: int = 45
+# Ticks que aguanta un AGV sin moverse antes de que el motor le fuerce el paso.
+# Con 45 se le veia plantado medio minuto en pantalla; barriendo de 8 a 45 sobre
+# corridas de 800 ticks con 5 AGVs, 12 sale mejor en todo a la vez: mas entregas
+# (23 contra 19), menos conflictos (863 contra 1424) y menos de la mitad de
+# espera media (7.1 contra 16.1). Por debajo de 10 el motor fuerza tanto que se
+# estorban entre ellos y las entregas vuelven a caer.
+STARVED_TICKS: int = 12
 REROUTE_COOLDOWN: int = 8
 SERVE_EPSILON: float = 0.0
 SERVE_MIN_VISITS: int = 30
@@ -58,7 +85,12 @@ def _recta(graph: WarehouseGraph, a: str, b: str) -> float:
 
 
 def default_route(graph: WarehouseGraph) -> tuple[str, str]:
-    """Origen y destino por defecto del mapa."""
+    """Origen y destino por defecto del mapa.
+
+    Si el mapa trae el bloque `agvs` medido de la escena de Unity, el primer AGV
+    sale del nodo donde de verdad esta puesto. Si no, cae en el primer y ultimo
+    nodo, que sirve para los mapas de prueba pero no se parece a ninguna escena.
+    """
     ruta = DEFAULT_ROUTES.get(graph.name)
     if ruta is not None and all(nodo in graph.adjacency for nodo in ruta):
         return ruta
@@ -66,7 +98,28 @@ def default_route(graph: WarehouseGraph) -> tuple[str, str]:
     nodos = graph.nodes()
     if not nodos:
         raise ValueError("el mapa no tiene ni un nodo")
+
+    if graph.agv_starts:
+        origen = graph.agv_starts[0]
+        destino = next((n for n in reversed(nodos) if n != origen), nodos[-1])
+        return origen, destino
+
     return nodos[0], nodos[-1]
+
+
+def _estado_de_caja_en(rol: str) -> str:
+    """El estado que le toca a una caja por el sitio donde acaba.
+
+    En un muelle termino su viaje y en una estanteria queda guardada. En
+    cualquier otro sitio —un pasillo, tipicamente— esta literalmente en el
+    suelo, y eso es `WAITING_PICKUP`, no `STORED`: marcarla como guardada
+    dibuja una caja flotando en una balda que no existe.
+    """
+    if rol == ROLE_DOCK:
+        return missions.BoxStatus.DELIVERED
+    if rol == ROLE_STORAGE:
+        return missions.BoxStatus.STORED
+    return missions.BoxStatus.WAITING_PICKUP
 
 
 class ActionRecord:
@@ -93,11 +146,8 @@ def make_policy(
     model: str | Path | None = None,
     seed: int = config.RANDOM_SEED,
 ) -> conflicts.Policy:
-    """Monta una politica por su nombre: `"baseline"` o `"qlearning"`."""
+    """Monta una politica por su nombre. Hoy solo hay una: `"qlearning"`."""
     nombre = str(name).strip().lower()
-
-    if nombre == config.POLICY_BASELINE:
-        return conflicts.BaselinePolicy()
 
     if nombre == config.POLICY_QLEARNING:
         import qlearning
@@ -154,7 +204,7 @@ class Simulation:
         routes: Sequence[tuple[str, str]] | None = None,
         deliveries: bool = False,
     ) -> None:
-        """`policy` acepta el nombre del modo (`"baseline"` / `"qlearning"`) o un"""
+        """`policy` acepta el nombre del modo (`"qlearning"`) o una ya construida."""
         if routes is not None:
             n_agents = len(routes)
         if n_agents < 1:
@@ -171,8 +221,8 @@ class Simulation:
         self.step: int = 0
         self.seed: int = seed
         self._model: str | Path | None = model
-        self.policy: conflicts.Policy = conflicts.BaselinePolicy()
-        self.mode: str = self.policy.name
+        self.policy: conflicts.Policy | None = None
+        self.mode: str = config.DEFAULT_POLICY
         self._lock = threading.RLock()
 
         por_defecto = default_route(graph)
@@ -217,8 +267,8 @@ class Simulation:
         self._forzados: int = 0
         self._por_id: dict[int, Agent] = {a.id: a for a in self.agents}
 
-        if policy is not None:
-            self._monta_politica(policy)
+        # Sin politica no hay simulacion: si no se pide ninguna, la de por defecto.
+        self._monta_politica(policy if policy is not None else config.DEFAULT_POLICY)
 
         self.reset()
 
@@ -281,7 +331,7 @@ class Simulation:
                 "step": self.step,
                 "agents": [self._describe(agente) for agente in self.agents],
                 "stats": self.stats(),
-                "boxes": [caja.as_dict() for caja in self.inventory.values()],
+                "boxes": [self._describe_caja(caja) for caja in self.inventory.values()],
                 "mode": self.mode,
             }
 
@@ -300,7 +350,7 @@ class Simulation:
             return self.snapshot()
 
     def stats(self) -> dict[str, Any]:
-        """Los numeros de la corrida, que son con los que se compara el baseline.
+        """Los numeros de la corrida, que son con los que se mide la politica.
 
         Todo aqui dentro es determinista y serializable: dos simulaciones con la
         misma semilla tienen que producir snapshots identicos, `stats` incluido.
@@ -426,7 +476,12 @@ class Simulation:
         return rutas
 
     def _planea_rutas(self, n_agents: int) -> list[tuple[str, str]]:
-        """Reparte origen y destino, siempre igual para la misma semilla."""
+        """Reparte origen y destino, siempre igual para la misma semilla.
+
+        Las salidas que el mapa declara en `agvs` mandan sobre el sorteo: son
+        donde estan los AGV en la escena de Unity, y arrancar en otro sitio hace
+        que el cliente los vea teletransportarse en el primer paso.
+        """
         rutas = [(self._origen, self._destino)]
         nodos = self.graph.nodes()
         if len(nodos) < 2:
@@ -434,8 +489,26 @@ class Simulation:
         if n_agents == 1:
             return rutas
 
+        # El mapa puede repetir salidas (dos AGV medidos junto al mismo nodo) y
+        # cada uno necesita la suya: las repetidas se sortean como las que faltan.
+        tomados = {self._origen}
+        del_mapa: list[str] = []
+        for nodo in self.graph.agv_starts[1:]:
+            if len(del_mapa) >= n_agents - 1:
+                break
+            if nodo in tomados:
+                continue
+            del_mapa.append(nodo)
+            tomados.add(nodo)
+
         rng = random.Random(self.seed)
-        origenes = rng.sample([n for n in nodos if n != self._origen], n_agents - 1)
+        faltan = n_agents - 1 - len(del_mapa)
+        sorteados = (
+            rng.sample([n for n in nodos if n not in tomados], faltan)
+            if faltan > 0
+            else []
+        )
+        origenes = del_mapa + sorteados
         destinos = rng.sample([n for n in nodos if n != self._destino], n_agents - 1)
         rutas.extend(zip(origenes, destinos))
         return rutas
@@ -465,11 +538,7 @@ class Simulation:
         if caja is not None:
             caja.mission = None
             caja.node = agente.current_node if agente.carrying else caja.node
-            caja.status = (
-                missions.BoxStatus.DELIVERED
-                if self.graph.role_of(caja.node) == ROLE_DOCK
-                else missions.BoxStatus.STORED
-            )
+            caja.status = _estado_de_caja_en(self.graph.role_of(caja.node))
         agente.mission = None
         agente.carrying = None
         agente.leg = Leg.NONE
@@ -486,10 +555,7 @@ class Simulation:
             return
         caja.node = nodo
         caja.mission = None
-        if self.graph.role_of(nodo) == ROLE_DOCK:
-            caja.status = missions.BoxStatus.DELIVERED
-        else:
-            caja.status = missions.BoxStatus.STORED
+        caja.status = _estado_de_caja_en(self.graph.role_of(nodo))
 
     def _fase_bateria(self) -> None:
         """Los enchufados cargan, y nadie empieza un tramo del que no pueda volver.
@@ -513,11 +579,22 @@ class Simulation:
                 self._manda_a_cargar(agente, cargadores)
 
     def _carga(self, agente: Agent) -> None:
-        """Un tick enchufado. En cuanto se llena vuelve a la subasta."""
+        """Un tick enchufado. Al llenarse retoma su entrega, o vuelve a pujar."""
         if not agente.charge():
             return
         agente.charges += 1
         agente.state = State.IDLE
+
+        if agente.carrying and agente.route_to_destination(self.penalties):
+            log.debug("paso %3d | AGV %s | cargado, sigue con %s hacia %s",
+                      self.step, agente.id, agente.carrying, agente.destination)
+            return
+
+        if agente.mission is not None:
+            # Cargado pero sin camino al muelle: mejor devolver la mision que
+            # quedarse con ella cogida y bloquearla para todos los demas.
+            self._suelta_mision(agente)
+
         log.debug("paso %3d | AGV %s | cargado al 100%%, vuelve a pujar",
                   self.step, agente.id)
 
@@ -530,8 +607,18 @@ class Simulation:
         agente.state = State.IDLE
 
     def _manda_a_cargar(self, agente: Agent, cargadores: Sequence[str]) -> None:
-        """Le corta lo que estuviera haciendo y lo manda a enchufarse."""
-        if agente.mission is not None:
+        """Le corta lo que estuviera haciendo y lo manda a enchufarse.
+
+        Si ya tiene la caja encima se la lleva puesta y retoma la entrega al
+        acabar de cargar. Tirarla en el pasillo, que es lo que se hacia antes,
+        deja cajas por el suelo y obliga a otro AGV a ir a recogerlas.
+        """
+        if agente.carrying:
+            log.info(
+                "AGV %s se va a cargar al %.0f%% con %s encima; retoma %s despues",
+                agente.id, agente.battery, agente.carrying, agente.mission,
+            )
+        elif agente.mission is not None:
             log.warning(
                 "AGV %s abandona %s al %.0f%%: se quedaria sin vuelta a un cargador",
                 agente.id, agente.mission, agente.battery,
@@ -617,7 +704,12 @@ class Simulation:
         libres = [par for par in asequibles if par[1] not in tomados]
 
         for _, nodo in libres or asequibles or alcanzables:
-            if agente.assign_task(agente.current_node, nodo, task=agente.task):
+            trazada = (
+                agente.divert_to(nodo)
+                if agente.carrying
+                else agente.assign_task(agente.current_node, nodo, task=agente.task)
+            )
+            if trazada:
                 agente.leg = Leg.TO_CHARGER
                 if len(agente.path) == 1:
                     agente.leg = Leg.NONE
@@ -929,7 +1021,7 @@ class Simulation:
         for conflicto in detectados:
             for agent_id in conflicto.agents:
                 suyos.setdefault(agent_id, []).append(conflicto)
-            resolucion = conflicts.resolve_baseline(conflicto)
+            resolucion = conflicts.resolve_conflict(conflicto)
             if resolucion.winner is None:
                 continue
             for perdedor in resolucion.losers:
@@ -1376,6 +1468,43 @@ class Simulation:
             "battery": round(agente.battery, 1),
         }
 
+    def _describe_caja(self, caja: missions.BoxState) -> dict[str, object]:
+        """Una caja tal y como la ve Unity, con su sitio ya en coordenadas de Unity.
+
+        Sin esto el cliente tendria que cargarse el mapa a mano para saber donde
+        cae cada nodo: el snapshot no lo lleva y no hay ruta que lo sirva.
+        """
+        datos = dict(caja.as_dict())
+        px, py = self._posicion_caja(caja)
+        x, _y, z = to_unity(px, py)
+        datos["x"] = x
+        datos["y"] = self._altura_caja(caja)
+        datos["z"] = z
+        return datos
+
+    def _posicion_caja(self, caja: missions.BoxState) -> tuple[float, float]:
+        """Donde esta la caja en el plano: en su nodo, o encima del AGV que la lleva."""
+        if caja.status == missions.BoxStatus.IN_TRANSIT:
+            for agente in self.agents:
+                if agente.carrying == caja.id:
+                    return self._posicion(agente)
+        return self.graph.positions.get(caja.node, (0.0, 0.0))
+
+    def _altura_caja(self, caja: missions.BoxState) -> float:
+        """Altura de la caja: la balda de su nivel, o la horquilla si va montada.
+
+        Las constantes salen de `coordinate_system` del mapa, que es quien midio
+        la estanteria. Si el mapa no las trae, se cae a las del almacen del reto.
+        """
+        sistema = self.graph.coordinate_system
+        base = float(sistema.get("level_base", 0.154))
+        alto = float(sistema.get("level_height", 0.69))
+        offset = float(sistema.get("caja_offset_y", 0.218))
+
+        if caja.status == missions.BoxStatus.IN_TRANSIT:
+            return float(sistema.get("carry_height", CARRY_HEIGHT))
+        return base + (max(caja.level, 1) - 1) * alto + offset
+
     def _posicion(self, agente: Agent) -> tuple[float, float]:
         """Posicion logica, interpolada entre el nodo actual y el siguiente."""
         actual = self.graph.positions.get(agente.current_node)
@@ -1384,16 +1513,52 @@ class Simulation:
 
         siguiente = agente.next_node()
         if siguiente is None or agente.progress <= 0.0:
-            return actual
+            return self._retranquea(actual, agente.current_node, agente.previous_node())
 
         destino = self.graph.positions.get(siguiente)
         if destino is None:
             return actual
 
         avance = min(agente.progress, 1.0)
-        return (
+        punto = (
             actual[0] + (destino[0] - actual[0]) * avance,
             actual[1] + (destino[1] - actual[1]) * avance,
+        )
+        return self._retranquea(punto, siguiente, agente.current_node)
+
+    def _retranquea(
+        self,
+        punto: tuple[float, float],
+        nodo: str,
+        desde: str | None,
+    ) -> tuple[float, float]:
+        """Aparta el punto del nodo cuando ese nodo es un objeto, no un pasillo.
+
+        El AGV se queda a `APPROACH_GAP` metros, sobre la linea por la que viene:
+        se planta delante de la estanteria en vez de meterse dentro. En los ramales
+        cortos el hueco se recorta para dejarle siempre `APPROACH_MIN_TRAVEL` de
+        recorrido, y asi no acaba pintado encima del nodo del que salio.
+        """
+        if self.graph.role_of(nodo) not in ROLES_CON_RETRANQUEO:
+            return punto
+
+        centro = self.graph.positions.get(nodo)
+        origen = self.graph.positions.get(desde) if desde is not None else None
+        if centro is None or origen is None:
+            return punto
+
+        largo = math.dist(centro, origen)
+        if largo <= 0.0:
+            return punto
+
+        hueco = min(APPROACH_GAP, max(0.0, largo - APPROACH_MIN_TRAVEL))
+        if math.dist(punto, centro) >= hueco:
+            return punto
+
+        avance = hueco / largo
+        return (
+            centro[0] + (origen[0] - centro[0]) * avance,
+            centro[1] + (origen[1] - centro[1]) * avance,
         )
 
     def _rotacion(self, agente: Agent) -> float:
