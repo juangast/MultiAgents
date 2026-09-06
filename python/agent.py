@@ -172,6 +172,18 @@ class Agent:
         self.busy = 0
         return True
 
+    def divert_to(self, node: str, penalties: Penalties | None = None) -> bool:
+        """Le traza ruta a otro nodo sin soltar lo que lleve encima.
+
+        `assign_task` borra la entrega entera —caja, destino y carga— porque
+        empieza una tarea nueva. Un desvio no: es un parentesis dentro de la
+        misma mision, para ir a cargar y volver a lo que estaba. Sin esto, un
+        AGV que se va a enchufar tiene que tirar la caja donde este parado.
+        """
+        return self._traza(
+            self.current_node, node, task=self.task, penalties=penalties
+        )
+
     def route_to_destination(self, penalties: Penalties | None = None) -> bool:
         """Traza el segundo tramo: desde donde recogio hasta el muelle.
 
@@ -390,7 +402,14 @@ class Agent:
         return bool(self.path) and self.path_index >= len(self.path) - 1
 
     def reset(self) -> None:
-        """Lo deja como recien creado, en su nodo de partida y sin tarea."""
+        """Lo deja como recien creado, en su nodo de partida y sin tarea.
+
+        Tiene que borrar *todo* lo que pone `__init__`. Dejarse `mission` puesta
+        deja al AGV parado para siempre: `available()` pide que sea None, el
+        MissionManager de la corrida nueva no conoce esa mision, y nadie se la
+        va a quitar. Lo mismo con la bateria: heredarla vacia arranca la corrida
+        con un AGV que solo puede ir a cargar.
+        """
         self.current_node = self.start_node
         self.target_node = None
         self.path = []
@@ -404,3 +423,7 @@ class Agent:
         self.destination = None
         self.carrying = None
         self.busy = 0
+        self.mission = None
+        self.completed = 0
+        self.battery = config.BATTERY_FULL
+        self.charges = 0

@@ -58,12 +58,14 @@ class BoxState:
         level: int,
         status: BoxStatus,
         mission: str | None = None,
+        unity_object: str | None = None,
     ) -> None:
         self.id = id
         self.node = node
         self.level = level
         self.status = status
         self.mission = mission
+        self.unity_object = unity_object
 
     def as_dict(self) -> dict[str, Any]:
         """La caja tal y como la ve Unity."""
@@ -73,6 +75,7 @@ class BoxState:
             "level": self.level,
             "status": self.status,
             "mission": self.mission,
+            "unity_object": self.unity_object,
         }
 
 
@@ -93,6 +96,7 @@ def build_inventory(graph: WarehouseGraph) -> dict[str, BoxState]:
                 if graph.role_of(caja.node) == ROLE_PRODUCTION
                 else BoxStatus.STORED
             ),
+            unity_object=caja.unity_object,
         )
         for caja in sorted(graph.boxes, key=lambda c: c.id)
     }

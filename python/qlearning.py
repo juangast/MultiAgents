@@ -540,7 +540,7 @@ class Decision:
 
 
 class QLearningPolicy:
-    """La politica de Q-Learning, con la misma interfaz que la baseline.
+    """La politica de Q-Learning, con la interfaz que pide la simulacion.
 
     Para que vea el estado completo hay que atarla con `bind()`. Sin atar sigue
     funcionando, pero saca el estado del `LocalState` que le pasa el motor, y
@@ -797,40 +797,6 @@ class TrainablePolicy(Protocol):
     def reset(self) -> None: ...
 
     def decision(self, agent_id: int) -> Decision | None: ...
-
-
-class BaselineAdapter:
-    """La politica de la fase 5 con el cuaderno de la fase 7."""
-
-    name: str = "baseline"
-
-    def __init__(self, *, simulation: SimulationView | None = None) -> None:
-        self._inner = conflicts.BaselinePolicy()
-        self._simulation: SimulationView | None = simulation
-        self._last: dict[int, Decision] = {}
-
-    def __repr__(self) -> str:
-        return f"BaselineAdapter(bound={self._simulation is not None})"
-
-    def bind(self, simulation: SimulationView) -> None:
-        self._simulation = simulation
-
-    def reset(self) -> None:
-        self._last.clear()
-
-    def decide(self, agent: Agent, local_state: conflicts.LocalState) -> str:
-        estado = (
-            get_local_state(agent, self._simulation)
-            if self._simulation is not None
-            else state_from_local(agent, local_state)
-        )
-        motor = self._inner.decide(agent, local_state)
-        accion = Action.ADVANCE if motor == conflicts.Intent.ADVANCE else Action.WAIT
-        self._last[agent.id] = Decision(estado, accion, local_state.step)
-        return motor
-
-    def decision(self, agent_id: int) -> Decision | None:
-        return self._last.get(agent_id)
 
 
 def random_routes(
@@ -1293,48 +1259,9 @@ def evaluate(
     tabla = load_qtable(model_path)
 
     aprendida = Trainer(graph, ajustes, q_table=tabla, learn=False)
-    aprendida.run(episodes)
+    historia = aprendida.run(episodes)
+    return aprendida, historia
 
-    referencia = _run_baseline(graph, ajustes, episodes)
-    return aprendida, referencia
-
-
-def _run_baseline(
-    graph: WarehouseGraph, cfg: TrainingConfig, episodes: int
-) -> list[EpisodeStats]:
-    """La baseline de la fase 5 sobre los mismos escenarios, con la misma vara."""
-    maestro = random.Random(cfg.seed)
-    semilla_escenarios = maestro.randrange(2**31)
-
-    politica = BaselineAdapter()
-    entorno = TrainingEnv(
-        graph,
-        cfg.agents,
-        politica,
-        seed=semilla_escenarios,
-        max_steps=cfg.max_steps,
-    )
-
-    historia: list[EpisodeStats] = []
-    with _quiet("simulation", "agent"):
-        for episode in range(1, episodes + 1):
-            entorno.reset()
-            total = 0.0
-            decisiones = 0
-            while not entorno.done():
-                for transicion in entorno.step():
-                    total += transicion.reward
-                    decisiones += 1
-            for transicion in entorno.close_pending():
-                total += transicion.reward
-                decisiones += 1
-            numeros = entorno.stats(episode, 0.0, states_visited=0)
-            historia.append(
-                numeros.con_recompensa(
-                    total, total / decisiones if decisiones else 0.0
-                )
-            )
-    return historia
 
 
 def write_training_log(
@@ -1386,40 +1313,6 @@ def summary_lines(
     return lineas
 
 
-def compare_lines(
-    aprendida: Sequence[EpisodeStats], baseline: Sequence[EpisodeStats]
-) -> list[str]:
-    """Q-Learning contra baseline, promedio a promedio, listo para el log."""
-    if not aprendida or not baseline:
-        return ["(no hay con que comparar)"]
-
-    def medias(filas: Sequence[EpisodeStats]) -> dict[str, float]:
-        ticks = max(statistics.fmean(f.makespan for f in filas), 1.0)
-        return {
-            "recompensa": statistics.fmean(f.total_reward for f in filas),
-            "completadas": statistics.fmean(f.completed_tasks for f in filas),
-            "deadlocks": statistics.fmean(f.deadlocks for f in filas),
-            "makespan": ticks,
-            "conflictos": statistics.fmean(f.conflicts for f in filas),
-            "conflictos/tick": statistics.fmean(f.conflicts for f in filas) / ticks,
-            "espera": statistics.fmean(f.total_wait for f in filas),
-            "espera/tick": statistics.fmean(f.total_wait for f in filas) / ticks,
-        }
-
-    izquierda, derecha = medias(aprendida), medias(baseline)
-    lineas = [
-        f"--- {len(aprendida)} episodios, los mismos escenarios, medias ---",
-        f"{'metrica':<17}{'q-learning':>12}{'baseline':>12}{'diferencia':>13}",
-        "-" * 54,
-    ]
-    for nombre in izquierda:
-        uno, otro = izquierda[nombre], derecha[nombre]
-        lineas.append(f"{nombre:<17}{uno:>12.2f}{otro:>12.2f}{uno - otro:>+13.2f}")
-    lineas.append(
-        "los totales crudos (conflictos, espera) premian al que muere antes: "
-        "miralos por tick"
-    )
-    return lineas
 
 
 class _quiet:
