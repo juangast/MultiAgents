@@ -16,7 +16,7 @@ from typing import Any
 
 import config
 from config import get_logger
-from graph import ROLE_DOCK, ROLE_PRODUCTION, ROLE_STORAGE, Box, WarehouseGraph
+from graph import ROLE_DOCK, ROLE_PRODUCTION, ROLE_STORAGE, WarehouseGraph
 
 log = get_logger("missions")
 

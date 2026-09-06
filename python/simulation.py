@@ -24,12 +24,9 @@ from agent import Agent, Leg, State
 from graph import (
     ROLE_CHARGING,
     ROLE_DOCK,
-    ROLE_STORAGE,
-    Penalties,
     TemporaryPenalties,
     WarehouseGraph,
     astar,
-    path_cost,
     to_unity,
 )
 from config import get_logger
@@ -37,32 +34,6 @@ from config import get_logger
 log = get_logger("simulation")
 
 FINISHED_DEADLOCK: str = "deadlock"
-
-DEFAULT_ROUTES: dict[str, tuple[str, str]] = {
-    "simple": ("A", "F"),
-    "warehouse": ("S1", "N6"),
-}
-
-
-# Altura a la que viaja una caja montada en la horquilla. Solo para pintar.
-CARRY_HEIGHT: float = 0.5
-
-# Los nodos de estanteria y de banda estan medidos *sobre* el pallet o sobre la
-# maquina: son el sitio de la caja, no un hueco donde quepa un AGV. Pintarlo
-# encima lo mete dentro del modelo, asi que al dibujarlo se le deja este hueco.
-# Es solo cosmetico: la logica sigue trabajando en nodos enteros.
-#
-# Los cargadores y los muelles se quedan fuera: son plazas donde el AGV aparca,
-# y dejarlo a medio metro se ve como si no acabara de llegar.
-# 1.15 m sale de medir el AGV: 0.90 m del centro al morro y las horquillas
-# asomando hasta 0.87 m, asi que a esta distancia las puntas quedan justo en el
-# pallet y el cuerpo fuera. Con menos, el morro se mete dentro de la estanteria.
-APPROACH_GAP: float = 1.15
-
-# Pero sin dejar el AGV pegado al nodo del que sale: en los ramales cortos manda
-# esto, no el hueco, para que siempre se le vea recorrer algo.
-APPROACH_MIN_TRAVEL: float = 0.15
-ROLES_CON_RETRANQUEO: frozenset[str] = frozenset({"storage", "conveyor"})
 
 DEADLOCK_FORCE_TICKS: int = 8
 YIELD_TICKS: int = 10
@@ -78,23 +49,8 @@ SERVE_EPSILON: float = 0.0
 SERVE_MIN_VISITS: int = 30
 
 
-def _recta(graph: WarehouseGraph, a: str, b: str) -> float:
-    """Distancia en linea recta entre dos nodos. 0.0 si falta una posicion."""
-    p, q = graph.positions.get(a), graph.positions.get(b)
-    return 0.0 if p is None or q is None else math.dist(p, q)
-
-
 def default_route(graph: WarehouseGraph) -> tuple[str, str]:
-    """Origen y destino por defecto del mapa.
-
-    Si el mapa trae el bloque `agvs` medido de la escena de Unity, el primer AGV
-    sale del nodo donde de verdad esta puesto. Si no, cae en el primer y ultimo
-    nodo, que sirve para los mapas de prueba pero no se parece a ninguna escena.
-    """
-    ruta = DEFAULT_ROUTES.get(graph.name)
-    if ruta is not None and all(nodo in graph.adjacency for nodo in ruta):
-        return ruta
-
+    """Origen y destino por defecto del mapa: el primer nodo y el ultimo."""
     nodos = graph.nodes()
     if not nodos:
         raise ValueError("el mapa no tiene ni un nodo")
