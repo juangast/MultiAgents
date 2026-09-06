@@ -16,7 +16,6 @@ log = get_logger("agent")
 
 class State(str, Enum):
     """En que anda el AGV. El orden es el del ciclo de vida."""
-
     __str__ = str.__str__
 
     IDLE = "idle"
