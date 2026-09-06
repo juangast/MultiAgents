@@ -79,15 +79,13 @@ class Conflict:
         node: str | None = None,
         edge: tuple[str, str] | None = None,
     ) -> None:
+        if type not in _ORDEN:
+            raise ValueError(f"tipo de conflicto desconocido: {type!r}")
         self.type = type
         self.agents = agents
         self.step = step
         self.node = node
         self.edge = edge
-
-    def __post_init__(self) -> None:
-        if self.type not in _ORDEN:
-            raise ValueError(f"tipo de conflicto desconocido: {self.type!r}")
 
 
 class Resolution:

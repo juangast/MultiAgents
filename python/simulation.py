@@ -24,11 +24,9 @@ from agent import Agent, Leg, State
 from graph import (
     ROLE_CHARGING,
     ROLE_DOCK,
-    Penalties,
     TemporaryPenalties,
     WarehouseGraph,
     astar,
-    path_cost,
     to_unity,
 )
 from config import get_logger
@@ -36,12 +34,6 @@ from config import get_logger
 log = get_logger("simulation")
 
 FINISHED_DEADLOCK: str = "deadlock"
-
-DEFAULT_ROUTES: dict[str, tuple[str, str]] = {
-    "simple": ("A", "F"),
-    "warehouse": ("S1", "N6"),
-}
-
 
 DEADLOCK_FORCE_TICKS: int = 8
 YIELD_TICKS: int = 10
@@ -51,18 +43,8 @@ SERVE_EPSILON: float = 0.0
 SERVE_MIN_VISITS: int = 30
 
 
-def _recta(graph: WarehouseGraph, a: str, b: str) -> float:
-    """Distancia en linea recta entre dos nodos. 0.0 si falta una posicion."""
-    p, q = graph.positions.get(a), graph.positions.get(b)
-    return 0.0 if p is None or q is None else math.dist(p, q)
-
-
 def default_route(graph: WarehouseGraph) -> tuple[str, str]:
-    """Origen y destino por defecto del mapa."""
-    ruta = DEFAULT_ROUTES.get(graph.name)
-    if ruta is not None and all(nodo in graph.adjacency for nodo in ruta):
-        return ruta
-
+    """Origen y destino por defecto del mapa: el primer nodo y el ultimo."""
     nodos = graph.nodes()
     if not nodos:
         raise ValueError("el mapa no tiene ni un nodo")

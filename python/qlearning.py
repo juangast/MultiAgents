@@ -11,7 +11,7 @@ import math
 import random
 import statistics
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from enum import Enum
 from itertools import islice

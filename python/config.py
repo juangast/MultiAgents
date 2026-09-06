@@ -7,11 +7,6 @@ from pathlib import Path
 HOST: str = "127.0.0.1"
 PORT: int = 5000
 ENCODING: str = "utf-8"
-CMD_GET_STATE: str = "GET_STATE"
-CMD_RESET: str = "RESET"
-CMD_PING: str = "PING"
-CMD_SET_MODE: str = "SET_MODE"
-
 UNITY_SCALE: float = 1.0
 RANDOM_SEED: int = 42
 
