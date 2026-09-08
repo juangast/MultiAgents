@@ -32,9 +32,19 @@ BATTERY_RESERVE: float = 30.0
 
 REWARD_TASK_COMPLETE: float = 100.0
 REWARD_PICKED: float = 50.0
+# Lo que vale dejar la caja en su muelle, que es el objetivo del reto entero.
+# Faltaba. En modo entregas los AGV encadenan misiones y nunca pasan a DONE, asi
+# que REWARD_TASK_COMPLETE no se cobra nunca (1500 episodios cerraron con
+# completed_tasks=0) y la unica señal positiva era recoger: se entrenaban AGVs
+# que levantaban cajas y no las llevaban a ningun sitio.
+REWARD_DELIVERED: float = 100.0
 REWARD_PROGRESS: float = 2.0
 REWARD_WAIT: float = -1.0
-REWARD_CONFLICT: float = -20.0
+# Un conflicto cuesta, de verdad, un tick de retraso: lo mismo que esperar. A
+# -20 costaba veinte, y como salen ~1200 por episodio contra ~10 entregas, la
+# suma de penalizaciones (-24000) sepultaba a la de entregas (+1000): la
+# politica optima pasaba a ser "no te metas en lios", o sea no moverse.
+REWARD_CONFLICT: float = -2.0
 REWARD_DEADLOCK: float = -50.0
 REWARD_USELESS_REROUTE: float = -3.0
 
@@ -53,7 +63,12 @@ MAPS_DIR: Path = PROJECT_ROOT / "python" / "maps"
 MODELS_DIR: Path = PROJECT_ROOT / "python" / "models"
 DEFAULT_MAP: str = "almacen_reto"
 
-Q_TABLE_FILE: Path = MODELS_DIR / "q_table.json"
+# La tabla del estado de dos bits. Con 4 estados y 3 acciones el espacio de
+# politicas tiene 81 elementos, asi que se pudo evaluar entero sobre el objetivo
+# real (cajas entregadas, en 4 escenarios) en vez de aproximarlo: 23.0 de media,
+# contra 20.0 de la vieja de 144 estados y 14.2 de la que sale de entrenar.
+# `q_table.json` se deja como estaba, con el estado de seis campos.
+Q_TABLE_FILE: Path = MODELS_DIR / "q_table_busqueda.json"
 TRAINING_LOG_FILE: Path = RESULTS_DIR / "training_log.csv"
 
 _FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"

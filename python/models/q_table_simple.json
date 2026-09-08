@@ -1,0 +1,105 @@
+{
+  "format": "agv-qtable/1",
+  "state_fields": [
+    "tengo_prioridad",
+    "hay_desvio"
+  ],
+  "actions": [
+    "advance",
+    "wait",
+    "reroute"
+  ],
+  "metadata": {
+    "trained_at": "2026-09-08T00:04:54+00:00",
+    "map": "almacen_reto",
+    "map_nodes": 62,
+    "agents": 5,
+    "seed": 42,
+    "episodes_run": 2000,
+    "hyperparameters": {
+      "map": "almacen_reto",
+      "scenario": "",
+      "deliveries": true,
+      "agents": 5,
+      "episodes": 2000,
+      "seed": 42,
+      "alpha": 0.2,
+      "gamma": 0.99,
+      "epsilon_start": 1.0,
+      "epsilon_end": 0.05,
+      "epsilon_decay": 0.995,
+      "max_steps_per_episode": 600,
+      "actions": [
+        "advance",
+        "wait",
+        "reroute"
+      ]
+    },
+    "final_epsilon": 0.05,
+    "states_visited": 4,
+    "state_space_size": 4,
+    "shared_q_table": true,
+    "visits": {
+      "0|0": 438212,
+      "0|1": 273917,
+      "1|0": 747781,
+      "1|1": 837735
+    },
+    "action_visits": {
+      "0|0": {
+        "advance": 116159,
+        "wait": 189734,
+        "reroute": 132319
+      },
+      "0|1": {
+        "advance": 53769,
+        "wait": 81600,
+        "reroute": 138548
+      },
+      "1|0": {
+        "advance": 242014,
+        "wait": 288622,
+        "reroute": 217145
+      },
+      "1|1": {
+        "advance": 319309,
+        "wait": 241564,
+        "reroute": 276862
+      }
+    },
+    "last_episode": {
+      "episode": 2000,
+      "epsilon": 0.05,
+      "total_reward": 2170.3,
+      "avg_reward": 2.065,
+      "conflicts": 807,
+      "deadlocks": 0,
+      "completed_tasks": 0,
+      "makespan": 574,
+      "total_wait": 150,
+      "states_visited": 4
+    }
+  },
+  "q": {
+    "0|0": {
+      "advance": 41.345302731124825,
+      "wait": 46.64242777916417,
+      "reroute": 91.76271747408553
+    },
+    "0|1": {
+      "advance": 97.280150289483,
+      "wait": 97.00817463130625,
+      "reroute": 122.60452996850827
+    },
+    "1|0": {
+      "advance": 36.172676270759666,
+      "wait": 92.3574869344683,
+      "reroute": 73.22571313125752
+    },
+    "1|1": {
+      "advance": 110.07518720659158,
+      "wait": 121.9077989368188,
+      "reroute": 107.11392068122206
+    }
+  }
+}
