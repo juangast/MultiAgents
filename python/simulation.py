@@ -24,6 +24,7 @@ from agent import Agent, Leg, State
 from graph import (
     ROLE_CHARGING,
     ROLE_DOCK,
+    ROLE_STORAGE,
     TemporaryPenalties,
     WarehouseGraph,
     astar,
@@ -34,6 +35,32 @@ from config import get_logger
 log = get_logger("simulation")
 
 FINISHED_DEADLOCK: str = "deadlock"
+
+# Altura a la que viaja una caja montada en la horquilla. Solo para pintar.
+CARRY_HEIGHT: float = 0.5
+
+# Los nodos de estanteria y de banda estan medidos *sobre* el pallet o sobre la
+# maquina: son el sitio de la caja, no un hueco donde quepa un AGV. Pintarlo
+# encima lo mete dentro del modelo, asi que al dibujarlo se le deja este hueco.
+# Es solo cosmetico: la logica sigue trabajando en nodos enteros.
+#
+# Los cargadores y los muelles se quedan fuera: son plazas donde el AGV aparca,
+# y dejarlo a medio metro se ve como si no acabara de llegar.
+# 1.15 m sale de medir el AGV: 0.90 m del centro al morro y las horquillas
+# asomando hasta 0.87 m, asi que a esta distancia las puntas quedan justo en el
+# pallet y el cuerpo fuera. Con menos, el morro se mete dentro de la estanteria.
+# 1.55 y no 1.15: con 1.15 el AGV se plantaba DENTRO de la estanteria en 10 de
+# las aproximaciones del mapa (medido cruzando cada arista contra las cajas de
+# colision reales de la escena), por entre 0.10 y 0.40 m. Subirlo a 1.55 deja 3.
+# Mas alto no gana nada: los 3 que quedan son ramales tan cortos que el hueco lo
+# limita `APPROACH_MIN_TRAVEL`, y ahi el AGV no cabe fuera por esa linea; esos
+# los resuelve el empuje lateral del cliente de Unity.
+APPROACH_GAP: float = 1.55
+
+# Pero sin dejar el AGV pegado al nodo del que sale: en los ramales cortos manda
+# esto, no el hueco, para que siempre se le vea recorrer algo.
+APPROACH_MIN_TRAVEL: float = 0.15
+ROLES_CON_RETRANQUEO: frozenset[str] = frozenset({"storage", "conveyor"})
 
 DEADLOCK_FORCE_TICKS: int = 8
 YIELD_TICKS: int = 10
@@ -908,10 +935,8 @@ class Simulation:
             destino = intenciones.get(agente.id)
             if destino is None:
                 continue
-            acciones[agente.id] = conflicts.normalize_intent(
-                self.policy.decide(
-                    agente, self._estado_local(agente, destino, bloqueado_por, suyos)
-                )
+            acciones[agente.id] = self._accion_de(
+                agente, destino, self._estado_local(agente, destino, bloqueado_por, suyos)
             )
 
         forzados = self._desatasca(intenciones, acciones)
@@ -967,6 +992,37 @@ class Simulation:
             if self.step < reserva[1]
         }
         self._zonas = conflicts.congested_zones(self.agents, self.graph)
+
+    def _accion_de(
+        self, agente: Agent, destino: str, local: conflicts.LocalState
+    ) -> str:
+        """La accion de este AGV: la que pida la politica, salvo que no haga nada.
+
+        Con el nodo de delante vacio y sin nadie que le haya ganado el desempate,
+        avanzar es la unica accion que mueve: mas abajo solo ADVANCE arranca la
+        travesia, asi que WAIT y REROUTE tiran el tick. Y rerutear ahi tampoco
+        esquiva nada, porque `reroute_penalties()` encarece el nodo de delante y
+        ese nodo esta libre: A* devuelve la misma ruta, o una peor.
+
+        No es una preferencia de politica, es fisica del motor, y por eso se
+        aplica aqui y no dentro de una politica concreta.
+
+        Sin este filtro la Q-table entrenada que viene en el repo elige REROUTE
+        en el 76% de los ticks en los que el AGV va suelto (562 de 744): avanza
+        199 veces de 1071, el almacen entrega 2 cajas en 300 pasos y se atasca
+        en 3 a partir del paso 200. Con el filtro, 21 en 800 pasos y sin
+        estancarse. La tabla no esta rota del todo: su ultimo episodio de
+        entrenamiento ya cerro con `completed_tasks: 1` y recompensa media
+        negativa, o sea que nunca aprendio a separar avanzar de rerutear en la
+        celda `0|0|0|1|1|1`, que es la mas visitada (advance 60.8, wait 62.4,
+        reroute 64.7: un empate que el desempate greedy resuelve hacia reroute).
+
+        En cuanto hay alguien delante o alguien le gana el paso, decide la
+        politica: ceder o rodear ahi si significan algo, y es lo que se aprende.
+        """
+        if not local.blocked_by and not self.occupancy.get(destino):
+            return conflicts.Intent.ADVANCE
+        return conflicts.normalize_intent(self.policy.decide(agente, local))
 
     def _arbitra(
         self, detectados: list[conflicts.Conflict]
