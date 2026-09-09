@@ -43,6 +43,10 @@ State = tuple[int, ...]
 
 QUEUE_CAP: int = 2
 
+# Por debajo de esto, dos celdas de una misma fila valen lo mismo y la tabla no
+# esta prefiriendo ninguna. Ver `QLearningPolicy._sin_criterio()`.
+FLAT_ROW_EPS: float = 1e-9
+
 
 class SimulationView(Protocol):
     """Lo que `get_local_state()` necesita mirar de la simulacion."""
@@ -91,6 +95,36 @@ def state_from_local(agent: Agent, local_state: conflicts.LocalState) -> State:
         _tengo_prioridad(agent, rivales),
         int(agent.carrying is not None),
     )
+
+
+PRIORITY_FIELD: int = STATE_FIELDS.index("has_priority")
+
+
+def con_prioridad_del_motor(
+    state: State, local_state: conflicts.LocalState
+) -> State:
+    """El mismo estado, pero con `has_priority` copiado del arbitraje del motor.
+
+    `get_local_state()` deduce la prioridad con `_rivales()`, que reconstruye por
+    su cuenta quien se disputa el paso. El motor no lo deduce: ya lo ha decidido,
+    y lo dice en `local_state.blocked_by`. Medido sobre una corrida de 600 ticks
+    con 5 AGVs, las dos versiones discrepan en el 12% de las decisiones, y
+    siempre en la misma direccion: `_rivales()` ve menos rivales de los que hay,
+    asi que el AGV se cree con via libre, elige ADVANCE y el motor lo para.
+
+    Eso no es solo un tick perdido: ese ADVANCE frenado se cobra como CONFLICT,
+    que es la penalizacion mas cara despues del deadlock. Con la respuesta del
+    motor delante no hay razon para preferir la aproximacion.
+
+    Se deja `_rivales()` para el `next_state` del entrenamiento, que se calcula
+    sin `LocalState` porque ahi el motor todavia no ha arbitrado nada.
+    """
+    prioridad = int(not local_state.blocked_by)
+    if state[PRIORITY_FIELD] == prioridad:
+        return state
+    campos = list(state)
+    campos[PRIORITY_FIELD] = prioridad
+    return tuple(campos)
 
 
 DISTANCE_NEAR_NODES: int = 3
@@ -569,6 +603,7 @@ class QLearningPolicy:
         self._avisado: bool = False
         self._visits: Mapping[State, Mapping[Action, int]] = visits or {}
         self.min_visits: int = int(min_visits)
+        self.fallbacks: int = 0
 
     def __repr__(self) -> str:
         return (
@@ -584,11 +619,12 @@ class QLearningPolicy:
     def reset(self) -> None:
         """Olvida las decisiones del episodio. La Q-table **no** se toca."""
         self._last.clear()
+        self.fallbacks = 0
 
     def decide(self, agent: Agent, local_state: conflicts.LocalState) -> str:
         """La accion elegida: `"advance"`, `"wait"` o `"reroute"`."""
         estado = self.observe(agent, local_state)
-        accion = self.choose(estado)
+        accion = self.choose(estado, local_state=local_state)
         self._last[agent.id] = Decision(estado, accion, local_state.step)
         return accion.value
 
@@ -597,7 +633,10 @@ class QLearningPolicy:
     ) -> State:
         """El estado de este agente: de la simulacion si esta atada, si no del motor."""
         if self._simulation is not None:
-            return get_local_state(agent, self._simulation)
+            estado = get_local_state(agent, self._simulation)
+            if local_state is not None:
+                estado = con_prioridad_del_motor(estado, local_state)
+            return estado
         if local_state is None:
             raise ValueError(
                 "sin bind(simulation) hace falta el local_state del motor "
@@ -611,21 +650,65 @@ class QLearningPolicy:
             self._avisado = True
         return state_from_local(agent, local_state)
 
-    def choose(self, state: State) -> Action:
-        """Epsilon-greedy sobre la Q-table. Con `epsilon = 0` es greedy puro."""
+    def choose(
+        self, state: State, *, local_state: conflicts.LocalState | None = None
+    ) -> Action:
+        """Epsilon-greedy sobre la Q-table. Con `epsilon = 0` es greedy puro.
+
+        Donde la tabla no tiene nada aprendido no se inventa: cae en la regla de
+        la baseline. Ver `_sin_criterio()` para el por que.
+        """
         if self.epsilon > 0.0 and self._rng.random() < self.epsilon:
             return self._rng.choice(self.actions)
-        return self.q.best_action(state, among=self._respaldadas(state))
+
+        respaldadas = self._respaldadas(state)
+        if local_state is not None and self._sin_criterio(state, respaldadas):
+            self.fallbacks += 1
+            return self._como_la_baseline(local_state)
+        return self.q.best_action(state, among=respaldadas or self.actions)
 
     def _respaldadas(self, state: State) -> tuple[Action, ...]:
-        """Las acciones que esta tabla probo lo bastante en este estado."""
+        """Las acciones que esta tabla probo lo bastante en este estado.
+
+        Devuelve la tupla vacia cuando ninguna llega al minimo. Antes devolvia
+        `self.actions` en ese caso, que era justo lo contrario de lo que hace
+        falta: se acababa eligiendo entre tres celdas que nadie visito.
+        """
         if self.min_visits <= 0 or not self._visits:
             return self.actions
         fila = self._visits.get(tuple(state), {})
-        respaldadas = tuple(
+        return tuple(
             accion for accion in self.actions if fila.get(accion, 0) >= self.min_visits
         )
-        return respaldadas or self.actions
+
+    def _sin_criterio(self, state: State, respaldadas: Sequence[Action]) -> bool:
+        """True si la tabla no prefiere de verdad ninguna accion en este estado.
+
+        Son dos casos y los dos acababan en lo mismo. `best_action()` recorre las
+        acciones en el orden de `ACTIONS` y se queda con la primera salvo que otra
+        la supere en estricto, asi que una fila plana siempre devolvia ADVANCE:
+
+        * el estado no esta en la tabla, y su fila es de ceros recien creada;
+        * esta, pero ninguna accion llego al minimo de visitas.
+
+        Un ADVANCE ahi no es una decision aprendida, es el desempate por orden
+        alfabetico haciendose pasar por una. Y es el peor default posible: el AGV
+        entra en el nodo pase lo que pase, que es exactamente lo que la baseline
+        evita. Con `deliveries` la mitad del espacio de estados (los 72 con
+        `carrying=1`) puede estar sin visitar, asi que no es un caso raro.
+        """
+        if not respaldadas:
+            return True
+        if state not in self.q:
+            return True
+        fila = self.q[state]
+        valores = [fila[accion] for accion in respaldadas]
+        return max(valores) - min(valores) <= FLAT_ROW_EPS
+
+    @staticmethod
+    def _como_la_baseline(local_state: conflicts.LocalState) -> Action:
+        """La regla de `conflicts.BaselinePolicy`: ceder si te ganaron el paso."""
+        return Action.WAIT if local_state.blocked_by else Action.ADVANCE
 
     def last_decision(self, agent_id: int) -> tuple[State, Action] | None:
         """El (estado, accion) con el que decidio este AGV la ultima vez."""
@@ -820,7 +903,9 @@ class BaselineAdapter:
 
     def decide(self, agent: Agent, local_state: conflicts.LocalState) -> str:
         estado = (
-            get_local_state(agent, self._simulation)
+            con_prioridad_del_motor(
+                get_local_state(agent, self._simulation), local_state
+            )
             if self._simulation is not None
             else state_from_local(agent, local_state)
         )
@@ -1026,8 +1111,14 @@ class TrainingEnv:
 
     def stats(self, episode: int, epsilon: float, *, states_visited: int) -> EpisodeStats:
         """Los numeros del episodio que acaba de terminar."""
-        completadas = sum(
-            1 for agente in self.sim.agents if agente.state == AgentState.DONE
+        # Con `deliveries` un AGV no llega nunca a DONE: al acabar una mision coge
+        # la siguiente, asi que contar los DONE daba 0 en todos los episodios y
+        # dejaba la comparacion sin la unica metrica de trabajo util que tiene.
+        # Lo que ahi mide el trabajo hecho son las entregas del almacen.
+        completadas = (
+            self.sim.delivered
+            if self.deliveries
+            else sum(1 for agente in self.sim.agents if agente.state == AgentState.DONE)
         )
         llegaron_todos = len(self._llegadas) == len(self.sim.agents)
         return EpisodeStats(
@@ -1292,6 +1383,15 @@ def evaluate(
     ajustes = cfg if cfg is not None else TrainingConfig()
     tabla = load_qtable(model_path)
 
+    # El modelo dice con que acciones se entreno, y manda el. `make_policy()` ya
+    # lo respetaba al servir, pero aqui no se miraba: una tabla entrenada sin
+    # REROUTE se evaluaba CON REROUTE disponible, eligiendo entre celdas que
+    # valen 0.0 porque nadie las toco nunca. Contra un ADVANCE aprendido en
+    # negativo, ese 0.0 gana, y el modelo quedaba peor de lo que es.
+    entrenada_con_reroute = trained_enable_reroute(model_path)
+    if entrenada_con_reroute is not None and ajustes.enable_reroute is None:
+        ajustes.enable_reroute = entrenada_con_reroute
+
     aprendida = Trainer(graph, ajustes, q_table=tabla, learn=False)
     aprendida.run(episodes)
 
@@ -1313,6 +1413,7 @@ def _run_baseline(
         politica,
         seed=semilla_escenarios,
         max_steps=cfg.max_steps,
+        deliveries=cfg.deliveries,
     )
 
     historia: list[EpisodeStats] = []

@@ -1074,7 +1074,13 @@ class Simulation:
             return None
         self._proximo_reroute[agente.id] = self.step + REROUTE_COOLDOWN
 
-        vieja = tuple(agente.path)
+        # Solo lo que le QUEDA, no la ruta entera. `conflicts.reroute()` devuelve
+        # un camino que arranca en `current_node`, asi que meter aqui el tramo ya
+        # recorrido comparaba peras con manzanas: quien lo lee (`is_useless_reroute`)
+        # veia la ruta nueva mas barata por el simple hecho de empezar mas cerca
+        # del destino, y ningun reroute se declaraba inutil a media ruta. Con eso
+        # REROUTE le salia gratis al Q-Learning y se lo comia todo.
+        vieja = tuple(agente.path[agente.path_index:])
         for clave, cuanto in conflicts.reroute_penalties(agente).items():
             self.penalties.add(clave, cuanto, step=self.step)
 
