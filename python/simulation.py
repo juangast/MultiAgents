@@ -988,6 +988,9 @@ class Simulation:
                 else conflicts.Intent.WAIT,
             )
 
+        for agente in self.agents:
+            self._suelta_lo_que_no_pisa(agente)
+
         self.penalties.expire(self.step)
         self._reservas = {
             nodo: reserva
@@ -1097,6 +1100,31 @@ class Simulation:
                 donde,
             )
 
+
+    def _suelta_lo_que_no_pisa(self, agente: Agent) -> None:
+        """Suelta los nodos que el agente tiene marcados y ya no le tocan.
+
+        Un AGV ocupa el nodo que pisa y, mientras cruza, tambien el de destino.
+        Si cambia de ruta a mitad —un reroute, un desvio al cargador, una mision
+        nueva— el destino que habia reservado se queda marcado como suyo para
+        siempre, y ese nodo no vuelve a dejar pasar a nadie. Pasando por aqui al
+        final de cada tick, la ocupacion no puede quedar desfasada.
+        """
+        suyos = {agente.current_node}
+        siguiente = agente.next_node()
+        if siguiente is not None and agente.progress > 0.0:
+            suyos.add(siguiente)
+
+        for nodo in [n for n, quien in self.occupancy.items() if quien == agente.id]:
+            if nodo in suyos:
+                continue
+            del self.occupancy[nodo]
+            log.debug(
+                "paso %3d | AGV %s | suelta %s: ya no lo pisa ni va hacia el",
+                self.step,
+                agente.id,
+                nodo,
+            )
 
     def _puede_entrar(self, agente: Agent, destino: str) -> bool:
         """Dice si el nodo esta libre **para este agente**. Sin excepciones."""

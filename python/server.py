@@ -1,6 +1,6 @@
 """El enlace con Unity: servidor HTTP con JSON.
 
-Cuatro rutas y nada mas. `GET /state` mira sin tocar el reloj y `POST /step`
+Seis rutas y nada mas. `GET /state` mira sin tocar el reloj y `POST /step`
 avanza un paso: en HTTP el GET no puede tener efectos, y de paso eso arregla que
 dos clientes ya no se roben los ticks el uno al otro.
 
@@ -58,7 +58,8 @@ class AGVRequestHandler(BaseHTTPRequestHandler):
             self._responder(404, self._desconocida(ruta))
 
     def do_POST(self) -> None:
-        """`POST /step` avanza un paso, `/reset` reinicia y `/mode` cambia de politica."""
+        """`POST /step` avanza un paso, `/reset` reinicia, `/mode` cambia de
+        politica y `/fleet` cambia el reparto de la flota."""
         ruta = self.path.split("?")[0].rstrip("/") or "/"
         cuerpo = self._lee_cuerpo()
         if cuerpo is None:
@@ -71,6 +72,9 @@ class AGVRequestHandler(BaseHTTPRequestHandler):
             self._responder(200, {"ok": True})
         elif ruta == "/mode":
             codigo, payload = set_mode_payload(self.server.simulation, cuerpo)
+            self._responder(codigo, payload)
+        elif ruta == "/fleet":
+            codigo, payload = set_fleet_payload(self.server.simulation, cuerpo)
             self._responder(codigo, payload)
         else:
             self._responder(404, self._desconocida(ruta))
@@ -127,11 +131,16 @@ ROUTES: dict[str, str] = {
     "POST /step": "Avanza un paso y devuelve el estado",
     "POST /reset": "Reinicia la corrida",
     "POST /mode": "Cambia de politica: {\"mode\": \"qlearning\"}",
+    "POST /fleet": "Cambia el reparto de la flota: {\"fleet\": \"libre\"}",
 }
 
 ERROR_BAD_MODE: str = "bad_mode"
 ERROR_MODE_NOT_SUPPORTED: str = "mode_not_supported"
 ERROR_SET_MODE_FAILED: str = "set_mode_failed"
+
+ERROR_BAD_FLEET: str = "bad_fleet"
+ERROR_FLEET_NOT_SUPPORTED: str = "fleet_not_supported"
+ERROR_SET_FLEET_FAILED: str = "set_fleet_failed"
 
 
 def set_mode_payload(
@@ -160,6 +169,46 @@ def set_mode_payload(
         return 409, {"error": ERROR_SET_MODE_FAILED, "mode": modo, "detail": str(exc)}
 
     respuesta: dict[str, Any] = {"ok": True, "mode": activo or modo}
+    corrida = getattr(simulation, "run", None)
+    if isinstance(corrida, int):
+        respuesta["run"] = corrida
+    return 200, respuesta
+
+
+def set_fleet_payload(
+    simulation: Simulation, body: dict[str, Any]
+) -> tuple[int, dict[str, Any]]:
+    """Cambia el reparto de la flota en caliente. Devuelve (codigo HTTP, payload).
+
+    Quien hace que en el almacen: si unos AGV se dedican a la linea de entrada y
+    el resto al muelle, o si todos pujan por todo. Como `set_mode_payload`,
+    arranca una corrida limpia.
+
+    Los repartos no se validan contra `config`, sino contra los que declare la
+    propia simulacion en `fleets`: quien los define es el adaptador de Unity, no
+    el nucleo. Una simulacion sin `set_fleet` se sirve igual y contesta 501.
+    """
+    cambiar = getattr(simulation, "set_fleet", None)
+    if not callable(cambiar):
+        return 501, {"error": ERROR_FLEET_NOT_SUPPORTED}
+
+    reparto = str(body.get("fleet", "")).strip().lower()
+    disponibles = [str(f) for f in getattr(simulation, "fleets", ())]
+    if disponibles and reparto not in disponibles:
+        return 400, {
+            "error": ERROR_BAD_FLEET,
+            "fleet": reparto,
+            "fleets": disponibles,
+        }
+
+    try:
+        activo = cambiar(reparto)
+    except ValueError as exc:
+        return 409, {
+            "error": ERROR_SET_FLEET_FAILED, "fleet": reparto, "detail": str(exc)
+        }
+
+    respuesta: dict[str, Any] = {"ok": True, "fleet": activo or reparto}
     corrida = getattr(simulation, "run", None)
     if isinstance(corrida, int):
         respuesta["run"] = corrida

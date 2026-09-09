@@ -38,7 +38,7 @@ llevar el reloj con `POST /step` y otro pintar con `GET /state` sin alterar nada
 
 ## 2. Rutas
 
-Cinco, y ninguna necesita cabeceras especiales.
+Seis, y ninguna necesita cabeceras especiales.
 
 | Ruta | Cuerpo | Qué hace | Avanza el tick |
 |---|---|---|:--:|
@@ -47,6 +47,7 @@ Cinco, y ninguna necesita cabeceras especiales.
 | `POST /step` | — (o `{}`) | Avanza un paso y devuelve el estado | **sí** |
 | `POST /reset` | — (o `{}`) | Reinicia la corrida: `step` vuelve a 0 y `run` sube | no |
 | `POST /mode` | `{"mode": "..."}` | Cambia de política **en caliente** y reinicia la corrida | no |
+| `POST /fleet` | `{"fleet": "..."}` | Cambia el **reparto de la flota** en caliente y reinicia la corrida | no |
 
 ### Probarlo sin Unity
 
@@ -55,6 +56,7 @@ curl localhost:5000/health
 curl localhost:5000/state
 curl -X POST localhost:5000/step
 curl -X POST -d '{"mode":"qlearning"}' localhost:5000/mode
+curl -X POST -d '{"fleet":"libre"}' localhost:5000/fleet
 curl -X POST localhost:5000/reset
 ```
 
@@ -94,6 +96,33 @@ Sus errores, cada uno con su código HTTP:
 <- 400  {"error":"bad_mode","mode":"turbo","modes":["baseline","qlearning"]}
 ```
 
+### `POST /fleet`
+
+Quién hace qué en el almacén. La sirve el adaptador de Unity
+(`PythonBridge/serve_unity.py`); un servidor sin repartos contesta `501` y no
+pasa nada. Como `/mode`, **arranca una corrida limpia**.
+
+| `fleet` | Qué hace |
+|---|---|
+| `dedicada` | Unos cuantos AGV (los más cercanos a la banda) solo hacen `produccion -> rack`; los demás solo `rack -> muelle` |
+| `libre` | Ninguno tiene flujo asignado. Todos pujan por todo, y cada caja parada en la banda **sube la puja** de sus misiones |
+
+```
+-> POST /fleet  {"fleet": "libre"}
+<- 200  {"ok":true,"fleet":"libre","run":2}
+```
+
+| Código | `error` | Cuándo pasa |
+|---|---|---|
+| 400 | `bad_fleet` | Ese reparto no existe, o no venía ninguno. `fleets` trae los que sí valen |
+| 409 | `set_fleet_failed` | El reparto existe pero no se pudo montar. Lleva `detail` |
+| 501 | `fleet_not_supported` | Esta simulación no sabe repartir la flota |
+
+```
+-> POST /fleet  {"fleet": "turno de noche"}
+<- 400  {"error":"bad_fleet","fleet":"turno de noche","fleets":["dedicada","libre"]}
+```
+
 ### Errores de forma
 
 ```
@@ -101,7 +130,7 @@ Sus errores, cada uno con su código HTTP:
 <- 400  {"error":"bad_json","detail":"Expecting property name enclosed in double quotes: ..."}
 
 -> GET /loquesea
-<- 404  {"error":"unknown_route","path":"/loquesea","routes":["GET /health","GET /state","POST /mode","POST /reset","POST /step"]}
+<- 404  {"error":"unknown_route","path":"/loquesea","routes":["GET /health","GET /state","POST /fleet","POST /mode","POST /reset","POST /step"]}
 ```
 
 Una ruta desconocida **no** cierra nada: contesta 404 con la lista de las que hay y sigue.
@@ -147,6 +176,7 @@ para que se lea; en el cable va en una sola:
 | `stats` | object | fase 5 | Los números de la corrida |
 | `boxes` | list | entregas | Una entrada por caja del almacen, con donde esta **ahora** |
 | `mode` | str | fase 8 | La política activa: `baseline` o `qlearning` |
+| `fleet` | object | flotas | Quién hace qué y cómo va la línea de entrada ([abajo](#fleet)) |
 
 ### `agents[]`
 
@@ -230,6 +260,50 @@ inventario **inicial**, y esta lista dice donde esta cada una en este momento.
 | `IN_TRANSIT` | Va encima de un AGV | Caja sobre el AGV, sigue su posicion |
 | `DELIVERED` | Ya salio por un muelle | Caja en el muelle |
 
+<a id="fleet"></a>
+### `fleet`
+
+Solo lo manda el adaptador de Unity, y **solo con entregas**. Un cliente que no
+lo conozca lo ignora y sigue igual.
+
+```json
+"fleet": {
+  "mode": "libre", "modes": ["dedicada", "libre"], "dedicated": [],
+  "weight_box": 25.0, "weight_wait": 0.6,
+  "belt_total": 6, "belt_arrived": 3, "belt_pending": 2, "belt_oldest": 11,
+  "belt_bonus": 56.6, "belt_picked": 1, "belt_wait_avg": 14.0, "belt_wait_max": 19,
+  "belt_stored": 1, "belt_cycle_avg": 36.0,
+  "dock_done": 1, "dock_cycle_avg": 29.0,
+  "per_agv": [0, 1, 0, 0, 0]
+}
+```
+
+| Campo | Tipo | Qué es |
+|---|---|---|
+| `mode` | str | El reparto activo: `dedicada` o `libre` |
+| `modes` | list[str] | Los repartos que acepta `POST /fleet` |
+| `dedicated` | list[int] | Ids de los AGV atados a la banda. Vacía con la flota libre |
+| `weight_box` | float | Lo que suma a la puja **cada caja** parada en la banda |
+| `weight_wait` | float | Lo que suma **cada paso** que lleva esperando la más vieja |
+| `belt_total` | int | Cajas que entrarán por la línea a lo largo de la corrida |
+| `belt_arrived` | int | Cajas que ya han caído en la banda |
+| `belt_pending` | int | Cajas de la banda **sin dueño**: las que pesan en la subasta |
+| `belt_oldest` | int | Pasos que lleva esperando la más vieja de esas |
+| `belt_bonus` | float | Lo que suma **ahora mismo** una misión de banda. `0` con la flota dedicada |
+| `belt_picked` | int | Cajas de la banda ya recogidas |
+| `belt_wait_avg` | float | Pasos medios entre que una caja cae en la banda y la recogen |
+| `belt_wait_max` | int | Lo peor que ha esperado una |
+| `belt_stored` | int | Cajas de la banda ya guardadas en un rack |
+| `belt_cycle_avg` | float | Pasos medios de banda a rack, de punta a punta |
+| `dock_done` | int | Misiones `rack -> muelle` terminadas |
+| `dock_cycle_avg` | float | Pasos medios de rack a muelle, contando la espera en la bolsa |
+| `per_agv` | list[int] | Cajas que ha entregado cada AGV, en orden de id. Para ver el reparto |
+
+`belt_bonus` es lo que hace que la banda gane la subasta: se suma a la puja de
+**todas** las misiones `produccion -> rack` y crece con `belt_pending` y con
+`belt_oldest`, con un techo para que el muelle no se quede sin atender. Con la
+flota dedicada no se aplica, porque ahí ya hay AGV reservados para la banda.
+
 ### `stats`
 
 | Campo | Tipo | Desde | Qué es |
@@ -252,6 +326,7 @@ inventario **inicial**, y esta lista dice donde esta cada una en este momento.
 | `missions_total` | int | entregas | Misiones abiertas en total; **crece durante la corrida** |
 | `boxes_delivered` | int | entregas | Cajas que ya salieron por un muelle |
 | `messages` | int | entregas | Mensajes que lleva el bus de negociacion |
+| `charges` | int | entregas | Recargas completas de toda la flota en esta corrida |
 
 **Los cuatro tipos de conflicto:**
 
@@ -370,8 +445,9 @@ El formato está **congelado en cuanto a lo que ya existe**:
 - `JsonUtility` de Unity ignora lo que no conoce, así que un cliente escrito contra la fase 1
   sigue funcionando hoy sin tocarle una línea.
 
-Lo que sí puede cambiar de una corrida a otra: el número de AGVs (`--agents`), el mapa (`--map`) y
-la política (`--policy` o `POST /mode`). Nada de eso cambia la **forma** del JSON.
+Lo que sí puede cambiar de una corrida a otra: el número de AGVs (`--agents`), el mapa (`--map`),
+la política (`--policy` o `POST /mode`) y el reparto de la flota (`--flota` o `POST /fleet`). Nada
+de eso cambia la **forma** del JSON.
 
 ---
 
