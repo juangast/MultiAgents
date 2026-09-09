@@ -324,7 +324,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        aprendida, _historia = qlearning.evaluate(
+        aprendida, referencia = qlearning.evaluate(
             grafo, _ajustes(args, grafo), model_path=modelo, episodes=args.episodes
         )
     except ValueError as exc:
@@ -332,7 +332,7 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
         return 1
 
     _informa_modelo(modelo, qlearning.load_metadata(modelo))
-    for linea in qlearning.summary_lines(aprendida.history, aprendida.cfg.report_every):
+    for linea in qlearning.compare_lines(aprendida.history, referencia):
         log.info("%s", linea)
     if args.log:
         qlearning.write_training_log(aprendida.history, args.log)
