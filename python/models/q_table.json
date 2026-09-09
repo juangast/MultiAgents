@@ -19,7 +19,7 @@
     "map_nodes": 62,
     "agents": 4,
     "seed": 42,
-    "episodes_run": 1000,
+    "episodes_run": 2000,
     "hyperparameters": {
       "map": "almacen_reto",
       "scenario": "",
@@ -32,11 +32,10 @@
       "epsilon_start": 1.0,
       "epsilon_end": 0.05,
       "epsilon_decay": 0.995,
-      "max_steps_per_episode": 200,
+      "max_steps_per_episode": 600,
       "actions": [
         "advance",
-        "wait",
-        "reroute"
+        "wait"
       ]
     },
     "final_epsilon": 0.05,
@@ -624,7 +623,7 @@
       }
     },
     "last_episode": {
-      "episode": 1000,
+      "episode": 2000,
       "epsilon": 0.05,
       "total_reward": -306.0,
       "avg_reward": -0.4912,
