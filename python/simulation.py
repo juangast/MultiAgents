@@ -129,8 +129,11 @@ def make_policy(
     model: str | Path | None = None,
     seed: int = config.RANDOM_SEED,
 ) -> conflicts.Policy:
-    """Monta una politica por su nombre. Hoy solo hay una: `"qlearning"`."""
+    """Monta una politica por su nombre: `"baseline"` o `"qlearning"`."""
     nombre = str(name).strip().lower()
+
+    if nombre == config.POLICY_BASELINE:
+        return conflicts.BaselinePolicy()
 
     if nombre == config.POLICY_QLEARNING:
         import qlearning

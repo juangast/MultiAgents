@@ -392,6 +392,19 @@ class Policy(Protocol):
 
 
 
+class BaselinePolicy:
+    """Cede el paso si alguien te gano el conflicto. Nada mas."""
+
+    name: str = "baseline"
+
+    def __repr__(self) -> str:
+        return "BaselinePolicy()"
+
+    def decide(self, agent: Agent, local_state: LocalState) -> str:
+        """`Intent.WAIT` si le ganaron el paso, `Intent.ADVANCE` si no."""
+        return Intent.WAIT if local_state.blocked_by else Intent.ADVANCE
+
+
 def read_only(occupancy: dict[str, int]) -> Occupancy:
     """Vista de solo lectura de la ocupacion, para pasarsela a una politica.
 

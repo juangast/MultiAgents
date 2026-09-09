@@ -12,8 +12,9 @@ RANDOM_SEED: int = 42
 
 DEADLOCK_TICKS: int = 20
 
+POLICY_BASELINE: str = "baseline"
 POLICY_QLEARNING: str = "qlearning"
-POLICIES: tuple[str, ...] = (POLICY_QLEARNING,)
+POLICIES: tuple[str, ...] = (POLICY_BASELINE, POLICY_QLEARNING)
 DEFAULT_POLICY: str = POLICY_QLEARNING
 
 
@@ -68,7 +69,7 @@ DEFAULT_MAP: str = "almacen_reto"
 # real (cajas entregadas, en 4 escenarios) en vez de aproximarlo: 23.0 de media,
 # contra 20.0 de la vieja de 144 estados y 14.2 de la que sale de entrenar.
 # `q_table.json` se deja como estaba, con el estado de seis campos.
-Q_TABLE_FILE: Path = MODELS_DIR / "q_table_busqueda.json"
+Q_TABLE_FILE: Path = MODELS_DIR / "q_table.json"
 TRAINING_LOG_FILE: Path = RESULTS_DIR / "training_log.csv"
 
 _FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
