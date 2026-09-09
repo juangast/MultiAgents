@@ -292,16 +292,16 @@ Para montar la escena hace falta el grafo. **No se puede pedir por HTTP** (ver
 **1. Verlo por consola**, con las coordenadas lógicas y las de Unity una al lado de la otra:
 
 ```bash
-python3 python/main.py map --name warehouse
+python3 python/main.py map --name almacen_reto
 ```
 
 ```
 --- nodos: logicas (x, y) -> Unity (x, y, z) ---
-G           (12, 4)  ->  (12, 0, 4)
-N1           (0, 8)  ->  (0, 0, 8)
-N2           (4, 8)  ->  (4, 0, 8)
+B1    (2.98, -7.06)  ->  (2.98, 0, -7.06)
+B2    (4.58, -7.06)  ->  (4.58, 0, -7.06)
+B3    (6.28, -7.06)  ->  (6.28, 0, -7.06)
 --- aristas ---
-G    -- N3    costo 5.7
+B1   -- P04   costo 1.18
 ```
 
 **2. Exportarlo a JSON** con las coordenadas ya convertidas, que es lo que conviene para generar la
@@ -309,20 +309,21 @@ escena. `graph.to_unity_dict()` devuelve esta estructura:
 
 ```json
 {
-  "name": "warehouse",
+  "name": "almacen_reto",
   "directed": false,
   "scale": 1.0,
-  "nodes": [{"id": "G", "x": 12.0, "y": 0.0, "z": 4.0},
-            {"id": "N1", "x": 0.0, "y": 0.0, "z": 8.0}],
-  "edges": [{"from": "G", "to": "N3", "cost": 5.7},
-            {"from": "G", "to": "N4", "cost": 5.7}]
+  "nodes": [{"id": "B1", "x": 2.98, "y": 0.0, "z": -7.06},
+            {"id": "B2", "x": 4.58, "y": 0.0, "z": -7.06}],
+  "edges": [{"from": "B1", "to": "P04", "cost": 1.18},
+            {"from": "B2", "to": "P05", "cost": 1.35}]
 }
 ```
 
 ```bash
 # volcarlo a un fichero para importarlo desde Unity
 python3 -c "import sys,json; sys.path.insert(0,'python'); import graph; \
-print(json.dumps(graph.warehouse_graph().to_unity_dict(), indent=2))" > warehouse_unity.json
+print(json.dumps(graph.load_graph(graph.map_path('almacen_reto')).to_unity_dict(), \
+indent=2))" > almacen_reto_unity.json
 ```
 
 Los ficheros de `python/maps/*.json` llevan las coordenadas **lógicas**, sin convertir: son la

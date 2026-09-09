@@ -11,7 +11,7 @@ import math
 import random
 import statistics
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from enum import Enum
 from itertools import islice
@@ -20,24 +20,33 @@ from typing import Any, Protocol
 
 import config
 import conflicts
+import missions
 import simulation
 from agent import Agent, State as AgentState
-from graph import WarehouseGraph, path_cost
+from graph import WarehouseGraph, astar, path_cost
 from config import get_logger, setup_logging
 
 log = get_logger("qlearning")
 
 
+# Dos bits, y nada mas. El estado de seis campos (144 combinaciones) repartia el
+# entrenamiento tan fino que 37 de sus 96 celdas visitadas se quedaban por debajo
+# de 500 muestras, y eran justo las disputadas; el 57% de las visitas se iba en
+# estados '0|0|0|*', donde no hay nada que decidir porque nadie estorba. Con el
+# motor resolviendo "camino libre -> avanza" antes de preguntar, a la tabla solo
+# le llegan los choques de verdad, y ahi lo unico que cambia la respuesta
+# correcta es quien manda y si se puede rodear. Medido sobre cuatro escenarios:
+# 22.2 entregas de media contra 20.0 de la tabla de 144, con 12 celdas y no 432.
+#
+# Lo que se probo y NO entro: 'distance_bucket' (lo que te falte para llegar no
+# dice quien debe ceder, y triplicaba la tabla) y 'edge_conflict' (dio cero
+# diferencia medible: las variantes con y sin el salieron identicas).
 STATE_FIELDS: tuple[str, ...] = (
-    "next_node_occupied",
-    "edge_conflict",
-    "queue_ahead",
-    "distance_bucket",
-    "has_priority",
-    "carrying",
+    "tengo_prioridad",
+    "hay_desvio",
 )
 
-STATE_SIZES: tuple[int, ...] = (2, 2, 3, 3, 2, 2)
+STATE_SIZES: tuple[int, ...] = (2, 2)
 
 State = tuple[int, ...]
 
@@ -57,44 +66,87 @@ class SimulationView(Protocol):
 
 
 def get_local_state(agent: Agent, simulation: SimulationView) -> State:
-    """El estado discreto y local de este AGV: siempre seis enteros."""
+    """El estado discreto y local de este AGV: dos bits."""
     siguiente = agent.next_node()
     return (
-        _ocupado(agent, siguiente, simulation.occupancy),
-        _viene_de_frente(agent, siguiente, simulation.agents),
-        _cola_delante(agent, simulation.agents),
-        distance_bucket(agent),
-        _tengo_prioridad(agent, _rivales(agent, siguiente, simulation)),
-        int(agent.carrying is not None),
+        _tengo_prioridad(agent, _contendientes(agent, siguiente, simulation)),
+        _hay_desvio(agent, simulation.graph),
     )
+
+
+def _contendientes(
+    agent: Agent, siguiente: str | None, simulation: SimulationView
+) -> set[int]:
+    """Los que se disputan el paso conmigo, que no es lo mismo que estar delante.
+
+    `_rivales()` mete tambien al que simplemente **ocupa** el nodo siguiente,
+    aunque se este marchando y no dispute nada. El motor no lo hace: sus
+    conflictos salen de quien quiere entrar donde, y `resolve_conflict()` solo
+    arbitra entre esos. Con el ocupante dentro, el bit de prioridad decia "no
+    mando" cada vez que alguien de id menor pasaba por delante, que no es el
+    caso que la politica tiene que aprender.
+    """
+    if siguiente is None:
+        return set()
+
+    contendientes: set[int] = set()
+    for otro in simulation.agents:
+        if otro.id == agent.id:
+            continue
+        # De morro contra morro.
+        if otro.current_node == siguiente and otro.next_node() == agent.current_node:
+            contendientes.add(otro.id)
+            continue
+        # Los dos queremos entrar en el mismo nodo.
+        if (
+            otro.progress <= 0.0
+            and otro.state in (AgentState.MOVING, AgentState.WAITING)
+            and otro.next_node() == siguiente
+        ):
+            contendientes.add(otro.id)
+    return contendientes
 
 
 def state_from_local(agent: Agent, local_state: conflicts.LocalState) -> State:
-    """El mismo estado, pero sacado de lo que el motor le pasa a la politica."""
+    """El mismo estado sin la simulacion atada, con el desvio aproximado.
+
+    Sin el grafo no se puede volver a correr A*, asi que aqui 'hay_desvio' se
+    estima con los vecinos libres del nodo actual: si hay por donde salir que no
+    sea el nodo bloqueado, se da por bueno. Sobreestima (ese vecino puede no
+    llevar a ningun sitio util), pero solo se usa cuando la politica corre
+    suelta; entrenando y sirviendo va atada y manda `get_local_state()`.
+    """
     siguiente = agent.next_node()
-    rivales = {
-        otro
-        for choque in local_state.conflicts
-        for otro in choque.agents
-        if otro != agent.id
-    }
-    rivales.update(local_state.blocked_by)
-    de_frente = any(
-        choque.type == conflicts.ConflictType.EDGE for choque in local_state.conflicts
-    )
-    cola = sum(
+    salidas = sum(
         1
-        for nodo in _proximos_nodos(agent)
-        if local_state.occupancy.get(nodo) not in (None, agent.id)
+        for vecino in local_state.neighbors
+        if vecino != siguiente
+        and local_state.occupancy.get(vecino) in (None, agent.id)
     )
-    return (
-        _ocupado(agent, siguiente, local_state.occupancy),
-        int(de_frente),
-        min(cola, QUEUE_CAP),
-        distance_bucket(agent),
-        _tengo_prioridad(agent, rivales),
-        int(agent.carrying is not None),
+    return (int(not local_state.blocked_by), int(salidas > 0))
+
+
+def _hay_desvio(agent: Agent, graph: WarehouseGraph) -> int:
+    """1 si, encareciendo el nodo de delante, A* sale por otro sitio.
+
+    Es lo que convierte REROUTE de apuesta a ciegas en una decision: sin esto la
+    politica pedia recalcular tambien cuando no habia por donde, y `reroute()`
+    le devolvia la misma ruta habiendole costado el tick. Se calcula igual que
+    lo hara `conflicts.reroute()` despues, para que lo que se aprende y lo que
+    se ejecuta coincidan.
+    """
+    if agent.target_node is None or agent.progress > 0.0:
+        return 0
+
+    siguiente = agent.next_node()
+    if siguiente is None:
+        return 0
+
+    otra = astar(
+        graph, agent.current_node, agent.target_node,
+        conflicts.reroute_penalties(agent),
     )
+    return int(otra is not None and len(otra) > 1 and otra[1] != siguiente)
 
 
 PRIORITY_FIELD: int = STATE_FIELDS.index("has_priority")
@@ -294,6 +346,7 @@ class Event(Enum):
 
     TASK_COMPLETE = "task_complete"
     PICKED = "picked"
+    DELIVERED = "delivered"
     PROGRESS = "progress"
     WAIT = "wait"
     CONFLICT = "conflict"
@@ -304,6 +357,7 @@ class Event(Enum):
 _CONFIG_KEY: dict[Event, str] = {
     Event.TASK_COMPLETE: "REWARD_TASK_COMPLETE",
     Event.PICKED: "REWARD_PICKED",
+    Event.DELIVERED: "REWARD_DELIVERED",
     Event.PROGRESS: "REWARD_PROGRESS",
     Event.WAIT: "REWARD_WAIT",
     Event.CONFLICT: "REWARD_CONFLICT",
@@ -574,7 +628,7 @@ class Decision:
 
 
 class QLearningPolicy:
-    """La politica de Q-Learning, con la misma interfaz que la baseline.
+    """La politica de Q-Learning, con la interfaz que pide la simulacion.
 
     Para que vea el estado completo hay que atarla con `bind()`. Sin atar sigue
     funcionando, pero saca el estado del `LocalState` que le pasa el motor, y
@@ -882,42 +936,6 @@ class TrainablePolicy(Protocol):
     def decision(self, agent_id: int) -> Decision | None: ...
 
 
-class BaselineAdapter:
-    """La politica de la fase 5 con el cuaderno de la fase 7."""
-
-    name: str = "baseline"
-
-    def __init__(self, *, simulation: SimulationView | None = None) -> None:
-        self._inner = conflicts.BaselinePolicy()
-        self._simulation: SimulationView | None = simulation
-        self._last: dict[int, Decision] = {}
-
-    def __repr__(self) -> str:
-        return f"BaselineAdapter(bound={self._simulation is not None})"
-
-    def bind(self, simulation: SimulationView) -> None:
-        self._simulation = simulation
-
-    def reset(self) -> None:
-        self._last.clear()
-
-    def decide(self, agent: Agent, local_state: conflicts.LocalState) -> str:
-        estado = (
-            con_prioridad_del_motor(
-                get_local_state(agent, self._simulation), local_state
-            )
-            if self._simulation is not None
-            else state_from_local(agent, local_state)
-        )
-        motor = self._inner.decide(agent, local_state)
-        accion = Action.ADVANCE if motor == conflicts.Intent.ADVANCE else Action.WAIT
-        self._last[agent.id] = Decision(estado, accion, local_state.step)
-        return motor
-
-    def decision(self, agent_id: int) -> Decision | None:
-        return self._last.get(agent_id)
-
-
 def random_routes(
     graph: WarehouseGraph, n_agents: int, rng: random.Random
 ) -> list[tuple[str, str]]:
@@ -955,6 +973,11 @@ class _Abierta:
         )
 
 
+def _restantes(agent: Agent) -> int:
+    """Nodos que le faltan al AGV para llegar a su destino."""
+    return max(len(agent.path) - 1 - agent.path_index, 0)
+
+
 class _Foto:
     """Como estaba un AGV al empezar el tick. Con esto se ve que le paso."""
 
@@ -964,11 +987,13 @@ class _Foto:
         state: str,
         wait_time: int,
         carrying: str | None = None,
+        restantes: int = 0,
     ) -> None:
         self.path_index = path_index
         self.state = state
         self.wait_time = wait_time
         self.carrying = carrying
+        self.restantes = restantes
 
 
 class TrainingEnv:
@@ -984,12 +1009,14 @@ class TrainingEnv:
         max_steps: int = config.MAX_STEPS_PER_EPISODE,
         routes_factory: Callable[[random.Random], Sequence[tuple[str, str]]] | None = None,
         deliveries: bool = False,
+        gamma: float = config.GAMMA,
     ) -> None:
         self.graph = graph
         self.n_agents = int(n_agents)
         self.policy = policy
         self.max_steps = int(max_steps)
         self.deliveries = bool(deliveries)
+        self.gamma = float(gamma)
         self._rng = random.Random(seed)
         self._routes_factory = routes_factory
 
@@ -1033,7 +1060,8 @@ class TrainingEnv:
         paso = self.sim.step + 1
         antes = {
             agente.id: _Foto(
-                agente.path_index, agente.state, agente.wait_time, agente.carrying
+                agente.path_index, agente.state, agente.wait_time, agente.carrying,
+                _restantes(agente),
             )
             for agente in self.sim.agents
         }
@@ -1082,6 +1110,7 @@ class TrainingEnv:
                 deadlock=murio_ahora,
             )
             abierta.reward += sum(reward(evento) for evento in eventos)
+            abierta.reward += self._acercarse(agente, antes[agente.id])
 
             if agente.state == AgentState.DONE:
                 del self._abiertas[agente.id]
@@ -1134,6 +1163,26 @@ class TrainingEnv:
             states_visited=states_visited,
         )
 
+    def _acercarse(self, agent: Agent, antes: _Foto) -> float:
+        """Lo que vale haberse acercado al destino en este tick.
+
+        Sustituye al viejo `Event.PROGRESS`, que se cobraba con que subiera
+        `path_index`. El problema: `conflicts.reroute()` devuelve `path_index` a
+        cero, asi que cada desvio volvia a cobrar la ruta entera y **rodear
+        pagaba mas que ir derecho**. La politica lo encontro: con la tabla de dos
+        bits eligio REROUTE en los dos estados en los que podia moverse, y cerro
+        el entrenamiento con recompensa media positiva y cero entregas.
+
+        Aqui el potencial es lo que falta para llegar, asi que alargar la ruta
+        cobra negativo justo por lo que la alarga, y acortarla cobra positivo. Es
+        shaping por potencial (Ng, Harada y Russell, 1999): al tener la forma
+        `gamma*F(s') - F(s)` no cambia cual es la politica optima, solo hace que
+        se encuentre antes.
+        """
+        ahora = -float(_restantes(agent))
+        antes_pot = -float(antes.restantes)
+        return config.REWARD_PROGRESS * (self.gamma * ahora - antes_pot)
+
     def _eventos(
         self,
         agent: Agent,
@@ -1155,12 +1204,20 @@ class TrainingEnv:
         registro = self.sim.action_record(agent.id)
         fresco = registro is not None and registro.step == paso
 
-        if agent.path_index > antes.path_index:
-            eventos.append(Event.PROGRESS)
+        # El avance ya no se cobra como evento: lo lleva `_acercarse()`, porque
+        # mirar `path_index` premiaba rodear. Ver alli el porque.
         if agent.state == AgentState.DONE and antes.state != AgentState.DONE:
             eventos.append(Event.TASK_COMPLETE)
         if agent.carrying is not None and antes.carrying is None:
             eventos.append(Event.PICKED)
+
+        # Soltar la caja solo cuenta si acabo entregada: `_suelta_mision()`
+        # tambien deja `carrying` en None cuando el AGV abandona el trabajo, y
+        # eso no merece cobro.
+        if antes.carrying is not None and agent.carrying is None:
+            caja = self.sim.inventory.get(antes.carrying)
+            if caja is not None and caja.status == missions.BoxStatus.DELIVERED:
+                eventos.append(Event.DELIVERED)
 
         if agent.wait_time > antes.wait_time:
             eventos.append(
@@ -1229,6 +1286,7 @@ class Trainer:
             max_steps=cfg.max_steps,
             routes_factory=routes_factory,
             deliveries=cfg.deliveries,
+            gamma=cfg.gamma,
         )
 
     def __repr__(self) -> str:
@@ -1393,49 +1451,9 @@ def evaluate(
         ajustes.enable_reroute = entrenada_con_reroute
 
     aprendida = Trainer(graph, ajustes, q_table=tabla, learn=False)
-    aprendida.run(episodes)
+    historia = aprendida.run(episodes)
+    return aprendida, historia
 
-    referencia = _run_baseline(graph, ajustes, episodes)
-    return aprendida, referencia
-
-
-def _run_baseline(
-    graph: WarehouseGraph, cfg: TrainingConfig, episodes: int
-) -> list[EpisodeStats]:
-    """La baseline de la fase 5 sobre los mismos escenarios, con la misma vara."""
-    maestro = random.Random(cfg.seed)
-    semilla_escenarios = maestro.randrange(2**31)
-
-    politica = BaselineAdapter()
-    entorno = TrainingEnv(
-        graph,
-        cfg.agents,
-        politica,
-        seed=semilla_escenarios,
-        max_steps=cfg.max_steps,
-        deliveries=cfg.deliveries,
-    )
-
-    historia: list[EpisodeStats] = []
-    with _quiet("simulation", "agent"):
-        for episode in range(1, episodes + 1):
-            entorno.reset()
-            total = 0.0
-            decisiones = 0
-            while not entorno.done():
-                for transicion in entorno.step():
-                    total += transicion.reward
-                    decisiones += 1
-            for transicion in entorno.close_pending():
-                total += transicion.reward
-                decisiones += 1
-            numeros = entorno.stats(episode, 0.0, states_visited=0)
-            historia.append(
-                numeros.con_recompensa(
-                    total, total / decisiones if decisiones else 0.0
-                )
-            )
-    return historia
 
 
 def write_training_log(
@@ -1487,40 +1505,6 @@ def summary_lines(
     return lineas
 
 
-def compare_lines(
-    aprendida: Sequence[EpisodeStats], baseline: Sequence[EpisodeStats]
-) -> list[str]:
-    """Q-Learning contra baseline, promedio a promedio, listo para el log."""
-    if not aprendida or not baseline:
-        return ["(no hay con que comparar)"]
-
-    def medias(filas: Sequence[EpisodeStats]) -> dict[str, float]:
-        ticks = max(statistics.fmean(f.makespan for f in filas), 1.0)
-        return {
-            "recompensa": statistics.fmean(f.total_reward for f in filas),
-            "completadas": statistics.fmean(f.completed_tasks for f in filas),
-            "deadlocks": statistics.fmean(f.deadlocks for f in filas),
-            "makespan": ticks,
-            "conflictos": statistics.fmean(f.conflicts for f in filas),
-            "conflictos/tick": statistics.fmean(f.conflicts for f in filas) / ticks,
-            "espera": statistics.fmean(f.total_wait for f in filas),
-            "espera/tick": statistics.fmean(f.total_wait for f in filas) / ticks,
-        }
-
-    izquierda, derecha = medias(aprendida), medias(baseline)
-    lineas = [
-        f"--- {len(aprendida)} episodios, los mismos escenarios, medias ---",
-        f"{'metrica':<17}{'q-learning':>12}{'baseline':>12}{'diferencia':>13}",
-        "-" * 54,
-    ]
-    for nombre in izquierda:
-        uno, otro = izquierda[nombre], derecha[nombre]
-        lineas.append(f"{nombre:<17}{uno:>12.2f}{otro:>12.2f}{uno - otro:>+13.2f}")
-    lineas.append(
-        "los totales crudos (conflictos, espera) premian al que muere antes: "
-        "miralos por tick"
-    )
-    return lineas
 
 
 class _quiet:

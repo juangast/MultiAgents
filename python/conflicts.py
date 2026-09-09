@@ -79,15 +79,13 @@ class Conflict:
         node: str | None = None,
         edge: tuple[str, str] | None = None,
     ) -> None:
+        if type not in _ORDEN:
+            raise ValueError(f"tipo de conflicto desconocido: {type!r}")
         self.type = type
         self.agents = agents
         self.step = step
         self.node = node
         self.edge = edge
-
-    def __post_init__(self) -> None:
-        if self.type not in _ORDEN:
-            raise ValueError(f"tipo de conflicto desconocido: {self.type!r}")
 
 
 class Resolution:
@@ -106,7 +104,7 @@ class ConflictLog:
     """Los conflictos de una corrida, con el conteo ya hecho.
 
     Se vacia en cada `reset()`: el registro es *por corrida*, que es la unidad
-    con la que se compara el baseline contra lo que venga despues.
+    con la que se mide una politica contra otra.
     """
 
     def __init__(self) -> None:
@@ -346,10 +344,12 @@ def reroute(
     agent.progress = 0.0
     return agent.path
 
-def resolve_baseline(conflict: Conflict) -> Resolution:
-    """La politica base: gana el agente con el id menor. Y ya.
+def resolve_conflict(conflict: Conflict) -> Resolution:
+    """Quien se lleva el paso en un conflicto: el agente con el id menor.
 
-    Gana el id menor. En congestion no hay a quien ceder, asi que no gana nadie.
+    Es la regla del **motor**, no de ninguna politica: se aplica en todos los
+    ticks y es la que rellena `blocked_by`. La politica decide despues, sabiendo
+    ya quien le gano. En congestion no hay a quien ceder, asi que no gana nadie.
     """
     if conflict.type == ConflictType.CONGESTION or not conflict.agents:
         return Resolution(None, ())
@@ -390,18 +390,6 @@ class Policy(Protocol):
         """Devuelve `Intent.ADVANCE` o `Intent.WAIT` para este agente en este tick."""
         ...
 
-
-class BaselinePolicy:
-    """Cede el paso si alguien te gano el conflicto. Nada mas."""
-
-    name: str = "baseline"
-
-    def __repr__(self) -> str:
-        return "BaselinePolicy()"
-
-    def decide(self, agent: Agent, local_state: LocalState) -> str:
-        """`Intent.WAIT` si le ganaron el paso, `Intent.ADVANCE` si no."""
-        return Intent.WAIT if local_state.blocked_by else Intent.ADVANCE
 
 
 def read_only(occupancy: dict[str, int]) -> Occupancy:

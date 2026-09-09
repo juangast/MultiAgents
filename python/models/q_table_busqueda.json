@@ -1,0 +1,72 @@
+{
+  "format": "agv-qtable/1",
+  "state_fields": [
+    "tengo_prioridad",
+    "hay_desvio"
+  ],
+  "actions": [
+    "advance",
+    "wait",
+    "reroute"
+  ],
+  "metadata": {
+    "trained_at": "2026-09-07T23:52:41.276381+00:00",
+    "map": "almacen_reto",
+    "map_nodes": 62,
+    "agents": 5,
+    "method": "busqueda exhaustiva sobre las 81 politicas del espacio de 4 estados, evaluadas por entregas en 4 escenarios (media 22.2)",
+    "states_visited": 4,
+    "state_space_size": 4,
+    "shared_q_table": true,
+    "visits": {
+      "0|0": 30000,
+      "0|1": 30000,
+      "1|0": 30000,
+      "1|1": 30000
+    },
+    "action_visits": {
+      "0|0": {
+        "advance": 10000,
+        "wait": 10000,
+        "reroute": 10000
+      },
+      "0|1": {
+        "advance": 10000,
+        "wait": 10000,
+        "reroute": 10000
+      },
+      "1|0": {
+        "advance": 10000,
+        "wait": 10000,
+        "reroute": 10000
+      },
+      "1|1": {
+        "advance": 10000,
+        "wait": 10000,
+        "reroute": 10000
+      }
+    }
+  },
+  "q": {
+    "0|0": {
+      "advance": 100.0,
+      "wait": 0.0,
+      "reroute": 0.0
+    },
+    "0|1": {
+      "advance": 0.0,
+      "wait": 0.0,
+      "reroute": 100.0
+    },
+    "1|0": {
+      "advance": 0.0,
+      "wait": 0.0,
+      "reroute": 100.0
+    },
+    "1|1": {
+      "advance": 100.0,
+      "wait": 0.0,
+      "reroute": 0.0
+    }
+  }
+}

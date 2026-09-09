@@ -16,7 +16,7 @@ aprenden a quién le toca ceder el paso cuando se cruzan.
 | | |
 |---|---|
 | Escribir el cliente de Unity | **[docs/PROTOCOL.md](docs/PROTOCOL.md)** — el contrato solo, autosuficiente |
-| Verlo funcionar en un comando | `python3 python/main.py simulate --map grid --agents 3 --deliveries` |
+| Verlo funcionar en un comando | `python3 python/main.py simulate --map almacen_reto --agents 3 --deliveries` |
 
 ---
 
@@ -43,22 +43,6 @@ se toma decenas de veces por minuto, con información local y sin tiempo para re
 almacén entero.
 
 Ese es el problema: **la coordinación, no el pathfinding.**
-
-El mapa de pruebas lo pone a propósito difícil. `warehouse` son 13 nodos con forma de pasillos y un
-**cuello de botella** en `G`:
-
-```
-N1──N2──N3            N4──N5──N6      y = 8
- │       │  ╲        ╱  │       │
- │       │    ▶ G ◀     │       │     y = 4
- │       │  ╱        ╲  │       │
-S1──S2──S3            S4──S5──S6      y = 0
- x=0     4   8   12   16   20   24
-```
-
-`G` es un **nodo de articulación**: es la única unión entre las dos mitades, así que toda ruta que
-cruce el almacén pasa por él a la fuerza. Quitarlo parte el grafo en dos. Ahí se concentra todo el
-conflicto interesante.
 
 ### Cómo se reparte el trabajo
 
@@ -272,22 +256,14 @@ unity_z = py * UNITY_SCALE
 `UNITY_SCALE` vale **`1.0`** y una unidad lógica es **un metro**, así que hoy los números coinciden.
 Vive en `python/config.py`, y cambiarlo cambia **todas** las coordenadas exportadas de golpe: las
 del snapshot y las del mapa. La conversión está en **una sola función** del proyecto,
-`protocol.to_unity()`, y en ningún sitio se guarda una copia ya convertida.
+`graph.to_unity()`, y en ningún sitio se guarda una copia ya convertida.
 
 Unity no tiene que convertir nada: `x`, `y` y `z` llegan listos.
 
 Para montar la escena hace falta el grafo, que se exporta con las coordenadas ya convertidas:
 
 ```bash
-python3 python/main.py map --name warehouse     # por consola, logicas y Unity al lado
-python3 -c "import sys,json; sys.path.insert(0,'python'); import graph; \
-print(json.dumps(graph.warehouse_graph().to_unity_dict(), indent=2))" > warehouse_unity.json
-```
-
-```json
-{"name": "warehouse", "directed": false, "scale": 1.0,
- "nodes": [{"id": "G", "x": 12.0, "y": 0.0, "z": 4.0}],
- "edges": [{"from": "G", "to": "N3", "cost": 5.7}]}
+python3 python/main.py map --name almacen_reto  # por consola, logicas y Unity al lado
 ```
 
 Los ficheros de `python/maps/*.json` llevan las coordenadas **lógicas**, sin convertir: son la
@@ -331,13 +307,13 @@ python3 python/main.py --help
 ```bash
 python3 python/main.py serve                                   # 127.0.0.1:5000, baseline
 python3 python/main.py serve --agents 6 --port 5055            # con trafico
-python3 python/main.py serve --map warehouse --agents 4 --policy qlearning \
+python3 python/main.py serve --map almacen_reto --agents 4 --policy qlearning \
         --model python/models/q_table.json
 ```
 
 | Opción | Por defecto | Para qué |
 |---|---|---|
-| `--map` | `warehouse` | Mapa a servir |
+| `--map` | `almacen_reto` | Mapa a servir |
 | `--host` / `--port` | `127.0.0.1:5000` | Dónde escuchar |
 | `--agents` | `1` | Cuántos AGVs |
 | `--policy` | `baseline` | `baseline` o `qlearning` |
@@ -355,34 +331,18 @@ hacen falta varios. `--policy qlearning` sin modelo sale con código **2** y dic
 #### `map`
 
 ```bash
-python3 python/main.py map --name warehouse
+python3 python/main.py map --name almacen_reto
 ```
 
-```
---- mapa warehouse ---
-origen        : python/maps/warehouse.json
-nodos         : 13
-aristas       : 16
-dirigido      : no
-UNITY_SCALE   : 1.0
---- nodos: logicas (x, y) -> Unity (x, y, z) ---
-G           (12, 4)  ->  (12, 0, 4)
-N1           (0, 8)  ->  (0, 0, 8)
---- aristas ---
-G    -- N3    costo 5.7
-validate(): OK
-```
-
-Sale con código 1 si el mapa no es válido. Hay tres mapas: `warehouse` (13 nodos con cuello de
-botella), `simple` (6 nodos, para pruebas rápidas) y `grid` (rejilla 4×4 con rutas alternativas).
+Sale con código 1 si el mapa no es válido.
 
 #### `simulate`
 
 Corre sin servidor y cuenta por el log lo que hace cada AGV en cada paso.
 
 ```bash
-python3 python/main.py simulate --map warehouse --agents 1 --steps 100
-python3 python/main.py simulate --map warehouse --agents 6 --steps 300 \
+python3 python/main.py simulate --map almacen_reto --agents 1 --steps 100
+python3 python/main.py simulate --map almacen_reto --agents 6 --steps 300 \
         --policy qlearning
 ```
 
@@ -404,8 +364,8 @@ Con `--deliveries` el trabajo sale de la subasta y el resumen cuenta las misione
 además escupe la negociación entera, mensaje a mensaje.
 
 ```bash
-python3 python/main.py simulate --map grid --agents 4 --steps 400 --deliveries
-python3 python/main.py simulate --map grid --agents 3 --steps 60 --deliveries --bus
+python3 python/main.py simulate --map almacen_reto --agents 4 --steps 400 --deliveries
+python3 python/main.py simulate --map almacen_reto --agents 3 --steps 60 --deliveries --bus
 ```
 
 ```
@@ -430,11 +390,11 @@ servidor en medio multiplicaría el tiempo sin darle al algoritmo ni un dato má
 unos 8 segundos.
 
 ```bash
-python3 python/main.py train --map warehouse --agents 4 --episodes 1000 --seed 42
+python3 python/main.py train --map almacen_reto --agents 4 --episodes 1000 --seed 42
 ```
 
 Escribe `python/models/q_table.json` (la tabla **y su metadata**: mapa, agentes, hiperparámetros,
-semilla, fecha y visitas por estado), `results/training_log.csv` y `results/learning_curve.png`.
+semilla, fecha y visitas por estado) y `results/training_log.csv`.
 
 #### `evaluate`
 
@@ -442,7 +402,7 @@ Carga una Q-table y la juega **greedy puro** (epsilon 0, la tabla no se toca), c
 sobre los mismos episodios.
 
 ```bash
-python3 python/main.py evaluate --map warehouse --agents 4
+python3 python/main.py evaluate --map almacen_reto --agents 4
 ```
 
 Sale con **2** si el modelo no está, y con **1** si está pero es de otro formato: una Q-table
@@ -460,13 +420,13 @@ antes o después del subcomando.
 
 ### Por qué A\* y Q-Learning se reparten el trabajo así
 
-El pathfinding lo resuelve **A\***: quién dice por dónde se va de `S1` a `N6` es `astar.astar()`.
+El pathfinding lo resuelve **A\***: quién dice por dónde se va de `S1` a `N6` es `graph.astar()`.
 Lo que se aprende es mucho más chico: **qué hacer AHORA** cuando la ruta que ya tengo me mete en un
 conflicto.
 
 La razón es de tamaño. Si el estado fuera "dónde está todo el mundo", el espacio explotaría: en
-`warehouse` hay 13 nodos, y solo las posiciones de 6 AGVs ya son 13⁶ = **4.826.809** estados, sin
-contar rutas ni destinos. Con el estado local de aquí abajo son **72**.
+`almacen_reto` hay 62 nodos, y solo las posiciones de 6 AGVs ya son 62⁶ = **56.800.235.584**
+estados, sin contar rutas ni destinos. Con el estado local de aquí abajo son **144**.
 
 ```
                     ┌─────────────────────────────────────┐
@@ -600,10 +560,8 @@ y la corrida muere. Hace falta llenar un componente entero del grafo para llegar
 ### 5. Del alcance
 
 - El mapa **no cambia en marcha**: no hay obstáculos dinámicos ni pasillos que se cierren.
-- Los AGVs no tienen batería ni tamaño: un AGV es un punto que ocupa un nodo. Carga sí llevan,
-  pero solo una caja y solo con `--deliveries`; sin esa bandera siguen siendo puntos que van
-  de un nodo a otro. El mapa `grid` declara estaciones de carga (`B4`, `C4`) que **nadie usa
-  todavía**: son datos del mapa esperando a que exista un modelo de batería.
+- Los AGVs no tienen tamaño: un AGV es un punto que ocupa un nodo. Carga sí llevan, pero solo
+  una caja y solo con `--deliveries`.
 - No hay prioridades entre tareas ni ventanas de tiempo.
 - La comparación es contra una baseline de "gana el id menor". No se ha medido contra un
   planificador centralizado tipo CBS, que sería la referencia fuerte.
@@ -624,7 +582,7 @@ agentesAGV/
 │   ├── qlearning.py    Q-Learning: el entorno y el entrenamiento
 │   ├── server.py       el contrato con Unity: servidor HTTP con JSON
 │   ├── main.py         CLI con argparse
-│   ├── maps/           los mapas en JSON (simple, warehouse, grid)
+│   ├── maps/           los mapas en JSON
 │   └── models/         las Q-tables entrenadas
 ├── docs/
 │   └── PROTOCOL.md     el protocolo HTTP solo, para el equipo de Unity
