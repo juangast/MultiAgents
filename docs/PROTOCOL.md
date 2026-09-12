@@ -175,6 +175,7 @@ para que se lea; en el cable va en una sola:
 | `agents` | list | fase 1 | Un objeto por AGV, siempre todos y siempre en el mismo orden |
 | `stats` | object | fase 5 | Los números de la corrida |
 | `boxes` | list | entregas | Una entrada por caja del almacen, con donde esta **ahora** |
+| `obstacles` | list | obstáculos | Los obstáculos de la corrida y dónde han caído ([abajo](#obstacles)) |
 | `mode` | str | fase 8 | La política activa: `baseline` o `qlearning` |
 | `fleet` | object | flotas | Quién hace qué y cómo va la línea de entrada ([abajo](#fleet)) |
 
@@ -260,6 +261,31 @@ inventario **inicial**, y esta lista dice donde esta cada una en este momento.
 | `IN_TRANSIT` | Va encima de un AGV | Caja sobre el AGV, sigue su posicion |
 | `DELIVERED` | Ya salio por un muelle | Caja en el muelle |
 
+<a id="obstacles"></a>
+### `obstacles[]`
+
+Bultos que tapan un pasillo. En cada corrida se reparten por nodos de paso
+elegidos al azar, y el servidor **le veta esos nodos a su propio A\***: no son
+decorado, las rutas que manda ya les dan la vuelta. El cliente no tiene que
+esquivar nada por su cuenta.
+
+Se sortean de nuevo en cada `POST /reset` y no se mueven dentro de una corrida,
+así que basta con leerlos cuando cambien.
+
+| Campo | Tipo | Qué es |
+|---|---|---|
+| `id` | str | Identificador estable. Es el nombre del objeto en la escena de Unity |
+| `active` | bool | `false` si a este obstáculo no le tocó sitio: el cliente lo esconde |
+| `node` | str \| null | Nodo que tapa, o `null` si `active` es `false` |
+| `x`, `z` | float | Dónde ponerlo, en las mismas coordenadas que los AGVs ([§4](#4-coordenadas-y-escala)) |
+
+No viene `y`: la altura es cosa de la escena, porque depende del modelo que se
+use para pintarlo. El cliente deja la que ya tuviera.
+
+Un obstáculo nunca cae en un nodo de estantería, muelle, banda o cargador —esos
+son puestos de trabajo, y taparlos anularía la misión que iba allí— ni en uno
+que deje parte del mapa incomunicado.
+
 <a id="fleet"></a>
 ### `fleet`
 
@@ -318,7 +344,8 @@ flota dedicada no se aplica, porque ahí ya hay AGV reservados para la banda.
 | `finished_reason` | str \| null | fase 5 | `"deadlock"` si la corrida murió atascada |
 | `actions` | object | fase 8 | Decisiones de la corrida por tipo: `advance` / `wait` / `reroute` |
 | `forced` | int | fase 8 | Veces que el motor tuvo que desatascar a la fuerza |
-| `penalties` | int | fase 8 | Penalizaciones de ruta vivas ahora mismo |
+| `penalties` | int | fase 8 | Penalizaciones de ruta vivas ahora mismo. **No** cuenta los obstáculos |
+| `obstacles` | int | obstáculos | Cuántos pasillos hay tapados esta corrida |
 | `deliveries` | bool | entregas | Si esta corrida va con entregas o solo con destinos |
 | `picked` | int | entregas | Cajas recogidas en esta corrida |
 | `delivered` | int | entregas | Cajas ya dejadas en un muelle |

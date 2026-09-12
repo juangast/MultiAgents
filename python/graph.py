@@ -11,6 +11,7 @@ import math
 from collections import deque
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import config
@@ -652,12 +653,28 @@ PENALTY_TTL: int = 15
 PENALTY_MAX: float = 40.0
 PENALTY_BAN: float = 1000.0
 
+# Lo que cuesta cruzar algo que estorba de forma fija (un obstaculo en mitad del
+# pasillo). Tiene que ser mucho mas caro que `PENALTY_BAN` y no solo un poco:
+# los vetos temporales del trafico se apilan, y una ruta con dos o tres nodos
+# vetados ya suma mas de 1000. Con los dos al mismo precio A* acababa metiendose
+# por encima del obstaculo en una de cada cinco rutas, en cuanto el rodeo tenia
+# un AGV delante. Un millon no lo alcanza ninguna pila realista (una ruta larga
+# vetada entera ronda las decenas de miles) y sigue siendo finito, que es lo que
+# evita que A* se quede sin ruta.
+PENALTY_OBSTACLE: float = 1_000_000.0
+
 
 class TemporaryPenalties(Mapping):
-    """Penalizaciones de ruta que caducan solas.
+    """Penalizaciones de ruta que caducan solas, mas un piso que no caduca.
 
     Sin caducidad el mapa se degrada para siempre: A* acabaria esquivando
-    pasillos que llevan cien ticks libres.
+    pasillos que llevan cien ticks libres. Ese es el comportamiento normal, el
+    de `add()` y `ban()`.
+
+    Encima de eso hay un piso fijo (`block()`) para lo que estorba de verdad y
+    no se quita solo: un obstaculo plantado en un pasillo sigue ahi el tick
+    siguiente, asi que ni `expire()` ni `clear()` lo tocan. Cuando una clave
+    esta en los dos, manda la mas cara.
     """
 
     def __init__(
@@ -669,17 +686,52 @@ class TemporaryPenalties(Mapping):
         self.ttl: int = int(ttl)
         self.cap: float = float(cap)
         self._items: dict[PenaltyKey, tuple[float, int]] = {}
+        self._fijos: dict[PenaltyKey, float] = {}
 
     def __repr__(self) -> str:
-        return f"TemporaryPenalties(activas={len(self._items)}, ttl={self.ttl})"
+        return (
+            f"TemporaryPenalties(activas={len(self._items)}, "
+            f"fijas={len(self._fijos)}, ttl={self.ttl})"
+        )
 
     def __getitem__(self, key: PenaltyKey) -> float:
-        return self._items[key][0]
+        temporal = self._items.get(key)
+        fijo = self._fijos.get(key)
+        if temporal is None and fijo is None:
+            raise KeyError(key)
+        return max(0.0 if temporal is None else temporal[0], fijo or 0.0)
 
     def __iter__(self) -> Iterator[PenaltyKey]:
-        return iter(self._items)
+        return iter(self._claves())
 
     def __len__(self) -> int:
+        return len(self._claves())
+
+    def _claves(self) -> dict[PenaltyKey, None]:
+        """Las claves de los dos pisos, sin repetir y en orden de insercion."""
+        claves = dict.fromkeys(self._items)
+        claves.update(dict.fromkeys(self._fijos))
+        return claves
+
+    @property
+    def fijas(self) -> Mapping[PenaltyKey, float]:
+        """Solo el piso fijo, en un mapa de solo lectura.
+
+        Es para las rutas que tienen que ignorar el trafico pero no lo que
+        estorba de verdad. El viaje al cargador es el caso: no puede alargarse
+        por esquivar un atasco —ahi manda la bateria—, pero tampoco puede
+        atravesar un obstaculo, que no se quita esperando.
+        """
+        return MappingProxyType(self._fijos)
+
+    @property
+    def temporales(self) -> int:
+        """Cuantas penalizaciones con caducidad hay vivas, sin contar los vetos fijos.
+
+        `len()` cuenta los dos pisos, que es lo que A* necesita ver. Esto es para
+        medir la presion de replanificacion, y ahi un obstaculo que lleva toda la
+        corrida en el mismo sitio no cuenta como un roce de hace dos ticks.
+        """
         return len(self._items)
 
     def add(self, key: PenaltyKey, amount: float, *, step: int) -> float:
@@ -696,8 +748,33 @@ class TemporaryPenalties(Mapping):
         self._items[key] = (PENALTY_BAN, int(step) + self.ttl)
         return PENALTY_BAN
 
+    def block(self, key: PenaltyKey, *, amount: float = PENALTY_OBSTACLE) -> float:
+        """Veta `key` hasta que se quite a mano: no caduca y `clear()` no la borra.
+
+        Es para lo que estorba de forma estable (un obstaculo en un pasillo), no
+        para un roce de un tick: para eso estan `add()` y `ban()`.
+
+        El precio es caro pero finito a proposito, igual que en `ban()`: si el
+        obstaculo acaba tapando el unico paso, A* prefiere cualquier rodeo y
+        solo pasa por encima cuando no hay ninguno, en vez de quedarse sin ruta.
+        Por que `PENALTY_OBSTACLE` y no `PENALTY_BAN`, en la constante.
+        """
+        self._fijos[key] = float(amount)
+        return float(amount)
+
+    def unblock(self, key: PenaltyKey) -> None:
+        """Levanta el veto fijo de `key`, si lo tenia."""
+        self._fijos.pop(key, None)
+
+    def unblock_all(self) -> None:
+        """Levanta todos los vetos fijos. Las temporales se quedan como estan."""
+        self._fijos.clear()
+
     def discard(self, key: PenaltyKey) -> None:
-        """Quita la penalizacion de `key`, si la tenia."""
+        """Quita la penalizacion temporal de `key`, si la tenia.
+
+        No toca el veto fijo: para eso esta `unblock()`.
+        """
         self._items.pop(key, None)
 
     def expire(self, step: int) -> int:
@@ -710,7 +787,12 @@ class TemporaryPenalties(Mapping):
         return len(vencidas)
 
     def clear(self) -> None:
-        """Deja la tabla vacia."""
+        """Deja la tabla temporal vacia. Los vetos fijos siguen puestos.
+
+        Lo llama `Simulation.reset()`, que reparte los obstaculos justo despues:
+        si esto se llevara los vetos por delante, el reparto nuevo se borraria o
+        habria que acordarse de rehacerlo. Para quitarlos esta `unblock_all()`.
+        """
         self._items.clear()
 
 
