@@ -19,6 +19,7 @@ from typing import Any
 import config
 import conflicts
 import missions
+import obstacles as obstaculos
 import server
 from agent import Agent, Leg, State
 from graph import (
@@ -29,6 +30,7 @@ from graph import (
     WarehouseGraph,
     astar,
     to_unity,
+    travel_ticks,
 )
 from config import get_logger
 
@@ -245,6 +247,9 @@ class Simulation:
         self._zonas: frozenset[str] = frozenset()
 
         self.penalties: TemporaryPenalties = TemporaryPenalties()
+        self.obstacles: obstaculos.ObstacleField = obstaculos.ObstacleField(
+            graph, seed=seed
+        )
         self._acciones: dict[int, ActionRecord] = {}
         self._reservas: dict[str, tuple[int, int]] = {}
         self._parado: dict[int, int] = {}
@@ -318,6 +323,7 @@ class Simulation:
                 "agents": [self._describe(agente) for agente in self.agents],
                 "stats": self.stats(),
                 "boxes": [self._describe_caja(caja) for caja in self.inventory.values()],
+                "obstacles": self.obstacles.as_dicts(),
                 "mode": self.mode,
             }
 
@@ -355,7 +361,8 @@ class Simulation:
                 "finished_reason": self.finished_reason,
                 "actions": dict(self._recuento),
                 "forced": self._forzados,
-                "penalties": len(self.penalties),
+                "penalties": self.penalties.temporales,
+                "obstacles": len(self.obstacles.nodes()),
                 "deliveries": self.deliveries,
                 "picked": self.picked,
                 "delivered": self.delivered,
@@ -408,6 +415,7 @@ class Simulation:
             self.occupancy = {}
 
             self.penalties.clear()
+            self._reparte_obstaculos()
             self._acciones.clear()
             self._reservas.clear()
             self._parado.clear()
@@ -428,7 +436,9 @@ class Simulation:
                     agente.current_node = origen
                     agente.state = State.IDLE
                 else:
-                    agente.assign_task(origen, destino, task=agente.id)
+                    agente.assign_task(
+                        origen, destino, task=agente.id, penalties=self.penalties
+                    )
                 self.occupancy[agente.current_node] = agente.id
 
             log.info(
@@ -438,6 +448,23 @@ class Simulation:
                 self.mode,
                 self.run,
             )
+
+    def _reparte_obstaculos(self) -> None:
+        """Sortea donde caen los obstaculos de esta corrida y se los veta a A*.
+
+        Va en `reset()` y no en `__init__` a proposito: asi cada corrida estrena
+        reparto y la politica no puede aprenderse el mapa de memoria, que es
+        justo lo que se le quiere exigir.
+
+        El veto es fijo (`block`) y no temporal: un obstaculo no se quita solo a
+        los quince ticks como una penalizacion de conflicto, sigue ahi toda la
+        corrida.
+        """
+        self.penalties.unblock_all()
+        ocupados = {origen for origen, _ in self._rutas}
+        ocupados.update(destino for _, destino in self._rutas)
+        for nodo in self.obstacles.scatter(avoid=ocupados):
+            self.penalties.block(nodo)
 
     def _comprueba_rutas(
         self, routes: Sequence[tuple[str, str]]
@@ -639,6 +666,20 @@ class Simulation:
         )
         self._al_cargador(agente, cargadores)
 
+    def _ticks_al_cargador(self, desde: str, cargador: str) -> int | None:
+        """Ticks del viaje al cargador rodeando los obstaculos, o None si no hay ruta.
+
+        `graph.route_ticks` mide por la ruta libre, y con un obstaculo en medio
+        esa ruta no existe: el AGV daria el rodeo gastando mas de lo calculado.
+        Aqui se mide por donde de verdad va a ir.
+        """
+        ruta = astar(self.graph, desde, cargador, self.penalties.fijas)
+        if ruta is None:
+            return None
+        return sum(
+            travel_ticks(self.graph.cost(a, b)) for a, b in zip(ruta, ruta[1:])
+        )
+
     def _cargadores_tomados(self, agente: Agent) -> set[str]:
         """Los cargadores que ya tiene otro AGV, enchufado o de camino.
 
@@ -667,9 +708,16 @@ class Simulation:
         sin plan se le manda a uno ocupado, porque hacer cola con bateria se
         arregla solo y quedarse seco en un pasillo no.
 
-        La ruta va sin penalizaciones a proposito. Esquivar atascos alarga el
-        camino, y este es justo el viaje que no puede permitirse ni un metro de
-        mas: aqui manda la bateria y no el trafico.
+        La ruta va sin las penalizaciones del trafico a proposito. Esquivar
+        atascos alarga el camino, y este es justo el viaje que no puede
+        permitirse ni un metro de mas: aqui manda la bateria y no el trafico.
+
+        Los obstaculos si cuentan (`penalties.fijas`), porque no son lo mismo:
+        un atasco se pasa esperando y una caja en mitad del pasillo no. Y tienen
+        que contar tambien **al elegir** el cargador, no solo al trazar la ruta:
+        si el mas cercano en linea de ruta queda detras de un obstaculo, el
+        rodeo gasta mas bateria de la que se le habia calculado y el AGV se
+        queda seco en el pasillo, que es exactamente lo que esto evita.
         """
         if cargadores is None:
             cargadores = self.graph.nodes_with_role(ROLE_CHARGING)
@@ -679,7 +727,7 @@ class Simulation:
         alcanzables = sorted(
             (d, nodo)
             for nodo in cargadores
-            if (d := self.graph.route_ticks(agente.current_node, nodo)) is not None
+            if (d := self._ticks_al_cargador(agente.current_node, nodo)) is not None
         )
         asequibles = [
             par
@@ -691,9 +739,14 @@ class Simulation:
 
         for _, nodo in libres or asequibles or alcanzables:
             trazada = (
-                agente.divert_to(nodo)
+                agente.divert_to(nodo, self.penalties.fijas)
                 if agente.carrying
-                else agente.assign_task(agente.current_node, nodo, task=agente.task)
+                else agente.assign_task(
+                    agente.current_node,
+                    nodo,
+                    task=agente.task,
+                    penalties=self.penalties.fijas,
+                )
             )
             if trazada:
                 agente.leg = Leg.TO_CHARGER
