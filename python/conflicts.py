@@ -15,7 +15,7 @@ log = get_logger("conflicts")
 CONFLICT_WAIT_THRESHOLD: int = 5
 CONGESTION_ZONE_AGENTS: int = 3
 
-
+#mmm
 class ConflictType(str, Enum):
     """Los cuatro tipos de choque que el almacen sabe reconocer."""
 
