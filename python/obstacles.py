@@ -1,20 +1,4 @@
-"""Obstaculos que aparecen en sitio libre y estorban de verdad.
-
-Son las cajas negras que ya estan puestas en la escena de Unity
-(`Obstaculo_1`..`Obstaculo_3`). Cada corrida se reparten por nodos de paso
-elegidos al azar y el nodo que ocupan queda **vetado para A\\***: no son
-decorado, los AGV les dan la vuelta.
-
-Sortear el nodo a ciegas tiene una trampa. En el almacen hay pasillos que son el
-unico paso a una zona, y taparlos deja estanterias o muelles incomunicados: A*
-se queda sin ruta y la corrida se muere en deadlock. Por eso ningun candidato se
-acepta sin probarlo antes: `_deja_el_mapa_entero` comprueba que, quitandolo, se
-siga llegando de cualquier nodo libre a todos los demas.
-
-Unity solo pinta lo que se le manda desde aqui: el `id` enlaza con el objeto de
-la escena y `x`/`z` dicen donde ponerlo. Que el obstaculo estorbe o no lo decide
-este modulo, no el cliente.
-"""
+"""Obstaculos que aparecen en sitio libre y estorban de verdad."""
 
 import heapq
 import random
@@ -27,26 +11,12 @@ from graph import ROLE_TRANSIT, WarehouseGraph, to_unity
 
 log = get_logger("obstacles")
 
-# Los objetos que ya existen en la escena de Unity. El id **es** el nombre del
-# GameObject porque el cliente los busca por nombre: esto es contrato, no una
-# etiqueta interna. Anadir otro aqui sin crearlo en la escena no rompe nada,
-# simplemente Unity no lo encuentra y lo ignora.
 OBSTACLE_IDS: tuple[str, ...] = ("Obstaculo_1", "Obstaculo_2", "Obstaculo_3")
 
-# Solo se tapan pasillos. Las estanterias, los muelles, las bandas y los
-# cargadores son puestos de trabajo: un obstaculo encima de uno no bloquea un
-# paso, anula la mision que iba a ese sitio.
 OBSTACLE_ROLE: str = ROLE_TRANSIT
 
-# Cuanto se le permite alargarse al rodeo, contra el tramo que tapa.
-#
-# Que haya que dar la vuelta es justo lo que se busca. Lo que no puede pasar es
-# que la vuelta sea media nave: hay pasillos de paso (P03 y P30 tienen dos
-# vecinos y nada mas) que son el eslabon de una cadena, y taparlos no desconecta
-# el mapa —por eso no basta con mirar la conectividad— pero manda a los AGV a
-# rodear el almacen entero. Medido sobre 12 corridas: los repartos con rodeos de
-# hasta 7x entregaban entre 7 y 14 cajas, y el unico que se fue a 12x se quedo
-# en 4 y acabo en deadlock. El corte va justo encima de ese grupo.
+# Tope de cuanto puede alargarse el rodeo. Medido sobre 12 corridas: hasta 7x
+# se entregaban 7-14 cajas; a 12x se cayo a 4 y acabo en deadlock.
 MAX_DETOUR: float = 8.0
 
 
@@ -78,9 +48,6 @@ class ObstacleField:
     ) -> None:
         self.graph: WarehouseGraph = graph
         self.obstacles: list[Obstacle] = [Obstacle(nombre) for nombre in ids]
-        # Un generador propio, y que **no** se reinicia en cada `scatter()`: asi
-        # cada corrida saca un reparto distinto y a la vez la sesion entera
-        # sigue siendo reproducible desde la semilla.
         self._rng: random.Random = random.Random(seed)
 
     def __repr__(self) -> str:
@@ -95,12 +62,7 @@ class ObstacleField:
         )
 
     def scatter(self, *, avoid: Iterable[str] = ()) -> frozenset[str]:
-        """Reparte los obstaculos por pasillos libres, uno por nodo.
-
-        `avoid` son los nodos que no se pueden tapar por estar ocupados ahora
-        mismo (los de salida de los AGV entran solos). Devuelve los nodos que
-        han quedado tapados.
-        """
+        """Reparte los obstaculos por pasillos libres, uno por nodo."""
         prohibidos = set(avoid) | set(self.graph.agv_starts)
         candidatos = [
             nodo
@@ -129,12 +91,7 @@ class ObstacleField:
         return frozenset(puestos)
 
     def _elige(self, candidatos: list[str], puestos: Sequence[str]) -> str | None:
-        """Saca de `candidatos` el primero que no parta el mapa, o None si ninguno.
-
-        Los que no valen se tiran para siempre: `puestos` solo crece, asi que un
-        nodo que ya estrangula el mapa con los obstaculos de ahora tampoco va a
-        valer con uno mas encima.
-        """
+        """Saca de `candidatos` el primero que no parta el mapa, o None si ninguno."""
         while candidatos:
             candidato = candidatos.pop()
             if _reparto_valido(self.graph, [*puestos, candidato]):
@@ -174,17 +131,7 @@ def _reparto_valido(
     tapados: Sequence[str],
     factor_max: float = MAX_DETOUR,
 ) -> bool:
-    """True si con `tapados` puestos se sigue pasando por todos lados sin rodeos absurdos.
-
-    Para cada nodo tapado mira sus vecinos de dos en dos: si para ir de un lado
-    al otro del obstaculo hace falta mas de `factor_max` veces lo que media
-    cruzarlo, ese nodo era un cuello de botella y el reparto no vale.
-
-    De paso cubre la conectividad, que es el caso extremo de lo mismo: si dos
-    vecinos dejan de alcanzarse, el rodeo es infinito y se descarta igual. Y hay
-    que repasar **todos** los tapados y no solo el ultimo, porque el rodeo que
-    le valia a uno puede pasar justo por donde acaba de caer otro.
-    """
+    """True si con `tapados` puestos se sigue pasando por todos lados sin rodeos absurdos."""
     bloqueados = set(tapados)
     for nodo in tapados:
         vecinos = [v for v in graph.neighbors(nodo) if v not in bloqueados]

@@ -1,8 +1,4 @@
-"""Deteccion de conflictos y la politica base.
-
-Cuatro tipos de choque (vertex, edge, following, congestion) y el desempate por
-id menor. La politica es intercambiable: el Q-Learning entra por `Policy`.
-"""
+"""Deteccion de conflictos y la politica base."""
 
 from collections.abc import Iterable, Mapping, Sequence
 from types import MappingProxyType
@@ -19,7 +15,7 @@ log = get_logger("conflicts")
 CONFLICT_WAIT_THRESHOLD: int = 5
 CONGESTION_ZONE_AGENTS: int = 3
 
-
+#mmm
 class ConflictType(str, Enum):
     """Los cuatro tipos de choque que el almacen sabe reconocer."""
 
@@ -32,10 +28,7 @@ class ConflictType(str, Enum):
 
 
 class Intent(str, Enum):
-    """Lo que una politica puede contestar.
-
-    Son tres a proposito: se aprende cuando ceder el paso, no a inventar rutas.
-    """
+    """Lo que una politica puede contestar."""
 
     __str__ = str.__str__
 
@@ -89,11 +82,7 @@ class Conflict:
 
 
 class Resolution:
-    """Quien gana un conflicto y quien se queda esperando.
-
-    En `congestion` no hay nada que arbitrar: no es una disputa por un nodo, es
-    un sintoma. Sale `Resolution(None, ())`.
-    """
+    """Quien gana un conflicto y quien se queda esperando."""
 
     def __init__(self, winner: int | None, losers: tuple[int, ...]) -> None:
         self.winner = winner
@@ -101,11 +90,7 @@ class Resolution:
 
 
 class ConflictLog:
-    """Los conflictos de una corrida, con el conteo ya hecho.
-
-    Se vacia en cada `reset()`: el registro es *por corrida*, que es la unidad
-    con la que se mide una politica contra otra.
-    """
+    """Los conflictos de una corrida, con el conteo ya hecho."""
 
     def __init__(self) -> None:
         self._items: list[Conflict] = []
@@ -121,11 +106,7 @@ class ConflictLog:
         return len(self._items)
 
     def by_type(self) -> dict[str, int]:
-        """Conteo por tipo, con los cuatro tipos siempre presentes.
-
-        Los ceros van explicitos: un informe en el que falta `edge` no se
-        distingue de uno en el que `edge` salio cero.
-        """
+        """Conteo por tipo, con los cuatro tipos siempre presentes."""
         cuenta = dict.fromkeys(ConflictType, 0)
         for conflicto in self._items:
             cuenta[conflicto.type] += 1
@@ -174,11 +155,7 @@ def _vertex(
     step: int,
     explicados: set[frozenset[int]],
 ) -> list[Conflict]:
-    """Dos o mas agentes queriendo el mismo nodo en el mismo tick.
-
-    El que ya esta encima del nodo cuenta como uno mas que lo quiere: no lo esta
-    pidiendo, lo esta usando, y eso es exactamente lo que impide entrar.
-    """
+    """Dos o mas agentes queriendo el mismo nodo en el mismo tick."""
     contendientes: dict[str, set[int]] = {}
     for agent_id, destino in intents.items():
         contendientes.setdefault(destino, set()).add(agent_id)
@@ -345,12 +322,7 @@ def reroute(
     return agent.path
 
 def resolve_conflict(conflict: Conflict) -> Resolution:
-    """Quien se lleva el paso en un conflicto: el agente con el id menor.
-
-    Es la regla del **motor**, no de ninguna politica: se aplica en todos los
-    ticks y es la que rellena `blocked_by`. La politica decide despues, sabiendo
-    ya quien le gano. En congestion no hay a quien ceder, asi que no gana nadie.
-    """
+    """Quien se lleva el paso en un conflicto: el agente con el id menor."""
     if conflict.type == ConflictType.CONGESTION or not conflict.agents:
         return Resolution(None, ())
 
@@ -391,7 +363,6 @@ class Policy(Protocol):
         ...
 
 
-
 class BaselinePolicy:
     """Cede el paso si alguien te gano el conflicto. Nada mas."""
 
@@ -406,9 +377,5 @@ class BaselinePolicy:
 
 
 def read_only(occupancy: dict[str, int]) -> Occupancy:
-    """Vista de solo lectura de la ocupacion, para pasarsela a una politica.
-
-    Una politica no tiene por que poder reescribir el mapa de ocupacion, y menos
-    una que en la fase 8 sera codigo de aprendizaje probando cosas.
-    """
+    """Vista de solo lectura de la ocupacion, para pasarsela a una politica."""
     return MappingProxyType(occupancy)

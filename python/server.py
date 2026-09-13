@@ -1,12 +1,4 @@
-"""El enlace con Unity: servidor HTTP con JSON.
-
-Seis rutas y nada mas. `GET /state` mira sin tocar el reloj y `POST /step`
-avanza un paso: en HTTP el GET no puede tener efectos, y de paso eso arregla que
-dos clientes ya no se roben los ticks el uno al otro.
-
-La simulacion entra por inyeccion de dependencia: aqui no hay ni una linea de
-logica del almacen.
-"""
+"""El enlace con Unity: servidor HTTP con JSON."""
 
 import json
 import signal
@@ -24,11 +16,7 @@ Snapshot = dict[str, Any]
 
 
 class Simulation(Protocol):
-    """Lo que el servidor necesita de una simulacion para poder atenderla.
-
-    `set_mode` no va aqui a proposito: es opcional, y una simulacion que no sepa
-    cambiar de politica tiene que poder servirse igual.
-    """
+    """Lo que el servidor necesita de una simulacion para poder atenderla."""
 
     def snapshot(self) -> Snapshot:
         ...
@@ -58,8 +46,7 @@ class AGVRequestHandler(BaseHTTPRequestHandler):
             self._responder(404, self._desconocida(ruta))
 
     def do_POST(self) -> None:
-        """`POST /step` avanza un paso, `/reset` reinicia, `/mode` cambia de
-        politica y `/fleet` cambia el reparto de la flota."""
+        """`POST /step` avanza un paso, `/reset` reinicia, `/mode` cambia de politica y `/fleet` cambia..."""
         ruta = self.path.split("?")[0].rstrip("/") or "/"
         cuerpo = self._lee_cuerpo()
         if cuerpo is None:
@@ -146,11 +133,7 @@ ERROR_SET_FLEET_FAILED: str = "set_fleet_failed"
 def set_mode_payload(
     simulation: Simulation, body: dict[str, Any]
 ) -> tuple[int, dict[str, Any]]:
-    """Cambia la politica en caliente. Devuelve (codigo HTTP, payload).
-
-    Arranca una corrida limpia: media corrida con una politica y media con otra
-    no es una corrida de ninguna de las dos.
-    """
+    """Cambia la politica en caliente. Devuelve (codigo HTTP, payload)."""
     modo = str(body.get("mode", "")).strip().lower()
     if modo not in config.POLICIES:
         return 400, {
@@ -178,16 +161,7 @@ def set_mode_payload(
 def set_fleet_payload(
     simulation: Simulation, body: dict[str, Any]
 ) -> tuple[int, dict[str, Any]]:
-    """Cambia el reparto de la flota en caliente. Devuelve (codigo HTTP, payload).
-
-    Quien hace que en el almacen: si unos AGV se dedican a la linea de entrada y
-    el resto al muelle, o si todos pujan por todo. Como `set_mode_payload`,
-    arranca una corrida limpia.
-
-    Los repartos no se validan contra `config`, sino contra los que declare la
-    propia simulacion en `fleets`: quien los define es el adaptador de Unity, no
-    el nucleo. Una simulacion sin `set_fleet` se sirve igual y contesta 501.
-    """
+    """Cambia el reparto de la flota en caliente. Devuelve (codigo HTTP, payload)."""
     cambiar = getattr(simulation, "set_fleet", None)
     if not callable(cambiar):
         return 501, {"error": ERROR_FLEET_NOT_SUPPORTED}
@@ -231,12 +205,7 @@ class AGVServer(ThreadingHTTPServer):
         super().__init__(server_address, AGVRequestHandler, bind_and_activate)
 
     def server_bind(self) -> None:
-        """Abre el socket sin resolver el nombre de la maquina.
-
-        `HTTPServer.server_bind()` llama a `getfqdn()`, que se va a DNS y puede
-        tardar segundos en arrancar. El nombre solo lo usa la cabecera `Server`,
-        asi que no vale lo que cuesta.
-        """
+        """Abre el socket sin resolver el nombre de la maquina."""
         super(type(self).__mro__[1], self).server_bind()
         self.server_name = self.server_address[0]
         self.server_port = self.server_address[1]

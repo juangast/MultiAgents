@@ -1,13 +1,4 @@
-"""Misiones, comunicacion y negociacion: el reparto de trabajo es una subasta.
-
-Nadie asigna las misiones desde arriba. El `MissionManager` las publica al bus y
-**no decide nada**: no calcula distancias, no compara AGVs y no elige ganador.
-Cada AGV mira lo publicado, calcula su propia utilidad y puja; el que mas ofrece
-se la lleva. Todo lo que se dicen queda registrado en el `MessageBus`.
-
-Una mision es una entrega entera: recoger una caja de su estanteria y dejarla en
-un muelle.
-"""
+"""Misiones, comunicacion y negociacion: el reparto de trabajo es una subasta."""
 
 import math
 from collections.abc import Iterable, Sequence
@@ -45,11 +36,7 @@ class BoxStatus(str, Enum):
 
 
 class BoxState:
-    """Una caja durante la corrida: donde esta ahora y como esta.
-
-    Es lo unico que se mueve del almacen. `graph.boxes` es el inventario inicial
-    y no cambia nunca; esto es su copia viva.
-    """
+    """Una caja durante la corrida: donde esta ahora y como esta."""
 
     def __init__(
         self,
@@ -103,11 +90,7 @@ def build_inventory(graph: WarehouseGraph) -> dict[str, BoxState]:
 
 
 class Flow(str, Enum):
-    """Los dos flujos logisticos del almacen.
-
-    `PRODUCTION_TO_RACK` guarda lo que sale de la linea de produccion;
-    `RACK_TO_DOCK` saca del almacen lo que ya estaba guardado.
-    """
+    """Los dos flujos logisticos del almacen."""
 
     __str__ = str.__str__
 
@@ -211,11 +194,7 @@ class Mission:
 
 
 def flow_of(graph: WarehouseGraph, box: BoxState) -> Flow | None:
-    """El flujo que pide una caja segun donde esta parada, o None si no pide nada.
-
-    Una caja recien fabricada hay que guardarla; una guardada hay que sacarla;
-    una que ya salio, ni una cosa ni la otra.
-    """
+    """El flujo que pide una caja segun donde esta parada, o None si no pide nada."""
     if box.status is BoxStatus.WAITING_PICKUP:
         return Flow.PRODUCTION_TO_RACK
     if box.status is BoxStatus.STORED:
@@ -224,15 +203,7 @@ def flow_of(graph: WarehouseGraph, box: BoxState) -> Flow | None:
 
 
 class MissionManager:
-    """Publica el trabajo que hay y apunta lo que pasa con el.
-
-    Hace tres cosas y nada mas: publicar, registrar quien acepto y registrar
-    quien termino. **No decide nada**: no calcula distancias, no compara AGVs y
-    no elige ganador. Quien ejecuta cada mision lo deciden los AGVs pujando.
-
-    Las misiones no estan escritas de antemano: salen del inventario en cada
-    paso, y por eso una caja guardada en el rack genera despues su salida.
-    """
+    """Publica el trabajo que hay y apunta lo que pasa con el."""
 
     def __init__(self, bus: MessageBus, graph: WarehouseGraph) -> None:
         self.bus = bus
@@ -254,11 +225,7 @@ class MissionManager:
         return destino
 
     def open_work(self, inventory: dict[str, BoxState]) -> list[Mission]:
-        """Abre una mision por cada caja que pide trabajo y no la tiene ya.
-
-        Es lo que encadena los dos flujos: en cuanto una caja pasa a `STORED`,
-        el paso siguiente le abre su mision de salida.
-        """
+        """Abre una mision por cada caja que pide trabajo y no la tiene ya."""
         nuevas: list[Mission] = []
         for caja in inventory.values():
             if caja.mission is not None:
@@ -291,14 +258,7 @@ class MissionManager:
         ]
 
     def busy_nodes(self) -> set[str]:
-        """Los nodos de recogida que ya tienen un AGV yendo a por su caja.
-
-        Una estanteria es un callejon sin salida con sitio para un solo AGV, y
-        suele guardar dos cajas, una por nivel. Sin esto sus dos misiones se
-        reparten a la vez, los dos AGVs van al mismo hueco y el que llega
-        segundo se queda clavado en el cruce del pasillo, tapando a todos los
-        demas. Se libera al recoger: a partir de ahi el primero ya se va.
-        """
+        """Los nodos de recogida que ya tienen un AGV yendo a por su caja."""
         return {
             m.node
             for m in self.missions.values()
@@ -360,11 +320,7 @@ class MissionManager:
 
 
 def resolve_auction(bids: Iterable[tuple[int, float]]) -> tuple[int, float] | None:
-    """El ganador de una subasta: la utilidad mas alta, y a igualdad el id menor.
-
-    El desempate por id no es un capricho: sin el, dos AGVs con la misma
-    utilidad harian que la corrida dependiera del orden del diccionario.
-    """
+    """El ganador de una subasta: la utilidad mas alta, y a igualdad el id menor."""
     pujas = sorted(bids, key=lambda p: (-p[1], p[0]))
     return pujas[0] if pujas else None
 
@@ -375,13 +331,7 @@ def resolve_auctions(
     manager: MissionManager,
     agents: Sequence[Any],
 ) -> list[tuple[Any, Mission, float]]:
-    """Resuelve todas las subastas del paso. Devuelve (agv, mision, utilidad).
-
-    Un AGV solo puede ganar una mision por paso: en cuanto se lleva una sale de
-    `libres` y sus pujas por las demas ya no cuentan. Y al reves, un nodo de
-    recogida solo admite un AGV a la vez: en cuanto alguien acepta la mision de
-    una estanteria, esa estanteria sale de la subasta hasta que se recoja.
-    """
+    """Resuelve todas las subastas del paso. Devuelve (agv, mision, utilidad)."""
     por_id = {agv.id: agv for agv in agents}
     libres = {agv.id for agv in agents if agv.available()}
     ocupados = manager.busy_nodes()
@@ -419,12 +369,7 @@ BID_W_BATTERY: float = 0.5
 
 
 def utility(distance: float, workload: float, level: int, battery: float) -> float:
-    """Lo que vale una mision para un AGV. Cuanto mas alta, mas la quiere.
-
-    Cuatro terminos: lo lejos que esta la caja, lo cargado de trabajo que va, lo
-    alto que este la caja (subir la horquilla cuesta ticks) y la bateria que le
-    queda. Gana el AGV libre, cercano, descansado y con las pilas llenas.
-    """
+    """Lo que vale una mision para un AGV. Cuanto mas alta, mas la quiere."""
     return (
         -BID_W_DISTANCE * distance
         - BID_W_WORKLOAD * workload
@@ -436,14 +381,7 @@ def utility(distance: float, workload: float, level: int, battery: float) -> flo
 def estimated_cost(
     graph: WarehouseGraph, node: str, mission: Mission, chargers: Sequence[str]
 ) -> float:
-    """Bateria que cuesta la mision entera: ida a la caja, transporte y salida al cargador.
-
-    Los tres tramos se miden en ticks de viaje por la ruta de verdad, que es lo
-    que gasta la bateria. Con la linea recta, o contando el costo en vez de los
-    ticks, el calculo se queda corto y el AGV acepta viajes que no puede
-    terminar: se planta a cero en mitad de un pasillo y, como los pasillos son
-    de un solo carril, deja el almacen tapado para todos los demas.
-    """
+    """Bateria que cuesta la mision entera: ida a la caja, transporte y salida al cargador."""
     ida = _ticks(graph, node, mission.node)
     carga = _ticks(graph, mission.node, mission.destination)
     al_cargador = min(
@@ -464,20 +402,12 @@ def reaches(
     mission: Mission,
     chargers: Sequence[str],
 ) -> bool:
-    """Filtro de viabilidad: la bateria tiene que dar para terminar y quedar con reserva.
-
-    No basta con estar por encima del umbral. Un AGV que acepta una mision que no
-    puede terminar se queda tirado a medio pasillo.
-    """
+    """Filtro de viabilidad: la bateria tiene que dar para terminar y quedar con reserva."""
     gasto = estimated_cost(graph, node, mission, chargers)
     return battery - gasto >= config.BATTERY_RESERVE
 
 
 def _ticks(graph: WarehouseGraph, a: str, b: str) -> float:
-    """Ticks de viaje de `a` a `b`. Infinito si no hay ruta.
-
-    Una mision sin ruta no se puede terminar, y con infinito ningun AGV la ve
-    viable en vez de aceptarla y quedarse tirado a medio camino.
-    """
+    """Ticks de viaje de `a` a `b`. Infinito si no hay ruta."""
     ticks = graph.route_ticks(a, b)
     return math.inf if ticks is None else float(ticks)
