@@ -1,9 +1,4 @@
-"""El mapa del almacen y el ruteo sobre el.
-
-Un nodo es un punto donde un AGV puede estar y una arista un tramo con su costo.
-El JSON de `maps/` es la unica fuente, y `to_unity()` la unica conversion de
-coordenadas del proyecto.
-"""
+"""El mapa del almacen y el ruteo sobre el."""
 
 import heapq
 import json
@@ -35,21 +30,12 @@ UNITY_Y: float = 0.0
 
 
 def to_unity(px: float, py: float) -> tuple[float, float, float]:
-    """Pasa una posicion (px, py) del plano de la simulacion a coordenadas de Unity.
-
-    Es la unica conversion del proyecto: no la repitas en otro sitio.
-    """
+    """Pasa una posicion (px, py) del plano de la simulacion a coordenadas de Unity."""
     return (px * config.UNITY_SCALE, UNITY_Y, py * config.UNITY_SCALE)
 
 
 def travel_ticks(cost: float) -> int:
-    """Ticks que tarda un AGV en cruzar un tramo de ese costo.
-
-    El progreso sube 1/costo por tick y el tramo se acaba al llegar a 1.0, asi
-    que uno de 2.2 se come 3 ticks enteros. Como la bateria se gasta por tick,
-    medirla con el costo en vez de con los ticks la subestima casi un tercio, y
-    el AGV acepta viajes que no puede terminar.
-    """
+    """Ticks que tarda un AGV en cruzar un tramo de ese costo."""
     if not math.isfinite(cost) or cost <= 0.0:
         return 1
 
@@ -67,12 +53,7 @@ class GraphError(ValueError):
 
 
 class Box:
-    """Una caja del almacen: donde esta y a que altura.
-
-    `unity_object` es el nombre del GameObject que la representa en la escena,
-    tal y como lo apunto quien midio el almacen. Es opcional: un mapa sin el
-    sigue valiendo, y el cliente tendra que crear las cajas por su cuenta.
-    """
+    """Una caja del almacen: donde esta y a que altura."""
 
     def __init__(
         self, id: str, node: str, level: int, unity_object: str | None = None
@@ -149,24 +130,13 @@ class WarehouseGraph:
         return b in self.adjacency.get(a, {})
 
     def cost(self, a: str, b: str) -> float:
-        """Costo de la arista a -> b.
-
-        Lanza KeyError si no existe: usa `has_edge()` como guardia cuando la
-        arista puede faltar.
-        """
+        """Costo de la arista a -> b."""
         if not self.has_edge(a, b):
             raise KeyError(f"no hay arista {a!r} -> {b!r}")
         return self.adjacency[a][b]
 
     def route_ticks(self, a: str, b: str) -> int | None:
-        """Ticks de viaje de `a` a `b` por la ruta mas barata, o None si no hay.
-
-        Cuenta ticks y no distancia porque es lo que mide la bateria, que se
-        gasta por tick. Y va por la ruta, no en linea recta: en un almacen de
-        estanterias en fondo de saco dos huecos a medio metro cuelgan de
-        pasillos distintos y hay que dar toda la vuelta. Se cachea porque el
-        mapa no cambia durante la corrida y esto se pregunta en cada puja.
-        """
+        """Ticks de viaje de `a` a `b` por la ruta mas barata, o None si no hay."""
         clave = (a, b)
         if clave not in self._rutas:
             ruta = astar(self, a, b)
@@ -180,11 +150,7 @@ class WarehouseGraph:
         return self._rutas[clave]
 
     def edges(self) -> list[tuple[str, str, float]]:
-        """Aristas ordenadas como (origen, destino, costo).
-
-        Si el grafo es no dirigido cada tramo sale una sola vez, con el par ya
-        ordenado: la arista inversa es el mismo tramo contado dos veces.
-        """
+        """Aristas ordenadas como (origen, destino, costo)."""
         aristas: list[tuple[str, str, float]] = []
         vistas: set[tuple[str, str]] = set()
 
@@ -246,11 +212,7 @@ class WarehouseGraph:
         }
 
     def validate(self) -> None:
-        """Revienta con GraphError si el grafo no sirve como mapa.
-
-        Junta todos los problemas en un solo mensaje en vez de parar en el
-        primero: asi un mapa mal editado se arregla de una pasada.
-        """
+        """Revienta con GraphError si el grafo no sirve como mapa."""
         problemas = self._problemas()
         if not problemas:
             return
@@ -281,11 +243,7 @@ class WarehouseGraph:
         return problemas
 
     def _problemas_de_almacen(self, conocidos: set[str]) -> list[str]:
-        """Roles, celdas y cajas: lo que el mapa dice del almacen, no del grafo.
-
-        Un mapa sin ninguno de los tres bloques no da ningun problema: son
-        opcionales y los mapas viejos siguen siendo validos.
-        """
+        """Roles, celdas y cajas: lo que el mapa dice del almacen, no del grafo."""
         problemas: list[str] = []
 
         for nodo in sorted(set(self.cells) - conocidos):
@@ -482,14 +440,7 @@ def load_graph(path: str | Path) -> WarehouseGraph:
 
 
 def _lee_agvs(crudo: Any, origen: Path) -> list[str]:
-    """Nodos de salida de los AGV, sacados del bloque `agvs` del mapa.
-
-    Ese bloque lo escribe quien mide la escena de Unity: dice donde esta cada
-    AGV y de que nodo esta mas cerca. Sin esto la simulacion arranca en un nodo
-    cualquiera y el AGV se teletransporta en el primer paso.
-
-    Es opcional: un mapa sin `agvs` sigue cargando igual.
-    """
+    """Nodos de salida de los AGV, sacados del bloque `agvs` del mapa."""
     if crudo is None:
         return []
     if not isinstance(crudo, list):
@@ -572,11 +523,7 @@ def _lee_roles(crudo: Any, origen: Path) -> dict[str, str]:
 
 
 def _lee_nodos(crudo: Any, origen: Path) -> tuple[Cells, NodeRoles]:
-    """Saca celdas y roles del bloque `nodes`, que es opcional.
-
-    Cada entrada puede traer `cell`, `role` o las dos: un nodo que solo declara
-    su rol no necesita celda, y al reves.
-    """
+    """Saca celdas y roles del bloque `nodes`, que es opcional."""
     if crudo is None:
         return {}, {}
     if not isinstance(crudo, dict):
@@ -653,29 +600,13 @@ PENALTY_TTL: int = 15
 PENALTY_MAX: float = 40.0
 PENALTY_BAN: float = 1000.0
 
-# Lo que cuesta cruzar algo que estorba de forma fija (un obstaculo en mitad del
-# pasillo). Tiene que ser mucho mas caro que `PENALTY_BAN` y no solo un poco:
-# los vetos temporales del trafico se apilan, y una ruta con dos o tres nodos
-# vetados ya suma mas de 1000. Con los dos al mismo precio A* acababa metiendose
-# por encima del obstaculo en una de cada cinco rutas, en cuanto el rodeo tenia
-# un AGV delante. Un millon no lo alcanza ninguna pila realista (una ruta larga
-# vetada entera ronda las decenas de miles) y sigue siendo finito, que es lo que
-# evita que A* se quede sin ruta.
+# Muy por encima de PENALTY_BAN: los vetos de trafico se apilan y una ruta con
+# dos o tres nodos vetados ya pasa de 1000. Finito, para que A* siempre halle ruta.
 PENALTY_OBSTACLE: float = 1_000_000.0
 
 
 class TemporaryPenalties(Mapping):
-    """Penalizaciones de ruta que caducan solas, mas un piso que no caduca.
-
-    Sin caducidad el mapa se degrada para siempre: A* acabaria esquivando
-    pasillos que llevan cien ticks libres. Ese es el comportamiento normal, el
-    de `add()` y `ban()`.
-
-    Encima de eso hay un piso fijo (`block()`) para lo que estorba de verdad y
-    no se quita solo: un obstaculo plantado en un pasillo sigue ahi el tick
-    siguiente, asi que ni `expire()` ni `clear()` lo tocan. Cuando una clave
-    esta en los dos, manda la mas cara.
-    """
+    """Penalizaciones de ruta que caducan solas, mas un piso que no caduca."""
 
     def __init__(
         self,
@@ -715,23 +646,12 @@ class TemporaryPenalties(Mapping):
 
     @property
     def fijas(self) -> Mapping[PenaltyKey, float]:
-        """Solo el piso fijo, en un mapa de solo lectura.
-
-        Es para las rutas que tienen que ignorar el trafico pero no lo que
-        estorba de verdad. El viaje al cargador es el caso: no puede alargarse
-        por esquivar un atasco —ahi manda la bateria—, pero tampoco puede
-        atravesar un obstaculo, que no se quita esperando.
-        """
+        """Solo el piso fijo, en un mapa de solo lectura."""
         return MappingProxyType(self._fijos)
 
     @property
     def temporales(self) -> int:
-        """Cuantas penalizaciones con caducidad hay vivas, sin contar los vetos fijos.
-
-        `len()` cuenta los dos pisos, que es lo que A* necesita ver. Esto es para
-        medir la presion de replanificacion, y ahi un obstaculo que lleva toda la
-        corrida en el mismo sitio no cuenta como un roce de hace dos ticks.
-        """
+        """Cuantas penalizaciones con caducidad hay vivas, sin contar los vetos fijos."""
         return len(self._items)
 
     def add(self, key: PenaltyKey, amount: float, *, step: int) -> float:
@@ -749,16 +669,7 @@ class TemporaryPenalties(Mapping):
         return PENALTY_BAN
 
     def block(self, key: PenaltyKey, *, amount: float = PENALTY_OBSTACLE) -> float:
-        """Veta `key` hasta que se quite a mano: no caduca y `clear()` no la borra.
-
-        Es para lo que estorba de forma estable (un obstaculo en un pasillo), no
-        para un roce de un tick: para eso estan `add()` y `ban()`.
-
-        El precio es caro pero finito a proposito, igual que en `ban()`: si el
-        obstaculo acaba tapando el unico paso, A* prefiere cualquier rodeo y
-        solo pasa por encima cuando no hay ninguno, en vez de quedarse sin ruta.
-        Por que `PENALTY_OBSTACLE` y no `PENALTY_BAN`, en la constante.
-        """
+        """Veta `key` hasta que se quite a mano: no caduca y `clear()` no la borra."""
         self._fijos[key] = float(amount)
         return float(amount)
 
@@ -771,10 +682,7 @@ class TemporaryPenalties(Mapping):
         self._fijos.clear()
 
     def discard(self, key: PenaltyKey) -> None:
-        """Quita la penalizacion temporal de `key`, si la tenia.
-
-        No toca el veto fijo: para eso esta `unblock()`.
-        """
+        """Quita la penalizacion temporal de `key`, si la tenia."""
         self._items.pop(key, None)
 
     def expire(self, step: int) -> int:
@@ -787,12 +695,7 @@ class TemporaryPenalties(Mapping):
         return len(vencidas)
 
     def clear(self) -> None:
-        """Deja la tabla temporal vacia. Los vetos fijos siguen puestos.
-
-        Lo llama `Simulation.reset()`, que reparte los obstaculos justo despues:
-        si esto se llevara los vetos por delante, el reparto nuevo se borraria o
-        habria que acordarse de rehacerlo. Para quitarlos esta `unblock_all()`.
-        """
+        """Deja la tabla temporal vacia. Los vetos fijos siguen puestos."""
         self._items.clear()
 
 

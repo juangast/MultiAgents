@@ -147,11 +147,7 @@ def cmd_simulate(args: argparse.Namespace) -> int:
 
 
 def _corre_simulacion(simulacion: simulation.Simulation, pasos: int) -> int:
-    """Tickea hasta `pasos`, o hasta que lleguen todos, contandolo por el log.
-
-    Devuelve 0 aunque la corrida muera en deadlock: una corrida que se atasca es
-    un resultado valido, no un fallo. Solo es error que un AGV no tenga ni ruta.
-    """
+    """Tickea hasta `pasos`, o hasta que lleguen todos, contandolo por el log."""
     grafo = simulacion.graph
     log.info(
         "--- simulacion: mapa %s, %d agente(s), modo %s, %d pasos como mucho ---",
@@ -281,11 +277,7 @@ def _razon_del_final(simulacion: simulation.Simulation) -> str:
 
 
 def cmd_train(args: argparse.Namespace) -> int:
-    """Modo TRAIN: entrena la Q-table y escribe el modelo y el CSV.
-
-    No levanta el servidor ni habla con Unity: mil episodios son cientos de
-    miles de ticks, y un socket en medio no le daria al algoritmo ni un dato mas.
-    """
+    """Modo TRAIN: entrena la Q-table y escribe el modelo y el CSV."""
     grafo, _origen, codigo = _abre_mapa(args.map)
     if grafo is None:
         return codigo
@@ -303,11 +295,7 @@ def cmd_train(args: argparse.Namespace) -> int:
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
-    """Modo EVALUATE: carga la Q-table del disco y juega greedy puro.
-
-    `epsilon = 0` y la tabla no se toca: mide como juega lo aprendido, sin
-    seguir aprendiendo.
-    """
+    """Modo EVALUATE: carga la Q-table del disco y juega greedy puro."""
     grafo, _origen, codigo = _abre_mapa(args.map)
     if grafo is None:
         return codigo
@@ -392,11 +380,7 @@ HANDLERS = {
 
 
 def _argumentos_de_politica(sub: argparse.ArgumentParser) -> None:
-    """`--policy` y `--model`, que comparten `serve` y `simulate`.
-
-    Hoy `--policy` solo admite un valor; sigue existiendo para que anadir otra
-    politica no obligue a rehacer la linea de comandos.
-    """
+    """`--policy` y `--model`, que comparten `serve` y `simulate`."""
     sub.add_argument(
         "--policy",
         choices=list(config.POLICIES),

@@ -1,12 +1,4 @@
-"""El almacen en marcha: ticks, conflictos, desatasco y snapshot.
-
-Cada tick va en dos fases dentro del mismo paso: primero cada AGV parado declara
-a que nodo quiere entrar, y despues se detectan los conflictos, la politica
-decide quien cede y solo entonces se mueve a alguien.
-
-A* dice POR DONDE y la politica dice QUE HACER AHORA: ninguna accion elige un
-nodo. `policy` es la unica variable experimental.
-"""
+"""El almacen en marcha: ticks, conflictos, desatasco y snapshot."""
 
 import math
 import random
@@ -38,40 +30,15 @@ log = get_logger("simulation")
 
 FINISHED_DEADLOCK: str = "deadlock"
 
-# Altura a la que viaja una caja montada en la horquilla. Solo para pintar.
 CARRY_HEIGHT: float = 0.5
 
-# Los nodos de estanteria y de banda estan medidos *sobre* el pallet o sobre la
-# maquina: son el sitio de la caja, no un hueco donde quepa un AGV. Pintarlo
-# encima lo mete dentro del modelo, asi que al dibujarlo se le deja este hueco.
-# Es solo cosmetico: la logica sigue trabajando en nodos enteros.
-#
-# Los cargadores y los muelles se quedan fuera: son plazas donde el AGV aparca,
-# y dejarlo a medio metro se ve como si no acabara de llegar.
-# 1.15 m sale de medir el AGV: 0.90 m del centro al morro y las horquillas
-# asomando hasta 0.87 m, asi que a esta distancia las puntas quedan justo en el
-# pallet y el cuerpo fuera. Con menos, el morro se mete dentro de la estanteria.
-# 1.55 y no 1.15: con 1.15 el AGV se plantaba DENTRO de la estanteria en 10 de
-# las aproximaciones del mapa (medido cruzando cada arista contra las cajas de
-# colision reales de la escena), por entre 0.10 y 0.40 m. Subirlo a 1.55 deja 3.
-# Mas alto no gana nada: los 3 que quedan son ramales tan cortos que el hueco lo
-# limita `APPROACH_MIN_TRAVEL`, y ahi el AGV no cabe fuera por esa linea; esos
-# los resuelve el empuje lateral del cliente de Unity.
 APPROACH_GAP: float = 1.55
 
-# Pero sin dejar el AGV pegado al nodo del que sale: en los ramales cortos manda
-# esto, no el hueco, para que siempre se le vea recorrer algo.
 APPROACH_MIN_TRAVEL: float = 0.15
 ROLES_CON_RETRANQUEO: frozenset[str] = frozenset({"storage", "conveyor"})
 
 DEADLOCK_FORCE_TICKS: int = 8
 YIELD_TICKS: int = 10
-# Ticks que aguanta un AGV sin moverse antes de que el motor le fuerce el paso.
-# Con 45 se le veia plantado medio minuto en pantalla; barriendo de 8 a 45 sobre
-# corridas de 800 ticks con 5 AGVs, 12 sale mejor en todo a la vez: mas entregas
-# (23 contra 19), menos conflictos (863 contra 1424) y menos de la mitad de
-# espera media (7.1 contra 16.1). Por debajo de 10 el motor fuerza tanto que se
-# estorban entre ellos y las entregas vuelven a caer.
 STARVED_TICKS: int = 12
 REROUTE_COOLDOWN: int = 8
 SERVE_EPSILON: float = 0.0
@@ -93,13 +60,7 @@ def default_route(graph: WarehouseGraph) -> tuple[str, str]:
 
 
 def _estado_de_caja_en(rol: str) -> str:
-    """El estado que le toca a una caja por el sitio donde acaba.
-
-    En un muelle termino su viaje y en una estanteria queda guardada. En
-    cualquier otro sitio —un pasillo, tipicamente— esta literalmente en el
-    suelo, y eso es `WAITING_PICKUP`, no `STORED`: marcarla como guardada
-    dibuja una caja flotando en una balda que no existe.
-    """
+    """El estado que le toca a una caja por el sitio donde acaba."""
     if rol == ROLE_DOCK:
         return missions.BoxStatus.DELIVERED
     if rol == ROLE_STORAGE:
@@ -258,7 +219,6 @@ class Simulation:
         self._forzados: int = 0
         self._por_id: dict[int, Agent] = {a.id: a for a in self.agents}
 
-        # Sin politica no hay simulacion: si no se pide ninguna, la de por defecto.
         self._monta_politica(policy if policy is not None else config.DEFAULT_POLICY)
 
         self.reset()
@@ -342,11 +302,7 @@ class Simulation:
             return self.snapshot()
 
     def stats(self) -> dict[str, Any]:
-        """Los numeros de la corrida, que son con los que se mide la politica.
-
-        Todo aqui dentro es determinista y serializable: dos simulaciones con la
-        misma semilla tienen que producir snapshots identicos, `stats` incluido.
-        """
+        """Los numeros de la corrida, que son con los que se mide la politica."""
         with self._lock:
             return {
                 "run": self.run,
@@ -395,16 +351,16 @@ class Simulation:
             return self.mode
 
     def action_record(self, agent_id: int) -> ActionRecord | None:
-        """Lo que decidio este AGV en el ultimo tick y lo que el motor le concedio.
-
-        Es por donde el entrenamiento se entera de que un ADVANCE quedo
-        `blocked` (y cobra el -20) o de que el desatasco forzo al agente.
-        """
+        """Lo que decidio este AGV en el ultimo tick y lo que el motor le concedio."""
         with self._lock:
             return self._acciones.get(agent_id)
 
-    def reset(self) -> None:
-        """Vuelve al paso cero y reparte otra vez las mismas tareas."""
+    def reset(self, *, resortea_obstaculos: bool = True) -> None:
+        """Vuelve al paso cero y reparte otra vez las mismas tareas.
+
+        Con `resortea_obstaculos=False` la corrida nueva conserva los obstaculos
+        de la anterior, que es lo que hace comparables dos repartos de flota.
+        """
         with self._lock:
             self.step = 0
             self.run += 1
@@ -415,7 +371,7 @@ class Simulation:
             self.occupancy = {}
 
             self.penalties.clear()
-            self._reparte_obstaculos()
+            self._reparte_obstaculos(resortea=resortea_obstaculos)
             self._acciones.clear()
             self._reservas.clear()
             self._parado.clear()
@@ -449,21 +405,16 @@ class Simulation:
                 self.run,
             )
 
-    def _reparte_obstaculos(self) -> None:
-        """Sortea donde caen los obstaculos de esta corrida y se los veta a A*.
-
-        Va en `reset()` y no en `__init__` a proposito: asi cada corrida estrena
-        reparto y la politica no puede aprenderse el mapa de memoria, que es
-        justo lo que se le quiere exigir.
-
-        El veto es fijo (`block`) y no temporal: un obstaculo no se quita solo a
-        los quince ticks como una penalizacion de conflicto, sigue ahi toda la
-        corrida.
-        """
+    def _reparte_obstaculos(self, *, resortea: bool = True) -> None:
+        """Sortea donde caen los obstaculos de esta corrida y se los veta a A*."""
         self.penalties.unblock_all()
-        ocupados = {origen for origen, _ in self._rutas}
-        ocupados.update(destino for _, destino in self._rutas)
-        for nodo in self.obstacles.scatter(avoid=ocupados):
+        if resortea:
+            ocupados = {origen for origen, _ in self._rutas}
+            ocupados.update(destino for _, destino in self._rutas)
+            nodos = self.obstacles.scatter(avoid=ocupados)
+        else:
+            nodos = self.obstacles.nodes()
+        for nodo in nodos:
             self.penalties.block(nodo)
 
     def _comprueba_rutas(
@@ -489,12 +440,7 @@ class Simulation:
         return rutas
 
     def _planea_rutas(self, n_agents: int) -> list[tuple[str, str]]:
-        """Reparte origen y destino, siempre igual para la misma semilla.
-
-        Las salidas que el mapa declara en `agvs` mandan sobre el sorteo: son
-        donde estan los AGV en la escena de Unity, y arrancar en otro sitio hace
-        que el cliente los vea teletransportarse en el primer paso.
-        """
+        """Reparte origen y destino, siempre igual para la misma semilla."""
         rutas = [(self._origen, self._destino)]
         nodos = self.graph.nodes()
         if len(nodos) < 2:
@@ -502,8 +448,6 @@ class Simulation:
         if n_agents == 1:
             return rutas
 
-        # El mapa puede repetir salidas (dos AGV medidos junto al mismo nodo) y
-        # cada uno necesita la suya: las repetidas se sortean como las que faltan.
         tomados = {self._origen}
         del_mapa: list[str] = []
         for nodo in self.graph.agv_starts[1:]:
@@ -536,13 +480,7 @@ class Simulation:
                     agente.state = State.DONE
 
     def _suelta_mision(self, agente: Agent) -> None:
-        """Devuelve a la bolsa la mision de un AGV que no la puede terminar.
-
-        Sin esto, un AGV varado se queda la mision cogida para siempre: la caja
-        no vuelve a publicarse, nadie mas puede ir a por ella y la corrida no
-        termina nunca. La caja se queda donde este, y desde ahi se vuelve a
-        pedir su trabajo.
-        """
+        """Devuelve a la bolsa la mision de un AGV que no la puede terminar."""
         if self.manager is None or agente.mission is None:
             return
 
@@ -557,12 +495,7 @@ class Simulation:
         agente.leg = Leg.NONE
 
     def _aterriza_caja(self, mission, nodo: str) -> None:
-        """Deja la caja en el nodo donde el AGV la solto y le pone su estado.
-
-        En un muelle la caja termina su viaje; en una estanteria queda guardada,
-        y al soltar su mision el manager le abrira la de salida en el paso
-        siguiente. Ese es el encadenado de los dos flujos.
-        """
+        """Deja la caja en el nodo donde el AGV la solto y le pone su estado."""
         caja = self.inventory.get(mission.box)
         if caja is None:
             return
@@ -571,12 +504,7 @@ class Simulation:
         caja.status = _estado_de_caja_en(self.graph.role_of(nodo))
 
     def _fase_bateria(self) -> None:
-        """Los enchufados cargan, y nadie empieza un tramo del que no pueda volver.
-
-        El orden importa: primero el que ya esta enchufado o tirado, luego el que
-        va de camino a un cargador, y solo al final se mira si alguien mas tiene
-        que dejar lo que hace e ir a enchufarse.
-        """
+        """Los enchufados cargan, y nadie empieza un tramo del que no pueda volver."""
         cargadores = self.graph.nodes_with_role(ROLE_CHARGING)
         for agente in self.agents:
             if agente.state == State.CHARGING:
@@ -604,8 +532,6 @@ class Simulation:
             return
 
         if agente.mission is not None:
-            # Cargado pero sin camino al muelle: mejor devolver la mision que
-            # quedarse con ella cogida y bloquearla para todos los demas.
             self._suelta_mision(agente)
 
         log.debug("paso %3d | AGV %s | cargado al 100%%, vuelve a pujar",
@@ -620,12 +546,7 @@ class Simulation:
         agente.state = State.IDLE
 
     def _manda_a_cargar(self, agente: Agent, cargadores: Sequence[str]) -> None:
-        """Le corta lo que estuviera haciendo y lo manda a enchufarse.
-
-        Si ya tiene la caja encima se la lleva puesta y retoma la entrega al
-        acabar de cargar. Tirarla en el pasillo, que es lo que se hacia antes,
-        deja cajas por el suelo y obliga a otro AGV a ir a recogerlas.
-        """
+        """Le corta lo que estuviera haciendo y lo manda a enchufarse."""
         if agente.carrying:
             log.info(
                 "AGV %s se va a cargar al %.0f%% con %s encima; retoma %s despues",
@@ -642,12 +563,7 @@ class Simulation:
     def _revisa_el_viaje_al_cargador(
         self, agente: Agent, cargadores: Sequence[str]
     ) -> None:
-        """Al que ya va a cargar le busca otro cargador si el suyo se le escapo.
-
-        Cada reroute alarga la ruta de verdad, asi que el cargador que si
-        alcanzaba deja de alcanzarse. Sin esta revision el AGV sigue conduciendo
-        hacia el mismo hasta quedarse seco en mitad del pasillo.
-        """
+        """Al que ya va a cargar le busca otro cargador si el suyo se le escapo."""
         destino = agente.target_node
         if destino is None or agente.progress > 0.0:
             return
@@ -667,12 +583,7 @@ class Simulation:
         self._al_cargador(agente, cargadores)
 
     def _ticks_al_cargador(self, desde: str, cargador: str) -> int | None:
-        """Ticks del viaje al cargador rodeando los obstaculos, o None si no hay ruta.
-
-        `graph.route_ticks` mide por la ruta libre, y con un obstaculo en medio
-        esa ruta no existe: el AGV daria el rodeo gastando mas de lo calculado.
-        Aqui se mide por donde de verdad va a ir.
-        """
+        """Ticks del viaje al cargador rodeando los obstaculos, o None si no hay ruta."""
         ruta = astar(self.graph, desde, cargador, self.penalties.fijas)
         if ruta is None:
             return None
@@ -681,12 +592,7 @@ class Simulation:
         )
 
     def _cargadores_tomados(self, agente: Agent) -> set[str]:
-        """Los cargadores que ya tiene otro AGV, enchufado o de camino.
-
-        Un cargador es un fondo de saco de un solo hueco, igual que una
-        estanteria: si dos AGVs van al mismo, el segundo se planta en el pasillo
-        a esperar, y ahi lo hace con la bateria en las ultimas.
-        """
+        """Los cargadores que ya tiene otro AGV, enchufado o de camino."""
         tomados: set[str] = set()
         for otro in self.agents:
             if otro.id == agente.id:
@@ -700,25 +606,7 @@ class Simulation:
     def _al_cargador(
         self, agente: Agent, cargadores: Sequence[str] | None = None
     ) -> bool:
-        """Le traza ruta a un cargador: libre si puede ser, y que le alcance seguro.
-
-        Cerca es por ruta, no en linea recta: el cargador que parece al lado
-        puede colgar de otro pasillo y estar a media nave por carretera. Y la
-        exclusividad es una preferencia, no una regla: antes que dejar a un AGV
-        sin plan se le manda a uno ocupado, porque hacer cola con bateria se
-        arregla solo y quedarse seco en un pasillo no.
-
-        La ruta va sin las penalizaciones del trafico a proposito. Esquivar
-        atascos alarga el camino, y este es justo el viaje que no puede
-        permitirse ni un metro de mas: aqui manda la bateria y no el trafico.
-
-        Los obstaculos si cuentan (`penalties.fijas`), porque no son lo mismo:
-        un atasco se pasa esperando y una caja en mitad del pasillo no. Y tienen
-        que contar tambien **al elegir** el cargador, no solo al trazar la ruta:
-        si el mas cercano en linea de ruta queda detras de un obstaculo, el
-        rodeo gasta mas bateria de la que se le habia calculado y el AGV se
-        queda seco en el pasillo, que es exactamente lo que esto evita.
-        """
+        """Le traza ruta a un cargador: libre si puede ser, y que le alcance seguro."""
         if cargadores is None:
             cargadores = self.graph.nodes_with_role(ROLE_CHARGING)
         if not cargadores:
@@ -765,11 +653,7 @@ class Simulation:
         return False
 
     def _fase_subasta(self) -> None:
-        """El manager publica, cada AGV puja por su cuenta y se reparte lo ganado.
-
-        Es todo el reparto de trabajo del almacen: aqui nadie asigna nada, el
-        motor solo traslada al AGV lo que su propia puja le gano.
-        """
+        """El manager publica, cada AGV puja por su cuenta y se reparte lo ganado."""
         if self.manager is None:
             return
 
@@ -958,12 +842,7 @@ class Simulation:
         return intenciones
 
     def _espera_por_bateria(self, agente: Agent, siguiente: str) -> None:
-        """Lo deja parado antes que dejarlo sin vuelta a un cargador.
-
-        Esperar no gasta bateria y conducir si, asi que ante la duda se para. El
-        pasillo se despeja solo y entonces la ruta corta al cargador vuelve a
-        salir; un AGV parado con bateria se recupera, uno seco no.
-        """
+        """Lo deja parado antes que dejarlo sin vuelta a un cargador."""
         agente.state = State.WAITING
         log.debug(
             "paso %3d | AGV %s | al %.0f%% se queda en %s: pasar a %s lo dejaria "
@@ -1055,30 +934,7 @@ class Simulation:
     def _accion_de(
         self, agente: Agent, destino: str, local: conflicts.LocalState
     ) -> str:
-        """La accion de este AGV: la que pida la politica, salvo que no haga nada.
-
-        Con el nodo de delante vacio y sin nadie que le haya ganado el desempate,
-        avanzar es la unica accion que mueve: mas abajo solo ADVANCE arranca la
-        travesia, asi que WAIT y REROUTE tiran el tick. Y rerutear ahi tampoco
-        esquiva nada, porque `reroute_penalties()` encarece el nodo de delante y
-        ese nodo esta libre: A* devuelve la misma ruta, o una peor.
-
-        No es una preferencia de politica, es fisica del motor, y por eso se
-        aplica aqui y no dentro de una politica concreta.
-
-        Sin este filtro la Q-table entrenada que viene en el repo elige REROUTE
-        en el 76% de los ticks en los que el AGV va suelto (562 de 744): avanza
-        199 veces de 1071, el almacen entrega 2 cajas en 300 pasos y se atasca
-        en 3 a partir del paso 200. Con el filtro, 21 en 800 pasos y sin
-        estancarse. La tabla no esta rota del todo: su ultimo episodio de
-        entrenamiento ya cerro con `completed_tasks: 1` y recompensa media
-        negativa, o sea que nunca aprendio a separar avanzar de rerutear en la
-        celda `0|0|0|1|1|1`, que es la mas visitada (advance 60.8, wait 62.4,
-        reroute 64.7: un empate que el desempate greedy resuelve hacia reroute).
-
-        En cuanto hay alguien delante o alguien le gana el paso, decide la
-        politica: ceder o rodear ahi si significan algo, y es lo que se aprende.
-        """
+        """La accion de este AGV: la que pida la politica, salvo que no haga nada."""
         if not local.blocked_by and not self.occupancy.get(destino):
             return conflicts.Intent.ADVANCE
         return conflicts.normalize_intent(self.policy.decide(agente, local))
@@ -1155,14 +1011,7 @@ class Simulation:
 
 
     def _suelta_lo_que_no_pisa(self, agente: Agent) -> None:
-        """Suelta los nodos que el agente tiene marcados y ya no le tocan.
-
-        Un AGV ocupa el nodo que pisa y, mientras cruza, tambien el de destino.
-        Si cambia de ruta a mitad —un reroute, un desvio al cargador, una mision
-        nueva— el destino que habia reservado se queda marcado como suyo para
-        siempre, y ese nodo no vuelve a dejar pasar a nadie. Pasando por aqui al
-        final de cada tick, la ocupacion no puede quedar desfasada.
-        """
+        """Suelta los nodos que el agente tiene marcados y ya no le tocan."""
         suyos = {agente.current_node}
         siguiente = agente.next_node()
         if siguiente is not None and agente.progress > 0.0:
@@ -1189,11 +1038,7 @@ class Simulation:
         return reserva is None or reserva[0] == agente.id or self.step >= reserva[1]
 
     def _empieza_travesia(self, agente: Agent, destino: str) -> None:
-        """Le concede el paso: reserva el destino y da el primer trozo de tramo.
-
-        Reserva doble: se queda tambien con el nodo del que sale, y lo suelta
-        solo al llegar. Un tramo que se cruza en un tick llega aqui mismo.
-        """
+        """Le concede el paso: reserva el destino y da el primer trozo de tramo."""
         costo = self.graph.cost(agente.current_node, destino)
         self.occupancy[destino] = agente.id
         agente.state = State.MOVING
@@ -1237,11 +1082,7 @@ class Simulation:
             agente.state = State.DONE
 
     def _cede_el_paso(self, agente: Agent) -> None:
-        """Le toca esperar: no se mueve y suma un tick al reloj de la espera.
-
-        `wait_time` **acumula**, no descuenta. Es el tiempo perdido de todo el
-        AGV en la corrida, que es la medida con la que se comparan las politicas.
-        """
+        """Le toca esperar: no se mueve y suma un tick al reloj de la espera."""
         agente.state = State.WAITING
         agente.wait_time += 1
 
@@ -1262,12 +1103,6 @@ class Simulation:
             return None
         self._proximo_reroute[agente.id] = self.step + REROUTE_COOLDOWN
 
-        # Solo lo que le QUEDA, no la ruta entera. `conflicts.reroute()` devuelve
-        # un camino que arranca en `current_node`, asi que meter aqui el tramo ya
-        # recorrido comparaba peras con manzanas: quien lo lee (`is_useless_reroute`)
-        # veia la ruta nueva mas barata por el simple hecho de empezar mas cerca
-        # del destino, y ningun reroute se declaraba inutil a media ruta. Con eso
-        # REROUTE le salia gratis al Q-Learning y se lo comia todo.
         vieja = tuple(agente.path[agente.path_index:])
         for clave, cuanto in conflicts.reroute_penalties(agente).items():
             self.penalties.add(clave, cuanto, step=self.step)
@@ -1483,11 +1318,7 @@ class Simulation:
         }
 
     def _cuenta_los_parados(self, antes: dict[int, tuple[str, float]]) -> None:
-        """Suma un tick al que no se movio nada, y pone a cero al que si.
-
-        El que llego, el que no tiene ruta y el que esta recogiendo o dejando una
-            caja no cuentan como parados: quedarse quieto es justo lo que toca.
-        """
+        """Suma un tick al que no se movio nada, y pone a cero al que si."""
         for agente in self.agents:
             if agente.state in (
                 State.DONE, State.IDLE, State.PICKING,
@@ -1571,11 +1402,7 @@ class Simulation:
         }
 
     def _describe_caja(self, caja: missions.BoxState) -> dict[str, object]:
-        """Una caja tal y como la ve Unity, con su sitio ya en coordenadas de Unity.
-
-        Sin esto el cliente tendria que cargarse el mapa a mano para saber donde
-        cae cada nodo: el snapshot no lo lleva y no hay ruta que lo sirva.
-        """
+        """Una caja tal y como la ve Unity, con su sitio ya en coordenadas de Unity."""
         datos = dict(caja.as_dict())
         px, py = self._posicion_caja(caja)
         x, _y, z = to_unity(px, py)
@@ -1593,11 +1420,7 @@ class Simulation:
         return self.graph.positions.get(caja.node, (0.0, 0.0))
 
     def _altura_caja(self, caja: missions.BoxState) -> float:
-        """Altura de la caja: la balda de su nivel, o la horquilla si va montada.
-
-        Las constantes salen de `coordinate_system` del mapa, que es quien midio
-        la estanteria. Si el mapa no las trae, se cae a las del almacen del reto.
-        """
+        """Altura de la caja: la balda de su nivel, o la horquilla si va montada."""
         sistema = self.graph.coordinate_system
         base = float(sistema.get("level_base", 0.154))
         alto = float(sistema.get("level_height", 0.69))
@@ -1634,13 +1457,7 @@ class Simulation:
         nodo: str,
         desde: str | None,
     ) -> tuple[float, float]:
-        """Aparta el punto del nodo cuando ese nodo es un objeto, no un pasillo.
-
-        El AGV se queda a `APPROACH_GAP` metros, sobre la linea por la que viene:
-        se planta delante de la estanteria en vez de meterse dentro. En los ramales
-        cortos el hueco se recorta para dejarle siempre `APPROACH_MIN_TRAVEL` de
-        recorrido, y asi no acaba pintado encima del nodo del que salio.
-        """
+        """Aparta el punto del nodo cuando ese nodo es un objeto, no un pasillo."""
         if self.graph.role_of(nodo) not in ROLES_CON_RETRANQUEO:
             return punto
 

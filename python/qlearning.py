@@ -1,8 +1,4 @@
-"""Q-Learning: el estado local, la recompensa, la Q-table y el entrenamiento.
-
-No sustituye a A*: A* traza la ruta y aqui solo se aprende que hacer ahora ante
-un riesgo de conflicto (avanzar, esperar o recalcular).
-"""
+"""Q-Learning: el estado local, la recompensa, la Q-table y el entrenamiento."""
 
 import csv
 import json
@@ -29,18 +25,6 @@ from config import get_logger, setup_logging
 log = get_logger("qlearning")
 
 
-# Dos bits, y nada mas. El estado de seis campos (144 combinaciones) repartia el
-# entrenamiento tan fino que 37 de sus 96 celdas visitadas se quedaban por debajo
-# de 500 muestras, y eran justo las disputadas; el 57% de las visitas se iba en
-# estados '0|0|0|*', donde no hay nada que decidir porque nadie estorba. Con el
-# motor resolviendo "camino libre -> avanza" antes de preguntar, a la tabla solo
-# le llegan los choques de verdad, y ahi lo unico que cambia la respuesta
-# correcta es quien manda y si se puede rodear. Medido sobre cuatro escenarios:
-# 22.2 entregas de media contra 20.0 de la tabla de 144, con 12 celdas y no 432.
-#
-# Lo que se probo y NO entro: 'distance_bucket' (lo que te falte para llegar no
-# dice quien debe ceder, y triplicaba la tabla) y 'edge_conflict' (dio cero
-# diferencia medible: las variantes con y sin el salieron identicas).
 STATE_FIELDS: tuple[str, ...] = (
     "next_node_occupied",
     "edge_conflict",
@@ -56,8 +40,6 @@ State = tuple[int, ...]
 
 QUEUE_CAP: int = 2
 
-# Por debajo de esto, dos celdas de una misma fila valen lo mismo y la tabla no
-# esta prefiriendo ninguna. Ver `QLearningPolicy._sin_criterio()`.
 FLAT_ROW_EPS: float = 1e-9
 
 
@@ -85,15 +67,7 @@ def get_local_state(agent: Agent, simulation: SimulationView) -> State:
 def _contendientes(
     agent: Agent, siguiente: str | None, simulation: SimulationView
 ) -> set[int]:
-    """Los que se disputan el paso conmigo, que no es lo mismo que estar delante.
-
-    `_rivales()` mete tambien al que simplemente **ocupa** el nodo siguiente,
-    aunque se este marchando y no dispute nada. El motor no lo hace: sus
-    conflictos salen de quien quiere entrar donde, y `resolve_conflict()` solo
-    arbitra entre esos. Con el ocupante dentro, el bit de prioridad decia "no
-    mando" cada vez que alguien de id menor pasaba por delante, que no es el
-    caso que la politica tiene que aprender.
-    """
+    """Los que se disputan el paso conmigo, que no es lo mismo que estar delante."""
     if siguiente is None:
         return set()
 
@@ -101,11 +75,9 @@ def _contendientes(
     for otro in simulation.agents:
         if otro.id == agent.id:
             continue
-        # De morro contra morro.
         if otro.current_node == siguiente and otro.next_node() == agent.current_node:
             contendientes.add(otro.id)
             continue
-        # Los dos queremos entrar en el mismo nodo.
         if (
             otro.progress <= 0.0
             and otro.state in (AgentState.MOVING, AgentState.WAITING)
@@ -149,22 +121,7 @@ PRIORITY_FIELD: int = STATE_FIELDS.index("has_priority")
 def con_prioridad_del_motor(
     state: State, local_state: conflicts.LocalState
 ) -> State:
-    """El mismo estado, pero con `has_priority` copiado del arbitraje del motor.
-
-    `get_local_state()` deduce la prioridad con `_rivales()`, que reconstruye por
-    su cuenta quien se disputa el paso. El motor no lo deduce: ya lo ha decidido,
-    y lo dice en `local_state.blocked_by`. Medido sobre una corrida de 600 ticks
-    con 5 AGVs, las dos versiones discrepan en el 12% de las decisiones, y
-    siempre en la misma direccion: `_rivales()` ve menos rivales de los que hay,
-    asi que el AGV se cree con via libre, elige ADVANCE y el motor lo para.
-
-    Eso no es solo un tick perdido: ese ADVANCE frenado se cobra como CONFLICT,
-    que es la penalizacion mas cara despues del deadlock. Con la respuesta del
-    motor delante no hay razon para preferir la aproximacion.
-
-    Se deja `_rivales()` para el `next_state` del entrenamiento, que se calcula
-    sin `LocalState` porque ahi el motor todavia no ha arbitrado nada.
-    """
+    """El mismo estado, pero con `has_priority` copiado del arbitraje del motor."""
     prioridad = int(not local_state.blocked_by)
     if state[PRIORITY_FIELD] == prioridad:
         return state
@@ -174,14 +131,7 @@ def con_prioridad_del_motor(
 
 
 def _hay_desvio(agent: Agent, graph: WarehouseGraph) -> int:
-    """1 si, encareciendo el nodo de delante, A* sale por otro sitio.
-
-    Es lo que convierte REROUTE de apuesta a ciegas en una decision: sin esto la
-    politica pedia recalcular tambien cuando no habia por donde, y `reroute()`
-    le devolvia la misma ruta habiendole costado el tick. Se calcula igual que
-    lo hara `conflicts.reroute()` despues, para que lo que se aprende y lo que
-    se ejecuta coincidan.
-    """
+    """1 si, encareciendo el nodo de delante, A* sale por otro sitio."""
     if agent.target_node is None or agent.progress > 0.0:
         return 0
 
@@ -202,22 +152,7 @@ PRIORITY_FIELD: int = STATE_FIELDS.index("has_priority")
 def con_prioridad_del_motor(
     state: State, local_state: conflicts.LocalState
 ) -> State:
-    """El mismo estado, pero con `has_priority` copiado del arbitraje del motor.
-
-    `get_local_state()` deduce la prioridad con `_rivales()`, que reconstruye por
-    su cuenta quien se disputa el paso. El motor no lo deduce: ya lo ha decidido,
-    y lo dice en `local_state.blocked_by`. Medido sobre una corrida de 600 ticks
-    con 5 AGVs, las dos versiones discrepan en el 12% de las decisiones, y
-    siempre en la misma direccion: `_rivales()` ve menos rivales de los que hay,
-    asi que el AGV se cree con via libre, elige ADVANCE y el motor lo para.
-
-    Eso no es solo un tick perdido: ese ADVANCE frenado se cobra como CONFLICT,
-    que es la penalizacion mas cara despues del deadlock. Con la respuesta del
-    motor delante no hay razon para preferir la aproximacion.
-
-    Se deja `_rivales()` para el `next_state` del entrenamiento, que se calcula
-    sin `LocalState` porque ahi el motor todavia no ha arbitrado nada.
-    """
+    """El mismo estado, pero con `has_priority` copiado del arbitraje del motor."""
     prioridad = int(not local_state.blocked_by)
     if state[PRIORITY_FIELD] == prioridad:
         return state
@@ -458,11 +393,7 @@ def _fila_en_cero() -> dict[Action, float]:
 
 
 class QTable:
-    """Q(s, a) como `dict[tuple, dict[Action, float]]`, con `defaultdict`.
-
-    Cada fila lleva SIEMPRE las tres acciones aunque el action set las deje
-        fuera, para que una tabla entrenada sin REROUTE se pueda leer igual.
-    """
+    """Q(s, a) como `dict[tuple, dict[Action, float]]`, con `defaultdict`."""
 
     def __init__(self, values: Mapping[State, Mapping[Action, float]] | None = None) -> None:
         self._q: defaultdict[State, dict[Action, float]] = defaultdict(_fila_en_cero)
@@ -567,13 +498,7 @@ class QTable:
 
 
 def load_qtable(path: str | Path) -> QTable:
-    """Lee una tabla de disco, comprobando que el formato es el de ahora.
-
-    Lanza ValueError si el fichero es de otra version o si los campos del estado
-    no son los de `STATE_FIELDS`, en ese orden: cargar a ciegas una tabla con
-    otro orden seria entrenar sobre estados que no son los que se creen, y eso
-    no da error nunca, da resultados malos.
-    """
+    """Lee una tabla de disco, comprobando que el formato es el de ahora."""
     origen = Path(path)
     crudo = json.loads(origen.read_text(encoding="utf-8"))
     if not isinstance(crudo, dict):
@@ -606,12 +531,7 @@ def load_qtable(path: str | Path) -> QTable:
 
 
 def trained_enable_reroute(path: str | Path) -> bool | None:
-    """Si este modelo se entreno con REROUTE. None si el fichero no lo dice.
-
-    Servir un modelo fuera de su action set es un fallo silencioso: la columna
-    que nunca se entreno esta a ceros, y como lo aprendido es casi todo
-    negativo, el cero gana y la politica elige justo lo que no probo.
-    """
+    """Si este modelo se entreno con REROUTE. None si el fichero no lo dice."""
     hiper = load_metadata(path).get("hyperparameters") or {}
     nombres = hiper.get("actions")
     if not nombres:
@@ -620,11 +540,7 @@ def trained_enable_reroute(path: str | Path) -> bool | None:
 
 
 def load_action_visits(path: str | Path) -> dict[State, dict[Action, int]]:
-    """Cuantas veces se actualizo cada celda (estado, accion) al entrenar.
-
-    Vacio si el modelo es anterior a que esto se guardara: entonces no hay con
-    que filtrar y la politica se comporta como siempre.
-    """
+    """Cuantas veces se actualizo cada celda (estado, accion) al entrenar."""
     datos = load_metadata(path).get("action_visits")
     if not isinstance(datos, dict):
         return {}
@@ -648,11 +564,7 @@ def load_action_visits(path: str | Path) -> dict[State, dict[Action, int]]:
 
 
 def load_metadata(path: str | Path) -> dict[str, Any]:
-    """La `metadata` con la que se guardo una Q-table, o `{}` si no lleva.
-
-    Se lee aparte de `load_qtable()`: una tabla vieja sin metadata tiene que
-    poder seguir cargando.
-    """
+    """La `metadata` con la que se guardo una Q-table, o `{}` si no lleva."""
     crudo = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(crudo, dict):
         return {}
@@ -661,12 +573,7 @@ def load_metadata(path: str | Path) -> dict[str, Any]:
 
 
 class Decision:
-    """Lo que un AGV decidio en un tick, con el paso en que lo decidio.
-
-    Lleva el `step` porque se guarda **la ultima** decision de cada AGV, no
-    todas: sin la marca de paso, el entrenamiento le atribuiria a la decision de
-    ahora lo que paso hace cuatro ticks.
-    """
+    """Lo que un AGV decidio en un tick, con el paso en que lo decidio."""
 
     def __init__(self, state: State, action: Action, step: int) -> None:
         self.state = state
@@ -675,12 +582,7 @@ class Decision:
 
 
 class QLearningPolicy:
-    """La politica de Q-Learning, con la interfaz que pide la simulacion.
-
-    Para que vea el estado completo hay que atarla con `bind()`. Sin atar sigue
-    funcionando, pero saca el estado del `LocalState` que le pasa el motor, y
-    ahi `queue_ahead` es una aproximacion.
-    """
+    """La politica de Q-Learning, con la interfaz que pide la simulacion."""
 
     name: str = "qlearning"
 
@@ -754,11 +656,7 @@ class QLearningPolicy:
     def choose(
         self, state: State, *, local_state: conflicts.LocalState | None = None
     ) -> Action:
-        """Epsilon-greedy sobre la Q-table. Con `epsilon = 0` es greedy puro.
-
-        Donde la tabla no tiene nada aprendido no se inventa: cae en la regla de
-        la baseline. Ver `_sin_criterio()` para el por que.
-        """
+        """Epsilon-greedy sobre la Q-table. Con `epsilon = 0` es greedy puro."""
         if self.epsilon > 0.0 and self._rng.random() < self.epsilon:
             return self._rng.choice(self.actions)
 
@@ -769,12 +667,7 @@ class QLearningPolicy:
         return self.q.best_action(state, among=respaldadas or self.actions)
 
     def _respaldadas(self, state: State) -> tuple[Action, ...]:
-        """Las acciones que esta tabla probo lo bastante en este estado.
-
-        Devuelve la tupla vacia cuando ninguna llega al minimo. Antes devolvia
-        `self.actions` en ese caso, que era justo lo contrario de lo que hace
-        falta: se acababa eligiendo entre tres celdas que nadie visito.
-        """
+        """Las acciones que esta tabla probo lo bastante en este estado."""
         if self.min_visits <= 0 or not self._visits:
             return self.actions
         fila = self._visits.get(tuple(state), {})
@@ -783,21 +676,7 @@ class QLearningPolicy:
         )
 
     def _sin_criterio(self, state: State, respaldadas: Sequence[Action]) -> bool:
-        """True si la tabla no prefiere de verdad ninguna accion en este estado.
-
-        Son dos casos y los dos acababan en lo mismo. `best_action()` recorre las
-        acciones en el orden de `ACTIONS` y se queda con la primera salvo que otra
-        la supere en estricto, asi que una fila plana siempre devolvia ADVANCE:
-
-        * el estado no esta en la tabla, y su fila es de ceros recien creada;
-        * esta, pero ninguna accion llego al minimo de visitas.
-
-        Un ADVANCE ahi no es una decision aprendida, es el desempate por orden
-        alfabetico haciendose pasar por una. Y es el peor default posible: el AGV
-        entra en el nodo pase lo que pase, que es exactamente lo que la baseline
-        evita. Con `deliveries` la mitad del espacio de estados (los 72 con
-        `carrying=1`) puede estar sin visitar, asi que no es un caso raro.
-        """
+        """True si la tabla no prefiere de verdad ninguna accion en este estado."""
         if not respaldadas:
             return True
         if state not in self.q:
@@ -1223,10 +1102,6 @@ class TrainingEnv:
 
     def stats(self, episode: int, epsilon: float, *, states_visited: int) -> EpisodeStats:
         """Los numeros del episodio que acaba de terminar."""
-        # Con `deliveries` un AGV no llega nunca a DONE: al acabar una mision coge
-        # la siguiente, asi que contar los DONE daba 0 en todos los episodios y
-        # dejaba la comparacion sin la unica metrica de trabajo util que tiene.
-        # Lo que ahi mide el trabajo hecho son las entregas del almacen.
         completadas = (
             self.sim.delivered
             if self.deliveries
@@ -1247,21 +1122,7 @@ class TrainingEnv:
         )
 
     def _acercarse(self, agent: Agent, antes: _Foto) -> float:
-        """Lo que vale haberse acercado al destino en este tick.
-
-        Sustituye al viejo `Event.PROGRESS`, que se cobraba con que subiera
-        `path_index`. El problema: `conflicts.reroute()` devuelve `path_index` a
-        cero, asi que cada desvio volvia a cobrar la ruta entera y **rodear
-        pagaba mas que ir derecho**. La politica lo encontro: con la tabla de dos
-        bits eligio REROUTE en los dos estados en los que podia moverse, y cerro
-        el entrenamiento con recompensa media positiva y cero entregas.
-
-        Aqui el potencial es lo que falta para llegar, asi que alargar la ruta
-        cobra negativo justo por lo que la alarga, y acortarla cobra positivo. Es
-        shaping por potencial (Ng, Harada y Russell, 1999): al tener la forma
-        `gamma*F(s') - F(s)` no cambia cual es la politica optima, solo hace que
-        se encuentre antes.
-        """
+        """Lo que vale haberse acercado al destino en este tick."""
         ahora = -float(_restantes(agent))
         antes_pot = -float(antes.restantes)
         return config.REWARD_PROGRESS * (self.gamma * ahora - antes_pot)
@@ -1276,27 +1137,16 @@ class TrainingEnv:
         en_conflicto: bool,
         deadlock: bool,
     ) -> list[Event]:
-        """Que le paso a este AGV en este tick, en eventos con precio.
-
-        El CONFLICT no se le cobra al que gano el desempate: el estado local no
-            distingue "camino libre" de "camino libre y gano la disputa", asi que
-            cobrarselo envenenaria la celda que sostiene toda la politica. Al perdedor
-            si, que es el que puede aprender algo.
-        """
+        """Que le paso a este AGV en este tick, en eventos con precio."""
         eventos: list[Event] = []
         registro = self.sim.action_record(agent.id)
         fresco = registro is not None and registro.step == paso
 
-        # El avance ya no se cobra como evento: lo lleva `_acercarse()`, porque
-        # mirar `path_index` premiaba rodear. Ver alli el porque.
         if agent.state == AgentState.DONE and antes.state != AgentState.DONE:
             eventos.append(Event.TASK_COMPLETE)
         if agent.carrying is not None and antes.carrying is None:
             eventos.append(Event.PICKED)
 
-        # Soltar la caja solo cuenta si acabo entregada: `_suelta_mision()`
-        # tambien deja `carrying` en None cuando el AGV abandona el trabajo, y
-        # eso no merece cobro.
         if antes.carrying is not None and agent.carrying is None:
             caja = self.sim.inventory.get(antes.carrying)
             if caja is not None and caja.status == missions.BoxStatus.DELIVERED:
@@ -1497,11 +1347,7 @@ def train(
     model_path: str | Path = config.Q_TABLE_FILE,
     log_path: str | Path | None = config.TRAINING_LOG_FILE,
 ) -> Trainer:
-    """Modo TRAIN: entrena, guarda el modelo y el CSV. Sin servidor.
-
-    Devuelve el `Trainer` con `history` lleno, por si quien llama quiere seguir
-    mirando los numeros.
-    """
+    """Modo TRAIN: entrena, guarda el modelo y el CSV. Sin servidor."""
     entrenador = Trainer(graph, cfg if cfg is not None else TrainingConfig())
     entrenador.run()
 
@@ -1524,11 +1370,6 @@ def evaluate(
     ajustes = cfg if cfg is not None else TrainingConfig()
     tabla = load_qtable(model_path)
 
-    # El modelo dice con que acciones se entreno, y manda el. `make_policy()` ya
-    # lo respetaba al servir, pero aqui no se miraba: una tabla entrenada sin
-    # REROUTE se evaluaba CON REROUTE disponible, eligiendo entre celdas que
-    # valen 0.0 porque nadie las toco nunca. Contra un ADVANCE aprendido en
-    # negativo, ese 0.0 gana, y el modelo quedaba peor de lo que es.
     entrenada_con_reroute = trained_enable_reroute(model_path)
     if entrenada_con_reroute is not None and ajustes.enable_reroute is None:
         ajustes.enable_reroute = entrenada_con_reroute
@@ -1538,7 +1379,6 @@ def evaluate(
 
     referencia = _run_baseline(graph, ajustes, episodes)
     return aprendida, referencia
-
 
 
 def _run_baseline(
@@ -1627,8 +1467,6 @@ def summary_lines(
     if agentes:
         lineas.append(f"(completadas es sobre {agentes} AGVs por episodio)")
     return lineas
-
-
 
 
 def compare_lines(
